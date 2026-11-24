@@ -13,9 +13,12 @@ import type { Store } from "./db.ts";
 import type { Runtime } from "./runtime.ts";
 import type { HubEvent, Task } from "./types.ts";
 import { assessRequirement } from "./quality.ts";
+import { byPriority, priorityRank } from "./priority.ts";
+import { pickDevRole } from "./roles.ts";
 import type { Notifier } from "./notify.ts";
 import type { Settings } from "./settings.ts";
 import type { GitHub } from "./github.ts";
+import { pickState, statusForStateType, type Linear, type LinearState } from "./linear.ts";
 import type { Workspace } from "./workspace.ts";
 
 export const PHASES = ["understand", "plan", "do", "test", "review"] as const;
@@ -35,15 +38,24 @@ export interface Issue {
   id: number; projectId: string; number: number; title: string; description: string; status: string; priority: number;
   assignee: string | null; labels: string[]; parentId: number | null; createdBy: string; createdAt: string; updatedAt: string;
   github: { number: number; state: "open" | "closed"; syncedAt: string } | null;
+  linear: { id: string; identifier: string; url: string; state: "open" | "closed"; stateId?: string; priority?: number; syncedAt: string } | null;
   pr: PR | null; phases: PhaseRec[]; cycle: number; phase: Phase | null;
   blocked: string[] | null; reqConfirmed?: boolean; budgetHold?: boolean; lifecycleDone?: boolean;
 }
 export interface Comment { id: number; issueId: number; author: string; kind: "user" | "agent" | "lead" | "system"; body: string; runId: string | null; createdAt: string }
 export interface Lead { agent: string; mode: "off" | "on_demand" | "autopilot"; duties: { flow: boolean; review: boolean; bugs: boolean; testing: boolean }; mergePolicy: "auto" | "manual"; dailyRuns: number; runsToday: number; runsDay?: string; activity: { at: string; text: string }[] }
+export interface LinearBinding {
+  teamId: string; teamKey: string; teamName: string;
+  mode: "two_way" | "import" | "push" | "off";
+  importScope: "all" | "label"; importLabel: string;
+  pushNew: boolean; postDeliverable: boolean;
+  lastSyncAt: string | null; pendingRemote: number;
+}
 export interface Project {
   id: string; name: string; key: string; description: string; createdAt: string; nextNumber: number;
   repo: { fullName: string; defaultBranch?: string } | null;
   sync: { mode: "two_way" | "import" | "push" | "off"; importScope: "all" | "label"; importLabel: string; pushNew: boolean; postDeliverable: boolean };
+  linear: LinearBinding | null;
   lastSyncAt: string | null; pendingRemote: number; lead: Lead;
   env: { baseUrl: string; preview: string; accounts: string[] };
   /** 演示模式下模拟的远端 issue */
@@ -56,6 +68,9 @@ export class WorkError extends Error {
   constructor(m: string, status = 400) { super(m); this.status = status; }
 }
 
+const defaultLinear = (team: { id: string; key: string; name: string }): LinearBinding => ({ teamId: team.id, teamKey: team.key, teamName: team.name, mode: "two_way", importScope: "all", importLabel: "agent", pushNew: true, postDeliverable: true, lastSyncAt: null, pendingRemote: 0 });
+/** 增量同步的起点：上次同步时间往前留 2 分钟重叠，防止时钟偏差漏掉变更（重复的会被去重） */
+const sinceFor = (iso: string | null | undefined) => (iso ? new Date(new Date(iso).getTime() - 120_000).toISOString() : null);
 const defaultLead = (mode: Lead["mode"] = "off"): Lead => ({ agent: "project-lead", mode, duties: { flow: true, review: true, bugs: true, testing: true }, mergePolicy: "auto", dailyRuns: 20, runsToday: 0, activity: [] });
 
 export interface QAPort {
@@ -70,20 +85,26 @@ export class Work {
   private notify: Notifier;
   private settings: Settings;
   private github: GitHub;
+  private linear: Linear;
   private workspace: Workspace;
+  /** Linear 工作流状态缓存（按团队，5 分钟） */
+  private linearStates = new Map<string, { at: number; states: LinearState[] }>();
   qa: QAPort | null = null;
   readonly simulate: boolean;
   /** 等待人确认需求的挂起调用 */
   private confirmWaiters = new Map<number, (answer: string) => void>();
+  /** 正在准备 worktree 的工作项，防止重复启动 */
+  private preparing = new Set<number>();
   /** 续跑提醒次数（按任务） */
   private nudges = new Map<string, number>();
 
-  constructor(store: Store, runtime: Runtime, deps: { notify: Notifier; settings: Settings; github: GitHub; workspace: Workspace; simulate: boolean }) {
+  constructor(store: Store, runtime: Runtime, deps: { notify: Notifier; settings: Settings; github: GitHub; linear: Linear; workspace: Workspace; simulate: boolean }) {
     this.store = store;
     this.runtime = runtime;
     this.notify = deps.notify;
     this.settings = deps.settings;
     this.github = deps.github;
+    this.linear = deps.linear;
     this.workspace = deps.workspace;
     this.simulate = deps.simulate;
     runtime.events.on("event", (e: HubEvent) => {
@@ -138,6 +159,8 @@ export class Work {
       pr: i.pr && p?.repo ? { ...i.pr, url: `https://github.com/${p.repo.fullName}/pull/${i.pr.number}` } : i.pr,
       comments: this.comments(i.id).filter((c) => c.kind !== "system").length,
       runs: runs.length, activeRuns: runs.filter((r) => !TERMINAL.has(r.status)).length,
+      /** 运行已提交但还在等并发槽位 */
+      queued: !!last && last.status === "pending",
       lastRun: last ? { id: last.id, status: last.status === "pending" ? "running" : last.status, error: last.error, agent: last.agent, startedAt: last.createdAt } : null,
       children: { total: kids.length, done: kids.filter((x) => x.status === "done").length },
       cost: runs.reduce((s, r) => s + this.runCost(r), 0),
@@ -155,18 +178,22 @@ export class Work {
       return { ...p, simRemote: undefined, counts: { total: its.length, open: its.filter((i) => !["done", "canceled"].includes(i.status)).length, inProgress: its.filter((i) => i.status === "in_progress").length, review: its.filter((i) => i.status === "in_review").length } };
     });
   }
-  saveProject(input: { name: string; key: string; description?: string; sync?: Partial<Project["sync"]>; env?: Partial<Project["env"]> }, origId?: string): Project {
+  saveProject(input: { name: string; key: string; description?: string; sync?: Partial<Project["sync"]>; linear?: Partial<LinearBinding> | null; env?: Partial<Project["env"]> }, origId?: string): Project {
     const key = String(input.key ?? "").trim().toUpperCase();
     if (!input.name?.trim()) throw new WorkError("项目名称不能为空");
     if (!/^[A-Z][A-Z0-9]{1,5}$/.test(key)) throw new WorkError("前缀为 2–6 位大写字母或数字，且以字母开头");
     if (this.projectsRaw().some((p) => p.key === key && p.id !== origId)) throw new WorkError(`前缀 ${key} 已被其他项目使用`);
     let p = origId ? this.proj(origId) : undefined;
-    if (!p) p = { id: "p_" + Math.random().toString(36).slice(2, 8), name: "", key, description: "", createdAt: now(), nextNumber: 1, repo: null, sync: { mode: "off", importScope: "all", importLabel: "agent", pushNew: true, postDeliverable: true }, lastSyncAt: null, pendingRemote: 0, lead: defaultLead(), env: { baseUrl: "", preview: "", accounts: [] } };
+    if (!p) p = { id: "p_" + Math.random().toString(36).slice(2, 8), name: "", key, description: "", createdAt: now(), nextNumber: 1, repo: null, sync: { mode: "off", importScope: "all", importLabel: "agent", pushNew: true, postDeliverable: true }, linear: null, lastSyncAt: null, pendingRemote: 0, lead: defaultLead(), env: { baseUrl: "", preview: "", accounts: [] } };
     p.name = input.name.trim();
     p.key = key;
     p.description = input.description ?? p.description;
     if (input.sync) p.sync = { ...p.sync, ...input.sync };
     if (input.env) p.env = { ...p.env, ...input.env };
+    if (input.linear !== undefined) {
+      p.linear = input.linear === null ? null : { ...(p.linear ?? defaultLinear({ id: "", key: "", name: "" })), ...input.linear };
+      if (p.linear?.teamId) this.linearStates.delete(p.linear.teamId);
+    }
     this.saveProj(p);
     this.emit("project");
     return p;
@@ -210,15 +237,29 @@ export class Work {
   private canImport = (p?: Project) => !!p?.repo && (p.sync.mode === "two_way" || p.sync.mode === "import");
 
   /** 同步：导入 GitHub 新 issue、推送标记需要同步的工作项、对齐 open/closed 状态 */
-  async sync(id: string): Promise<string> {
+  /** incremental：只读上次同步后有更新的 issue（定时同步用）；否则全量 */
+  async sync(id: string, opts: { incremental?: boolean } = {}): Promise<string> {
     const p = this.proj(id);
     if (!p?.repo) throw new WorkError("项目尚未绑定 GitHub 仓库");
     if (p.sync.mode === "off") throw new WorkError("同步已关闭，请先在同步设置里开启");
-    let imported = 0, skipped = 0, pushed = 0, states = 0;
+    let imported = 0, skipped = 0, pushed = 0, states = 0, pulled = 0;
     const mine = this.issues().filter((i) => i.projectId === id);
+    // 拉回远端的关闭 / 重新打开（只看上次同步后有更新的 issue）
+    if (this.canImport(p) && this.github.available()) {
+      const changed = await this.github.listIssues(p.repo.fullName, { state: "all", since: sinceFor(p.lastSyncAt) });
+      for (const r of changed) {
+        const i = mine.find((x) => x.github?.number === r.number);
+        if (!i?.github || r.state === i.github.state) continue;
+        const to = r.state === "closed" ? (r.state_reason === "not_planned" ? "canceled" : "done") : ["done", "canceled"].includes(i.status) ? "todo" : null;
+        i.github = { ...i.github, state: r.state === "closed" ? "closed" : "open", syncedAt: now() };
+        if (to) this.applyRemoteStatus(i, to, `GitHub #${r.number} ${r.state === "closed" ? "已关闭" : "被重新打开"}`);
+        else this.save(i);
+        pulled++;
+      }
+    }
     if (this.canImport(p)) {
       const remote = this.github.available()
-        ? (await this.github.listIssues(p.repo.fullName)).map((r) => ({ number: r.number, title: r.title, body: r.body ?? "", labels: r.labels.map((l) => (typeof l === "string" ? l : l.name)) }))
+        ? (await this.github.listIssues(p.repo.fullName, opts.incremental ? { state: "open", since: sinceFor(p.lastSyncAt) } : {})).map((r) => ({ number: r.number, title: r.title, body: r.body ?? "", labels: r.labels.map((l) => (typeof l === "string" ? l : l.name)) }))
         : p.simRemote ?? [];
       const keep: typeof remote = [];
       for (const r of remote) {
@@ -231,16 +272,19 @@ export class Work {
         imported++;
       }
       if (!this.github.available()) p.simRemote = keep;
-      p.pendingRemote = keep.length;
+      if (!opts.incremental || !this.github.available()) p.pendingRemote = keep.length;
     }
     if (this.canPush(p)) {
       for (const i of this.issues().filter((x) => x.projectId === id)) {
         if (await this.pushState(i)) states++;
       }
     }
-    p.lastSyncAt = now();
-    this.saveProj(p);
-    const text = `同步完成：导入 ${imported} 个${skipped ? `（${skipped} 个不在导入范围内，已跳过）` : ""}、推送 ${pushed} 个、更新状态 ${states} 个`;
+    const fresh = this.proj(id)!;
+    fresh.lastSyncAt = now();
+    fresh.pendingRemote = p.pendingRemote;
+    if (p.simRemote) fresh.simRemote = p.simRemote;
+    this.saveProj(fresh);
+    const text = `同步完成：导入 ${imported} 个${skipped ? `（${skipped} 个不在导入范围内，已跳过）` : ""}、拉回远端变更 ${pulled} 个、推送 ${pushed} 个、更新状态 ${states} 个`;
     this.syncLog(id, "ok", text);
     this.emit("sync");
     return text;
@@ -264,6 +308,223 @@ export class Work {
     i.github.state = want;
     this.save(i);
     return want === "closed" ? `↗ 已关闭 GitHub #${i.github.number}${i.status === "canceled" ? "（not planned）" : ""}` : `↗ 已重新打开 GitHub #${i.github.number}`;
+  }
+
+  /**
+   * 远端（GitHub / Linear）改了状态时更新工作项：不回推、不触发合并；
+   * 离开「进行中」会停止当前运行，回到「待办」且已指派时会重新开始执行。
+   */
+  private applyRemoteStatus(i: Issue, to: string, why: string) {
+    const before = i.status;
+    if (before === to) { this.save(i); return; }
+    i.status = to;
+    if (["done", "canceled", "backlog"].includes(to)) { i.phase = null; i.blocked = null; }
+    this.save(i);
+    this.addComment(i.id, "system", "system", `↙ ${why}：状态 ${STATUS_LABEL[before]} → ${STATUS_LABEL[to]}`);
+    const ar = this.activeRun(i.id);
+    if (ar && before === "in_progress" && to !== "in_progress") this.runtime.cancel(ar.id);
+    this.emit("issue");
+    if (to === "todo") void this.maybeAutoRun(this.getIssue(i.id)!, "远端同步");
+    if (to === "done" || to === "canceled") this.recycle(this.getIssue(i.id), "远端已关闭");
+  }
+
+  // ======================= worktree 回收 =======================
+  /** 工作项结束（完成 / 取消 / 删除）且没有在跑的运行时，删除它的 worktree 与本地分支 */
+  private recycle(i: Issue | undefined, why: string) {
+    if (!i) return;
+    const p = this.proj(i.projectId);
+    if (!p?.repo) return;
+    const key = this.key(i);
+    void this.workspace.remove(p, key).then((done) => {
+      if (done && this.getIssue(i.id)) this.addComment(i.id, "system", "system", `🧹 已回收工作目录（${why}）`);
+    }).catch((e) => this.syncLog(p.id, "warn", `回收 ${key} 的工作目录失败：${e.message}`));
+  }
+  /** 磁盘占用：按项目列出 worktree、对应工作项状态与可回收量 */
+  async diskUsage() {
+    const rows: { id: string; name: string; key: string; total: number; reclaimable: number; items: { key: string; bytes: number; mtime: string | null; status: string | null; reclaimable: boolean }[] }[] = [];
+    for (const p of this.projectsRaw().filter((x) => x.repo)) {
+      const issues = new Map(this.issues().filter((i) => i.projectId === p.id).map((i) => [this.key(i), i]));
+      const items = (await this.workspace.usage(p)).map((u) => {
+        const i = issues.get(u.key);
+        const done = !i || ["done", "canceled"].includes(i.status);
+        return { ...u, status: i ? i.status : null, reclaimable: done && !(i && this.activeRun(i.id)) };
+      }).sort((a, b) => b.bytes - a.bytes);
+      rows.push({
+        id: p.id, name: p.name, key: p.key,
+        total: items.reduce((s, x) => s + x.bytes, 0),
+        reclaimable: items.filter((x) => x.reclaimable).reduce((s, x) => s + x.bytes, 0),
+        items,
+      });
+    }
+    return { projects: rows, lastSweep: this.workspace.lastSweep ?? null };
+  }
+
+  /** 手动清理：回收所有可回收的 worktree，返回数量与释放的字节数 */
+  async cleanWorkspaces() {
+    const before = await this.diskUsage();
+    const removable = before.projects.flatMap((p) => p.items.filter((x) => x.reclaimable).map((x) => ({ pid: p.id, key: x.key, bytes: x.bytes })));
+    let removed = 0, freed = 0;
+    for (const r of removable) {
+      const proj = this.proj(r.pid);
+      if (!proj) continue;
+      if (await this.workspace.remove(proj, r.key).catch(() => false)) { removed++; freed += r.bytes; }
+    }
+    this.workspace.lastSweep = { at: now(), removed };
+    if (removed) this.emit("sync");
+    return { removed, freed };
+  }
+
+  /** 定期清扫：工作项已结束、已删除，或已不存在的 worktree 一并回收。返回回收的数量 */
+  async sweepWorkspaces(): Promise<number> {
+    let n = 0;
+    for (const p of this.projectsRaw().filter((x) => x.repo)) {
+      const byKey = new Map(this.issues().filter((i) => i.projectId === p.id).map((i) => [this.key(i), i]));
+      for (const key of this.workspace.keys(p)) {
+        const i = byKey.get(key);
+        const live = i && !["done", "canceled"].includes(i.status);
+        if (live || (i && this.activeRun(i.id)) || this.preparing.has(i?.id ?? -1)) continue;
+        if (await this.workspace.remove(p, key).catch(() => false)) n++;
+      }
+    }
+    return n;
+  }
+
+  // ======================= Linear 同步 =======================
+  private canPushLinear = (p?: Project) => !!p?.linear && (p.linear.mode === "two_way" || p.linear.mode === "push");
+  private canImportLinear = (p?: Project) => !!p?.linear && (p.linear.mode === "two_way" || p.linear.mode === "import");
+
+  private async linearStatesFor(teamId: string): Promise<LinearState[]> {
+    const hit = this.linearStates.get(teamId);
+    if (hit && Date.now() - hit.at < 5 * 60_000) return hit.states;
+    const states = await this.linear.states(teamId);
+    this.linearStates.set(teamId, { at: Date.now(), states });
+    return states;
+  }
+
+  async connectLinear(id: string, teamId: string) {
+    const p = this.proj(id);
+    if (!p) throw new WorkError("项目不存在", 404);
+    const team = this.settings.get().linear.teams?.find((t) => t.id === teamId);
+    if (!team) throw new WorkError("Linear 团队不存在，请先在设置里刷新团队列表");
+    if (this.projectsRaw().some((x) => x.id !== id && x.linear?.teamId === teamId))
+      throw new WorkError(`${team.name} 已绑定其他项目（一个 Linear 团队只能绑定一个项目）`);
+    p.linear = defaultLinear(team);
+    this.linearStates.delete(teamId);
+    this.saveProj(p);
+    this.syncLog(id, "ok", `已绑定 Linear 团队 ${team.name}（${team.key}）`);
+    this.emit("project");
+  }
+
+  disconnectLinear(id: string) {
+    const p = this.proj(id);
+    if (!p) throw new WorkError("项目不存在", 404);
+    const name = p.linear?.teamName;
+    p.linear = null;
+    this.saveProj(p);
+    this.syncLog(id, "warn", `已解绑 Linear 团队 ${name ?? ""}；已关联的工作项保留 Linear 编号但不再同步`);
+    this.emit("project");
+  }
+
+  /** 同步：从 Linear 导入 open issue、把已关联工作项的状态/优先级写回、对齐关闭状态 */
+  async syncLinear(id: string, opts: { incremental?: boolean } = {}): Promise<string> {
+    const p = this.proj(id);
+    if (!p) throw new WorkError("项目不存在", 404);
+    const cfg = p.linear;
+    if (!cfg) throw new WorkError("项目尚未绑定 Linear 团队");
+    if (cfg.mode === "off") throw new WorkError("Linear 同步已关闭，请先在项目设置里开启");
+    let imported = 0, skipped = 0, pushed = 0, pulled = 0;
+    const mine = this.issues().filter((i) => i.projectId === id);
+    const touched = new Set<number>();
+    if (this.canImportLinear(p)) {
+      const incremental = !!opts.incremental && !!cfg.lastSyncAt;
+      const remote = await this.linear.issues(cfg.teamId, incremental ? { updatedAfter: sinceFor(cfg.lastSyncAt) } : {});
+      // 已关联的：远端状态或优先级相对上次同步有变化时，以远端为准拉回
+      for (const r of remote) {
+        const i = mine.find((x) => x.linear?.id === r.id);
+        if (!i?.linear) continue;
+        const stateChanged = !!r.state && r.state.id !== i.linear.stateId;
+        const prioChanged = (r.priority ?? 0) !== (i.linear.priority ?? i.priority);
+        if (!stateChanged && !prioChanged) continue;
+        const notes: string[] = [];
+        if (prioChanged && r.priority !== i.priority) { notes.push(`优先级 ${PRIORITY_LABEL[i.priority]} → ${PRIORITY_LABEL[r.priority ?? 0]}`); i.priority = r.priority ?? 0; }
+        const closed = r.state?.type === "completed" || r.state?.type === "canceled";
+        i.linear = { ...i.linear, stateId: r.state?.id, priority: r.priority ?? 0, state: closed ? "closed" : "open", syncedAt: now() };
+        let to = stateChanged ? statusForStateType(r.state.type) : null;
+        // 远端回到未开始，但本地正在执行 / 待审核：保留本地进度，不打断
+        if (to && ["backlog", "todo"].includes(to) && ["in_progress", "in_review"].includes(i.status)) to = null;
+        if (to && to !== i.status) this.applyRemoteStatus(i, to, `Linear ${r.identifier} 变为「${r.state.name}」${notes.length ? `，${notes.join("，")}` : ""}`);
+        else {
+          this.save(i);
+          if (notes.length) this.addComment(i.id, "system", "system", `↙ Linear ${r.identifier}：${notes.join("，")}`);
+        }
+        touched.add(i.id);
+        pulled++;
+      }
+      for (const r of remote) {
+        if (r.state?.type === "completed" || r.state?.type === "canceled") continue;
+        if (mine.some((i) => i.linear?.id === r.id)) continue;
+        if (cfg.importScope === "label" && !r.labels.includes(cfg.importLabel)) { skipped++; continue; }
+        const i = this.newIssue(p, { title: r.title || "(无标题)", description: r.description ?? "", labels: r.labels, priority: r.priority ?? 0, createdBy: "Linear 导入" });
+        i.linear = { id: r.id, identifier: r.identifier, url: r.url, state: "open", stateId: r.state?.id, priority: r.priority ?? 0, syncedAt: now() };
+        this.save(i);
+        this.addComment(i.id, "system", "system", `从 Linear ${r.identifier} 导入`);
+        imported++;
+      }
+    }
+    if (this.canPushLinear(p)) {
+      for (const i of mine) {
+        if (touched.has(i.id)) continue; // 本次刚从远端拉回，不回推
+        const cur = this.getIssue(i.id);
+        if (cur && await this.pushLinearState(cur).catch(() => null)) pushed++;
+      }
+    }
+    const fresh = this.proj(id)!;
+    if (fresh.linear) {
+      fresh.linear.lastSyncAt = now();
+      if (!opts.incremental) fresh.linear.pendingRemote = skipped;
+      this.saveProj(fresh);
+    }
+    const text = `Linear 同步完成：导入 ${imported} 个${skipped ? `（${skipped} 个不在导入范围内，已跳过）` : ""}、拉回远端变更 ${pulled} 个、写回 ${pushed} 个`;
+    this.syncLog(id, "ok", text);
+    this.emit("sync");
+    return text;
+  }
+
+  private async pushLinearNew(i: Issue): Promise<string | null> {
+    const p = this.proj(i.projectId);
+    const cfg = p?.linear;
+    if (!cfg || i.linear || !this.canPushLinear(p)) return null;
+    const created = await this.linear.createIssue({ teamId: cfg.teamId, title: i.title, description: i.description, priority: i.priority });
+    i.linear = { id: created.id, identifier: created.identifier, url: created.url, state: "open", stateId: created.state?.id, priority: i.priority, syncedAt: now() };
+    this.save(i);
+    this.addComment(i.id, "system", "system", `↗ 已创建 Linear ${created.identifier}`);
+    return created.identifier;
+  }
+
+  /** 把工作项的状态与优先级写回 Linear；没有变化时返回 null */
+  private async pushLinearState(i: Issue): Promise<string | null> {
+    const p = this.proj(i.projectId);
+    const cfg = p?.linear;
+    if (!cfg || !i.linear || !this.canPushLinear(p)) return null;
+    const states = await this.linearStatesFor(cfg.teamId);
+    const target = pickState(states, i.status);
+    if (!target) return null;
+    if (i.linear.stateId === target.id && i.linear.priority === i.priority) return null;
+    await this.linear.updateIssue(i.linear.id, { stateId: target.id, priority: i.priority });
+    const closed = ["done", "canceled"].includes(i.status);
+    i.linear = { ...i.linear, stateId: target.id, priority: i.priority, state: closed ? "closed" : "open", syncedAt: now() };
+    this.save(i);
+    return target.name;
+  }
+
+  async pushToLinear(ref: string | number) {
+    const i = this.find(ref);
+    const p = this.proj(i.projectId);
+    if (!p?.linear) throw new WorkError("项目尚未绑定 Linear 团队");
+    if (!this.canPushLinear(p)) throw new WorkError("当前同步方向不允许推送到 Linear");
+    const id = await this.pushLinearNew(i);
+    if (!id) throw new WorkError("这个工作项已经关联了 Linear issue");
+    this.emit("issue");
   }
 
   // ======================= 项目负责人 =======================
@@ -293,10 +554,10 @@ export class Work {
       if (L.runsDay !== day) { L.runsDay = day; L.runsToday = 0; this.saveProj(p); }
       if (L.runsToday >= L.dailyRuns) continue;
       const its = this.issues().filter((i) => i.projectId === p.id);
-      const bug = L.duties.bugs && its.find((i) => i.labels.includes("bug") && !i.assignee && ["backlog", "todo"].includes(i.status));
+      const bug = L.duties.bugs && its.filter((i) => i.labels.includes("bug") && !i.assignee && ["backlog", "todo"].includes(i.status)).sort(byPriority)[0];
       if (bug) {
-        this.addComment(bug.id, L.agent, "lead", "分诊：判定为 bug，指派给 developer 修复。");
-        bug.assignee = this.store.getAgent("developer") ? "developer" : L.agent;
+        bug.assignee = pickDevRole(this.store, bug, L.agent);
+        this.addComment(bug.id, L.agent, "lead", `分诊：判定为 bug，指派给 ${bug.assignee} 修复。`);
         bug.status = "todo";
         this.save(bug);
         this.leadLog(p, `分诊 ${this.key(bug)}「${bug.title}」：bug，指派给 ${bug.assignee} 修复`);
@@ -312,7 +573,7 @@ export class Work {
           .filter(([t]) => !its.some((i) => i.title === t));
         if (!pool.length || Math.random() > 0.35) continue;
         const [title, description] = pool[0];
-        const i = this.newIssue(p, { title, description, labels: ["负责人提议"], priority: 3, assignee: this.store.getAgent("developer") ? "developer" : L.agent, createdBy: L.agent, status: "todo" });
+        const i = this.newIssue(p, { title, description, labels: ["负责人提议"], priority: 3, assignee: pickDevRole(this.store, { title, description }, L.agent), createdBy: L.agent, status: "todo" });
         this.addComment(i.id, L.agent, "lead", `持续迭代：发现改进点，创建本工作项。\n${description}`);
         this.leadLog(p, `持续迭代：提出并开始 ${this.key(i)}「${title}」`);
         await this.startRun(i, L.agent);
@@ -335,7 +596,7 @@ export class Work {
     const i: Issue = {
       id: this.store.nextSeq("issue"), projectId: p.id, number: fresh.nextNumber++, title: o.title, description: o.description ?? "",
       status: o.status ?? (o.assignee ? "todo" : "backlog"), priority: o.priority ?? 0, assignee: o.assignee ?? null, labels: o.labels ?? [],
-      parentId: o.parentId ?? null, createdBy: o.createdBy ?? ME, createdAt: now(), updatedAt: now(), github: null, pr: null, phases: [], cycle: 0, phase: null, blocked: null,
+      parentId: o.parentId ?? null, createdBy: o.createdBy ?? ME, createdAt: now(), updatedAt: now(), github: null, linear: null, pr: null, phases: [], cycle: 0, phase: null, blocked: null,
     };
     this.saveProj(fresh);
     Object.assign(p, fresh);
@@ -365,7 +626,7 @@ export class Work {
     return name;
   }
 
-  async create(input: { projectId: string; title: string; description?: string; status?: string; priority?: number; assignee?: string | null; labels?: string[]; parent?: string | null; github?: boolean; hotfix?: boolean }, actor = ME): Promise<ReturnType<Work["view"]>> {
+  async create(input: { projectId: string; title: string; description?: string; status?: string; priority?: number; assignee?: string | null; labels?: string[]; parent?: string | null; github?: boolean; linear?: boolean; hotfix?: boolean }, actor = ME): Promise<ReturnType<Work["view"]>> {
     const p = this.proj(input.projectId);
     if (!p) throw new WorkError("请先选择项目");
     if (!input.title?.trim()) throw new WorkError("标题不能为空");
@@ -377,13 +638,14 @@ export class Work {
     if (input.hotfix) {
       i.labels = [...new Set(["hotfix", ...i.labels])];
       i.priority = 1;
-      i.assignee ||= this.store.getAgent("developer") ? "developer" : null;
+      i.assignee ||= pickDevRole(this.store, i);
       i.status = "todo";
     }
     this.save(i);
     const n = input.github ? await this.pushNew(i).catch(() => null) : null;
+    const ln = input.linear ? await this.pushLinearNew(i).catch(() => null) : null;
     this.save(i);
-    this.addComment(i.id, "system", "system", `${actor} 创建了${input.hotfix ? " ⚡ Hotfix" : "工作项"}${n ? `，并创建了 GitHub #${n}` : ""}`);
+    this.addComment(i.id, "system", "system", `${actor} 创建了${input.hotfix ? " ⚡ Hotfix" : "工作项"}${n ? `，并创建了 GitHub #${n}` : ""}${ln ? `，并创建了 Linear ${ln}` : ""}`);
     this.emit("issue");
     await this.maybeAutoRun(i, actor);
     return this.view(this.getIssue(i.id)!);
@@ -407,12 +669,14 @@ export class Work {
     if (i.status === "done" && before.status !== "done" && i.pr?.state === "open") await this.merge(i, actor).catch((e) => ch.push(`合并 PR 失败：${e.message}`));
     this.save(i);
     const gh = i.status !== before.status ? await this.pushState(i).catch(() => null) : null;
-    if (ch.length) this.addComment(i.id, "system", "system", `${actor} 修改了${ch.join("，")}${gh ? `；${gh}` : ""}`);
+    const ln = await this.pushLinearState(i).catch(() => null);
+    if (ch.length) this.addComment(i.id, "system", "system", `${actor} 修改了${ch.join("，")}${gh ? `；${gh}` : ""}${ln ? `；Linear → ${ln}` : ""}`);
     // 把执行中的工作项挪出「进行中」= 停止当前运行
     const ar = this.activeRun(i.id);
     if (ar && before.status === "in_progress" && i.status !== "in_progress") this.runtime.cancel(ar.id);
     this.emit("issue");
     if (i.assignee !== before.assignee || (i.status === "todo" && before.status !== "todo")) await this.maybeAutoRun(this.getIssue(i.id)!, actor);
+    if (["done", "canceled"].includes(i.status) && i.status !== before.status) this.recycle(this.getIssue(i.id), i.status === "done" ? "已完成" : "已取消");
     return this.view(this.getIssue(i.id)!);
   }
 
@@ -434,6 +698,8 @@ export class Work {
     const i = this.find(ref);
     const r = this.activeRun(i.id);
     if (r) this.runtime.cancel(r.id);
+    const p = this.proj(i.projectId);
+    if (p?.repo) void this.workspace.remove(p, this.key(i)).catch(() => {});
     this.store.docDelete("issues", i.id);
     for (const x of this.issues().filter((x) => x.parentId === i.id)) { x.parentId = null; this.save(x); }
     this.store.docDeleteWhere("comments", (c) => c.issueId === i.id);
@@ -450,7 +716,7 @@ export class Work {
       else if (i.status === "in_review") out.push({ kind: "review", issue: v, text: i.pr?.guard && i.pr.state === "open" ? `安全护栏拦截：${i.pr.guard}` : i.pr?.state === "merged" ? `最终验收（PR #${i.pr.number} 已由 AI 合并）` : i.pr?.state === "open" ? `验收并合并 PR #${i.pr.number}` : "最终验收" });
       else if (leadOff && i.status === "todo" && v.lastRun?.status === "failed") out.push({ kind: "failed", issue: v, text: "运行失败（项目负责人已关闭，需要你处理）" });
     }
-    return out;
+    return out.sort((a, b) => priorityRank(a.issue.priority) - priorityRank(b.issue.priority));
   }
 
   confirmRequirement(ref: string | number, answer: string) {
@@ -500,11 +766,29 @@ export class Work {
     }
     i.status = "in_progress";
     this.save(i);
-    const task = this.runtime.submit(i.assignee!, this.buildInput(i, opts.resume), { source: "issue", issueId: i.id, hops: opts.hops ?? 0 });
-    this.addComment(i.id, "system", "system", opts.resume ? `▶ ${i.assignee} 从「${PHASE_LABEL[i.phase!]}」继续（由 ${by} 触发）` : `▶ ${i.assignee} 开始执行（由 ${by} 触发），第 ${i.cycle} 轮`, task.id);
+    // 先准备好 worktree 再启动：CLI 底座以 worktree 为工作目录，目录不存在会直接启动失败
     if (this.workspace.enabledFor(this.proj(i.projectId), this.store.getAgent(i.assignee!))) {
-      await this.workspace.prepare(this.proj(i.projectId)!, this.key(i)).catch((e) => this.addComment(i.id, "system", "system", `⚠ 准备工作目录失败：${e.message}`));
+      if (this.preparing.has(i.id)) return null;
+      this.preparing.add(i.id);
+      this.emit("issue");
+      try {
+        await this.workspace.prepare(this.proj(i.projectId)!, this.key(i));
+      } catch (e) {
+        const cur = this.getIssue(i.id)!;
+        const act = cur.phases.findLast((r) => r.result === "active");
+        if (act) { act.result = "fail"; act.endedAt = now(); act.note = "准备工作目录失败"; }
+        cur.phase = null;
+        if (cur.status === "in_progress") cur.status = "todo";
+        this.save(cur);
+        this.addComment(i.id, "system", "system", `✕ 准备工作目录失败，未开始执行：${(e as Error).message}`);
+        this.emit("issue");
+        return null;
+      } finally {
+        this.preparing.delete(i.id);
+      }
     }
+    const task = this.runtime.submit(i.assignee!, this.buildInput(i, opts.resume), { source: "issue", issueId: i.id, hops: opts.hops ?? 0, priority: i.priority });
+    this.addComment(i.id, "system", "system", opts.resume ? `▶ ${i.assignee} 从「${PHASE_LABEL[i.phase!]}」继续（由 ${by} 触发）` : `▶ ${i.assignee} 开始执行（由 ${by} 触发），第 ${i.cycle} 轮`, task.id);
     this.emit("issue");
     return task;
   }
@@ -643,7 +927,7 @@ export class Work {
       this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch}），+${res.additions} −${res.deletions}，${res.files} 个文件`);
       return `已提交 PR #${i.pr.number}。`;
     }
-    if (this.simulate && p.repo && (task.agent === "developer" || i.labels.includes("bug")) && !i.pr) {
+    if (this.simulate && p.repo && (["developer", "frontend-dev", "backend-dev", "devops"].includes(task.agent) || i.labels.includes("bug")) && !i.pr) {
       const add = 20 + Math.floor(Math.random() * 180);
       p.simGhNext = (p.simGhNext ?? 100) + 1;
       this.saveProj(p);
@@ -668,8 +952,13 @@ export class Work {
         if (this.github.available()) await this.github.comment(p.repo!.fullName, i.github.number, `**${task.agent} 交付：**\n\n${task.result ?? ""}`).catch(() => {});
         this.addComment(i.id, "system", "system", `↗ 交付内容已评论到 GitHub #${i.github.number}`);
       }
+      if (i.linear && p?.linear?.postDeliverable && this.canPushLinear(p)) {
+        await this.linear.comment(i.linear.id, `**${task.agent} 交付：**\n\n${task.result ?? ""}`).catch(() => {});
+        this.addComment(i.id, "system", "system", `↗ 交付内容已评论到 Linear ${i.linear.identifier}`);
+      }
       if (i.status === "in_progress") i.status = "in_review";
       this.save(i);
+      await this.pushLinearState(i).catch(() => null);
       await this.afterDeliver(i);
     } else {
       const act = i.phases.findLast((r) => r.result === "active" || r.result === "blocked");
@@ -680,6 +969,7 @@ export class Work {
       this.addComment(i.id, "system", "system", msg, task.id);
       if (i.status === "in_progress") i.status = "todo";
       this.save(i);
+      await this.pushLinearState(i).catch(() => null);
     }
     this.emit("run_finished", { key, status: task.status });
   }
@@ -715,6 +1005,8 @@ export class Work {
           lines.push(`AI 验收通过，已合并 PR #${i.pr.number} 并上线。你可以事后查看，如有问题可回滚。`);
           i.status = "done";
           await this.pushState(i);
+          await this.pushLinearState(i).catch(() => null);
+          this.recycle(i, "Hotfix 已合并上线");
           this.leadLog(p, `⚡ Hotfix ${key}：AI 验收通过，已合并 PR #${i.pr.number} 并完成`);
           this.notify.push("hotfix", `⚡ ${key} 已上线`, `${i.title}：测试通过，AI 验收后已合并 PR #${i.pr.number}。`, key);
         } else {
@@ -775,6 +1067,8 @@ export class Work {
     const before = i.status;
     if (i.status !== "done") { i.status = "done"; const gh = await this.pushState(i); this.addComment(i.id, "system", "system", `${ME} 修改了状态 ${STATUS_LABEL[before]} → 完成${gh ? `；${gh}` : ""}`); }
     this.save(i);
+    await this.pushLinearState(i).catch(() => null);
+    this.recycle(i, "PR 已合并，工作项完成");
     this.emit("issue");
   }
   async rollback(ref: string | number) {
@@ -790,6 +1084,7 @@ export class Work {
     i.status = "backlog";
     await this.pushState(i);
     this.save(i);
+    await this.pushLinearState(i).catch(() => null);
     this.emit("issue");
   }
   async pushToGithub(ref: string | number) {

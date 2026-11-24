@@ -1,5 +1,5 @@
 /** GitHub REST 客户端（Personal Access Token）。Token 只保存在服务端。 */
-export interface GhIssue { number: number; title: string; body: string | null; state: string; labels: (string | { name: string })[]; pull_request?: unknown }
+export interface GhIssue { number: number; title: string; body: string | null; state: string; state_reason?: string | null; labels: (string | { name: string })[]; pull_request?: unknown }
 
 export class GitHub {
   private token: () => string | null;
@@ -28,9 +28,16 @@ export class GitHub {
     return list.map((r) => r.full_name);
   }
   repo(full: string) { return this.req<{ default_branch: string; full_name: string }>("GET", `/repos/${full}`); }
-  async listIssues(full: string): Promise<GhIssue[]> {
-    const list = await this.req<GhIssue[]>("GET", `/repos/${full}/issues?state=open&per_page=100`);
-    return list.filter((i) => !i.pull_request);
+  /** 分页读取 issue（不含 PR）。state=all 时用于拉回远端的关闭 / 重新打开；since 只取此后有更新的 */
+  async listIssues(full: string, opts: { state?: "open" | "all"; since?: string | null; maxPages?: number } = {}): Promise<GhIssue[]> {
+    const out: GhIssue[] = [];
+    const q = `state=${opts.state ?? "open"}&per_page=100${opts.since ? `&since=${encodeURIComponent(opts.since)}` : ""}`;
+    for (let page = 1; page <= (opts.maxPages ?? 20); page++) {
+      const list = await this.req<GhIssue[]>("GET", `/repos/${full}/issues?${q}&page=${page}`);
+      out.push(...list.filter((i) => !i.pull_request));
+      if (list.length < 100) break;
+    }
+    return out;
   }
   createIssue(full: string, title: string, body: string, labels: string[] = []) { return this.req<GhIssue>("POST", `/repos/${full}/issues`, { title, body, labels }); }
   setIssueState(full: string, n: number, state: "open" | "closed", reason?: "completed" | "not_planned") { return this.req("PATCH", `/repos/${full}/issues/${n}`, { state, ...(state === "closed" && reason ? { state_reason: reason } : {}) }); }

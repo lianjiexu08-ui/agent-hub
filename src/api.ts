@@ -13,8 +13,12 @@ import type { Automation } from "./automation.ts";
 import type { Assistant } from "./assistant.ts";
 import { AgentSchema } from "./types.ts";
 import { detectRuntimes } from "./runtimes.ts";
+import { PRESETS } from "./providers.ts";
 
-export interface Services { store: Store; runtime: Runtime; settings: Settings; notifier: Notifier; work: Work; qa: QA; automation: Automation; assistant: Assistant; simulate: boolean }
+import type { Uploads } from "./uploads.ts";
+export interface Services {
+  uploads?: Uploads;
+  store: Store; runtime: Runtime; settings: Settings; notifier: Notifier; work: Work; qa: QA; automation: Automation; assistant: Assistant; simulate: boolean; /** 热重载：重新读配置并重新检测运行底座 */ reload?: () => Promise<unknown>; /** 进程级重启：拉起新进程后退出 */ restart?: () => unknown }
 
 export function buildApi(s: Services) {
   const { store, settings, notifier, work, qa, automation, assistant } = s;
@@ -37,6 +41,8 @@ export function buildApi(s: Services) {
     tools: store.listTools(),
     mcpServers: store.listMcpServers(),
     runtimes: await detectRuntimes(),
+    providerPresets: PRESETS,
+    concurrency: { ...s.runtime.concurrency(), cli: (s.runtime.cli as { stats?: () => unknown } | null)?.stats?.() ?? {} },
   });
 
   const saveAgent = (a: Record<string, unknown>, orig?: string | null) => {
@@ -70,6 +76,13 @@ export function buildApi(s: Services) {
     "work.connectRepo": (id, full) => work.connectRepo(id, full),
     "work.disconnectRepo": (id) => work.disconnectRepo(id),
     "work.sync": (id) => work.sync(id),
+    "work.connectLinear": (id, teamId) => work.connectLinear(id, teamId),
+    "work.disconnectLinear": (id) => work.disconnectLinear(id),
+    "work.syncLinear": (id) => work.syncLinear(id),
+    "work.diskUsage": () => work.diskUsage(),
+    "work.cleanWorkspaces": () => work.cleanWorkspaces(),
+    "work.receipt": (id) => store.docGet("receipts", id),
+    "work.pushToLinear": (ref) => work.pushToLinear(ref),
     "work.setLead": (id, patch) => work.setLead(id, patch),
     "qa.enqueue": (key) => qa.enqueue(work.view(work.find(key)), "manual"),
     "qa.rerun": (id) => qa.enqueue(issueOfRun(id), "manual"),
@@ -81,18 +94,25 @@ export function buildApi(s: Services) {
     "auto.toggle": (id, on) => automation.toggle(id, on),
     "auto.remove": (id) => automation.remove(id),
     "auto.setRule": (k, p) => automation.setRule(k, p),
-    "settings.patch": (p) => settings.patch(p),
+    "settings.patch": (p) => { settings.patch(p); s.runtime.setConcurrency(settings.get().concurrency.model); (s.runtime.cli as { pump?: () => void } | null)?.pump?.(); },
     "settings.verifyProvider": (id, f) => settings.verifyProvider(id, f),
+    "settings.listProviderModels": (id) => settings.listProviderModels(id),
+    "settings.setAssistantModel": (m) => settings.patch({ assistantModel: m ?? "" }),
     "settings.removeProvider": (id) => settings.removeProvider(id),
     "settings.saveModel": (m) => settings.saveModel(m),
     "settings.removeModel": (id) => settings.removeModel(id),
     "settings.connectGithub": (token) => settings.connectGithub(token),
     "settings.refreshGithubRepos": () => settings.refreshGithubRepos(),
     "settings.disconnectGithub": () => settings.disconnectGithub(),
+    "settings.connectLinear": (token) => settings.connectLinear(token),
+    "settings.refreshLinearTeams": () => settings.refreshLinearTeams(),
+    "settings.disconnectLinear": () => settings.disconnectLinear(),
     "settings.addSecret": (name, value, scope) => settings.addSecret(name, value, scope),
     "settings.removeSecret": (name) => settings.removeSecret(name),
     "settings.testChannel": async (id) => { const c = settings.get().notify.channels.find((x) => x.id === id); if (!c?.url) throw new Error("先填写地址"); await notifier.send(c, "【Agent Hub】测试消息：通知渠道配置成功"); },
     "runtimes.detect": () => detectRuntimes(true),
+    "system.reload": () => s.reload?.(),
+    "system.restart": () => s.restart?.(),
     "studio.saveAgent": (a, orig) => saveAgent(a, orig),
     "studio.deleteAgent": (n) => store.deleteAgent(n),
     "studio.saveSkill": (sk, orig) => settings.saveSkill(sk, orig),
@@ -101,7 +121,7 @@ export function buildApi(s: Services) {
     "knowledge.toggle": (id, on) => settings.toggleKnowledge(id, on),
     "knowledge.remove": (id) => settings.removeKnowledge(id),
     "notify.readAll": () => notifier.readAll(),
-    "assistant.butler": (text) => assistant.butler(text),
+    "assistant.butler": (text, attachments) => assistant.butler(text, attachments),
     "assistant.append": (m) => assistant.append(m),
     "assistant.updateCard": (i, p) => assistant.updateCard(i, p),
     "assistant.clear": () => assistant.clear(),

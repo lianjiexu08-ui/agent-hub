@@ -9,6 +9,8 @@ import type { HubEvent } from "./types.ts";
 import type { Work } from "./work.ts";
 import type { QA } from "./qa.ts";
 import type { Assistant } from "./assistant.ts";
+import { priorityRank } from "./priority.ts";
+import { pickReassignTarget } from "./roles.ts";
 
 export interface Rules {
   phaseTimeout: { on: boolean; sla: Record<string, number>; chain: string[] };
@@ -29,7 +31,7 @@ const DEFAULT_RULES: Rules = {
 const DEFAULT_JOBS: Job[] = [
   { id: "j_sentinel", name: "哨兵巡检", cron: "* * * * *", action: "sentinel", system: true, on: true, history: [] },
   { id: "j_lead", name: "项目负责人巡检", cron: "*/5 * * * *", action: "lead", system: true, on: true, history: [] },
-  { id: "j_sync", name: "同步 GitHub（所有绑定仓库）", cron: "0 * * * *", action: "sync", on: true, history: [] },
+  { id: "j_sync", name: "同步 GitHub / Linear", cron: "*/5 * * * *", action: "sync", on: true, history: [] },
   { id: "j_morning", name: "管家晨报", cron: "0 9 * * *", action: "report", on: true, history: [] },
 ];
 
@@ -57,6 +59,7 @@ export class Automation {
   private assistant: Assistant;
   private state = new Map<string, { level: number; lastAt?: string; reminded?: string }>();
   private retried = new Set<string>();
+  private lastSweep = 0;
 
   constructor(store: Store, runtime: Runtime, work: Work, qa: QA, assistant: Assistant, opts: { sentinelMs: number; leadMs: number }) {
     this.store = store;
@@ -66,6 +69,9 @@ export class Automation {
     this.assistant = assistant;
     if (!store.docGet("auto", "rules")) store.docPut("auto", "rules", { id: "rules", ...DEFAULT_RULES });
     for (const j of DEFAULT_JOBS) if (!store.docGet("jobs", j.id)) store.docPut("jobs", j.id, { ...j, nextAt: nextRun(j.cron)?.toISOString() ?? null });
+    // 旧版默认每小时同步：没被人改过的升级为每 5 分钟增量同步（官方 SaaS 的 Webhook 进不了内网，靠轮询）
+    const sj = store.docGet<Job>("jobs", "j_sync");
+    if (sj && sj.cron === "0 * * * *" && sj.name === "同步 GitHub（所有绑定仓库）") store.docPut("jobs", sj.id, { ...sj, name: "同步 GitHub / Linear", cron: "*/5 * * * *", nextAt: nextRun("*/5 * * * *")?.toISOString() ?? null });
     setInterval(() => { const j = this.job("j_sentinel"); if (j?.on) void this.runJob(j); }, opts.sentinelMs);
     setInterval(() => { const j = this.job("j_lead"); if (j?.on) void this.runJob(j); }, opts.leadMs);
     setInterval(() => {
@@ -102,9 +108,14 @@ export class Automation {
       if (j.action === "sentinel") { const n = await this.sentinel(); result = n ? `处理 ${n} 项` : "一切正常"; }
       if (j.action === "lead") { await this.work.leadTick(); result = "已巡检"; }
       if (j.action === "sync") {
-        const ps = this.work.projectsRaw().filter((p) => p.repo && p.sync.mode !== "off");
-        for (const p of ps) await this.work.sync(p.id);
-        result = `已同步 ${ps.length} 个仓库`;
+        const gh = this.work.projectsRaw().filter((p) => p.repo && p.sync.mode !== "off");
+        const ln = this.work.projectsRaw().filter((p) => p.linear && p.linear.mode !== "off");
+        const errs: string[] = [];
+        // 单个项目失败不影响其他项目；定时同步走增量
+        for (const p of gh) await this.work.sync(p.id, { incremental: !manual }).catch((e) => errs.push(`${p.name}（GitHub）：${e.message}`));
+        for (const p of ln) await this.work.syncLinear(p.id, { incremental: !manual }).catch((e) => errs.push(`${p.name}（Linear）：${e.message}`));
+        result = `已同步 ${gh.length} 个 GitHub 仓库、${ln.length} 个 Linear 团队${errs.length ? `；失败 ${errs.length} 个：${errs.join("；")}` : ""}`;
+        if (errs.length) ok = false;
       }
       if (j.action === "report") { this.assistant.postReport(); result = "已推送到首页"; }
       if (j.action === "create" && j.projectId && j.params) {
@@ -151,7 +162,8 @@ export class Automation {
       const chain = noBeat && st.level === 0 ? ["restart", ...R.phaseTimeout.chain.filter((a) => a !== "restart" && a !== "nudge")] : R.phaseTimeout.chain;
       const action = chain[Math.min(st.level, chain.length - 1)];
       const reason = noBeat ? `${Math.round(x.idleMin)} 分钟无心跳` : `「${x.phase}」已 ${Math.round(x.phaseMin)} 分钟（时限 ${sla} 分钟）`;
-      const to = this.store.listAgents().map((a) => a.name).find((n) => n !== x.agent && ["developer", "orchestrator"].includes(n)) ?? x.agent;
+      const issue = this.work.list().find((i) => i.key === x.key);
+      const to = pickReassignTarget(this.store, x.agent, issue);
       await this.work.sentinelAct(x.key, action, { minutes: Math.round(Math.max(x.phaseMin, x.idleMin)), to });
       this.addLog(action, `${x.key} ${reason} → ${{ nudge: "提醒", restart: "重启当前阶段", reassign: `改派给 ${to}`, escalate: "上报项目负责人" }[action]}`, x.key);
       st.level++;
@@ -162,11 +174,17 @@ export class Automation {
       const m = (Date.now() - new Date(r.queuedAt).getTime()) / 60000;
       if (m >= R.queueWait.minutes) { r.boosted = true; r.hotfix = true; this.store.docPut("qa_runs", r.id, r); this.addLog("boost", `${r.issueKey} 验收排队 ${Math.round(m)} 分钟，已提升优先级`, r.issueKey); acted++; }
     }
-    if (R.retryFailed.on) for (const i of this.work.list().filter((i) => i.status === "todo" && i.lastRun?.status === "failed" && !this.retried.has(i.lastRun.id))) {
+    if (R.retryFailed.on) for (const i of this.work.list().filter((i) => i.status === "todo" && i.lastRun?.status === "failed" && !this.retried.has(i.lastRun.id)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))) {
       this.retried.add(i.lastRun!.id);
       const tries = i.runs;
       if (/需求|预算|轮仍未通过/.test(i.lastRun!.error ?? "") || tries > R.retryFailed.times + 1) continue;
       if (await this.work.retryFailed(i.key)) { this.addLog("retry", `${i.key} 运行失败（${(i.lastRun!.error ?? "").slice(0, 40)}），自动重试`, i.key); acted++; }
+    }
+    // 每小时清扫一次已结束工作项残留的 worktree
+    if (Date.now() - this.lastSweep > 3600_000) {
+      this.lastSweep = Date.now();
+      const n = await this.work.sweepWorkspaces().catch(() => 0);
+      if (n) { this.addLog("sweep", `回收了 ${n} 个已结束工作项的工作目录`); acted++; }
     }
     if (acted) this.emit();
     return acted;

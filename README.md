@@ -25,6 +25,7 @@ npm install
 
 # 演示模式：模型回复由脚本生成，其余全部是真实的服务端逻辑，不需要 API Key
 npm run demo            # 打开 http://127.0.0.1:18790
+npm run demo:lan        # 同上，但监听 0.0.0.0，便于从内网访问（未设置 HUB_TOKEN 时仅供演示）
 
 # 正式运行
 npm start               # 在「设置 → 模型服务」里填 Anthropic API Key，在「集成」里填 GitHub Token
@@ -75,6 +76,11 @@ src/mcp.ts             把 Hub 作为 MCP 服务提供给 Claude Code 等客户�
 ```
 
 数据存在 SQLite（`node:sqlite`，WAL 模式）。
+
+### 优先级
+
+工作项优先级为 0 无 · 1 紧急 · 2 高 · 3 中 · 4 低。调度统一按 **紧急 → 高 → 中 → 低 → 无**：
+运行槽位、测试队列、项目负责人分诊与失败重试、任务中心与测试板块的展示顺序都遵循这一规则。
 
 ### 生命周期是怎么驱动的
 

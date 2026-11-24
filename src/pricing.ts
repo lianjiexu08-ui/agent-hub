@@ -14,8 +14,12 @@ export interface Usage {
   cache_creation_input_tokens?: number | null;
 }
 
+/** 自定义模型的价格由设置提供（每百万 tokens 的输入 / 输出美元） */
+let resolver: ((model: string) => [number, number] | null) | null = null;
+export function setPriceResolver(fn: ((model: string) => [number, number] | null) | null) { resolver = fn; }
+
 export function costOf(model: string, u: Usage): number {
-  const [i, o] = PRICES[model] ?? [4, 20];
+  const [i, o] = resolver?.(model) ?? PRICES[model] ?? [4, 20];
   const cacheRead = u.cache_read_input_tokens ?? 0;
   const cacheWrite = u.cache_creation_input_tokens ?? 0;
   return (u.input_tokens * i + cacheRead * i * 0.1 + cacheWrite * i * 1.25 + u.output_tokens * o) / 1_000_000;

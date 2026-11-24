@@ -53,6 +53,7 @@ function insert(spec: Spec, parent?: Task): Task {
     hops: spec.hops ?? 0,
     source: spec.source ?? (parent ? "delegate" : "api"),
     issueId: null,
+    priority: 0,
   });
   const results = new Map<string, string>();
   for (const child of spec.children ?? []) {

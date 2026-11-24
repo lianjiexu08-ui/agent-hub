@@ -1,5 +1,29 @@
 /** 首次启动时的初始数据：演示模式写入一组示例项目和工作项（会立即开始执行），正常模式只建一个空项目。 */
 import type { Store } from "./db.ts";
+import { AgentSchema, McpServerSchema, ToolSchema } from "./types.ts";
+
+/**
+ * 导入种子：首次启动导入全部智能体、工具和 MCP 服务器；
+ * 之后只补种子里新增的智能体（记录在 meta/seed-agents），被人删掉或已存在的不动。返回新增的名称。
+ */
+export function importSeed(store: Store, data: { agents?: unknown[]; tools?: unknown[]; mcpServers?: unknown[] }): string[] {
+  const first = store.listAgents().length === 0;
+  if (first) {
+    ToolSchema.array().parse(data.tools ?? []).forEach((t) => store.upsertTool(t));
+    McpServerSchema.array().parse(data.mcpServers ?? []).forEach((s) => store.upsertMcpServer(s));
+  }
+  const meta = store.docGet<{ id: string; agents: string[] }>("meta", "seed-agents");
+  const seeded = new Set(meta?.agents ?? (first ? [] : store.listAgents().map((a) => a.name)));
+  const added: string[] = [];
+  for (const a of AgentSchema.array().parse(data.agents ?? [])) {
+    if (seeded.has(a.name) || store.getAgent(a.name)) { seeded.add(a.name); continue; }
+    store.upsertAgent(a);
+    seeded.add(a.name);
+    added.push(a.name);
+  }
+  store.docPut("meta", "seed-agents", { id: "seed-agents", agents: [...seeded] });
+  return added;
+}
 import type { Settings } from "./settings.ts";
 import type { Work } from "./work.ts";
 

@@ -11,16 +11,17 @@ import type { Settings } from "./settings.ts";
 import type { HubEvent, Task } from "./types.ts";
 import type { Project, QAPort } from "./work.ts";
 import { z } from "zod";
+import { priorityRank } from "./priority.ts";
 
 interface Step { desc: string; cmd: string; status: "passed" | "failed" | "skipped" | null; ms?: number; error?: string | null; found?: string; at?: string; locate?: boolean; assert?: boolean }
 interface Case { id: string; criterion: number | null; kind: "browser" | "unit" | "check" | "health"; title: string; mutates: string[]; status: "passed" | "failed" | "running" | "skipped" | null; steps: Step[]; note?: string }
 export interface QARun {
-  id: string; issueKey: string; title: string; projectId: string; pr: number | null; hotfix: boolean;
+  id: string; issueKey: string; title: string; projectId: string; pr: number | null; hotfix: boolean; priority: number;
   status: "queued" | "running" | "passed" | "failed" | "cancelled"; trigger: string; browser: string | null; env: string; account: string | null;
   mutates: string[]; cases: Case[]; queuedAt: string; startedAt?: string; endedAt?: string; wait: string | null; cursor: { c: number; s: number } | null;
   simulated: boolean; taskId?: string; failAt?: number; boosted?: boolean;
 }
-type IssueLike = { key: string; title: string; description: string; labels: string[]; projectId: string; pr: { number: number } | null; quality: { criteria: string[] } };
+type IssueLike = { key: string; title: string; description: string; labels: string[]; projectId: string; pr: { number: number } | null; priority: number; quality: { criteria: string[] } };
 
 const WEB = /页面|首页|导航|按钮|登录|博客|表单|移动端|样式|展示|定价|seo|前端|UI/i;
 const now = () => new Date().toISOString();
@@ -99,7 +100,7 @@ export class QA implements QAPort {
 
   enqueue(i: IssueLike, trigger: string): string {
     const cases = this.buildCases(i);
-    const r: QARun = { id: "qr_" + this.store.nextSeq("qa"), issueKey: i.key, title: i.title, projectId: i.projectId, pr: i.pr?.number ?? null, hotfix: i.labels.includes("hotfix"), status: "queued", trigger, browser: null, env: "", account: null, mutates: [...new Set(cases.flatMap((c) => c.mutates))], cases, queuedAt: now(), wait: "等待调度", cursor: null, simulated: this.simulate };
+    const r: QARun = { id: "qr_" + this.store.nextSeq("qa"), issueKey: i.key, title: i.title, projectId: i.projectId, pr: i.pr?.number ?? null, hotfix: i.labels.includes("hotfix"), priority: i.priority ?? 0, status: "queued", trigger, browser: null, env: "", account: null, mutates: [...new Set(cases.flatMap((c) => c.mutates))], cases, queuedAt: now(), wait: "等待调度", cursor: null, simulated: this.simulate };
     r.env = this.envFor(r);
     this.save(r);
     this.emit();
@@ -131,7 +132,10 @@ export class QA implements QAPort {
   }
 
   // ---------- 调度 ----------
+  /** 浏览器验收的并发：远程 Chrome / 串行 / 真实 DevEye（单浏览器会话）时为 1 */
   private capacity() { const s = this.settings.get().qa; return s.browser === "local" || s.schedule === "serial" || (!this.simulate && this.deveye) ? 1 : s.maxParallel; }
+  /** 不需要浏览器的验收（CI：单元测试 / 检查）不占浏览器，只受最大并行数限制 */
+  private ciCapacity() { const s = this.settings.get().qa; return s.schedule === "serial" ? 1 : Math.max(1, s.maxParallel); }
   private conflict(a: QARun, b: QARun): string | null {
     if (a.env !== b.env || a.env === "CI") return null;
     const m = a.mutates.find((x) => b.mutates.includes(x));
@@ -143,10 +147,15 @@ export class QA implements QAPort {
     const s = this.settings.get().qa;
     let changed = false;
     const running = this.runs().filter((r) => r.status === "running");
-    const queued = this.runs().filter((r) => r.status === "queued").sort((a, b) => Number(b.hotfix) - Number(a.hotfix) || a.queuedAt.localeCompare(b.queuedAt));
+    const queued = this.runs()
+      .filter((r) => r.status === "queued")
+      .sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority) || Number(b.hotfix) - Number(a.hotfix) || a.queuedAt.localeCompare(b.queuedAt));
     for (const r of queued) {
       const prev = r.wait;
-      if (running.length >= this.capacity()) r.wait = s.browser === "local" ? "远程 Chrome 一次只执行一个验收" : s.schedule === "serial" ? "串行模式：等待前一个验收完成" : `并行已满（${this.capacity()} 个浏览器）`;
+      const ci = this.envFor(r) === "CI";
+      const busy = ci ? running.filter((x) => x.env === "CI").length >= this.ciCapacity() : running.filter((x) => x.env !== "CI").length >= this.capacity();
+      if (ci && busy) r.wait = `并行已满（${this.ciCapacity()} 个 CI 验收）`;
+      else if (busy) r.wait = s.browser === "local" ? "远程 Chrome 一次只执行一个验收" : s.schedule === "serial" ? "串行模式：等待前一个验收完成" : `并行已满（${this.capacity()} 个浏览器）`;
       else {
         r.env = this.envFor(r);
         const accounts = this.proj(r.projectId)?.env.accounts ?? [];
@@ -186,7 +195,7 @@ export class QA implements QAPort {
     } else {
       const agent = this.store.getAgent("tester") ? "tester" : this.store.listAgents()[0]?.name;
       if (!agent) return this.finish(r, "failed");
-      const t = this.runtime.submit(agent, this.taskInput(r), { source: "qa" as Task["source"] });
+      const t = this.runtime.submit(agent, this.taskInput(r), { source: "qa" as Task["source"], priority: r.priority });
       r.taskId = t.id;
       this.save(r);
     }

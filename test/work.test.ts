@@ -8,6 +8,7 @@ import { Runtime } from "../src/runtime.ts";
 import { Settings } from "../src/settings.ts";
 import { Notifier } from "../src/notify.ts";
 import { GitHub } from "../src/github.ts";
+import { Linear } from "../src/linear.ts";
 import { Workspace } from "../src/workspace.ts";
 import { Work } from "../src/work.ts";
 import { QA } from "../src/qa.ts";
@@ -27,7 +28,7 @@ function setup(opts: { reviewFailRate?: number; qaFail?: boolean | null } = {}) 
   const github = new GitHub(() => null);
   const workspace = new Workspace("/tmp/agent-hub-test-ws", () => null);
   const runtime = new Runtime(store, simulatedLLM({ delayMs: [5, 15], reviewFailRate: opts.reviewFailRate ?? 0 }), { maxConcurrency: 8, maxDepth: 3, maxHops: 3 });
-  const work = new Work(store, runtime, { notify, settings, github, workspace, simulate: true });
+  const work = new Work(store, runtime, { notify, settings, github, linear: new Linear(() => null), workspace, simulate: true });
   const qa = new QA(store, runtime, settings, (id) => work.proj(id), true, { stepMs: 2 });
   qa.forceFail = opts.qaFail ?? false;
   work.qa = qa;
@@ -150,4 +151,30 @@ test("cron：下次运行时间", () => {
   assert.equal(n.getMinutes(), 0);
   assert.equal(nextRun("*/5 * * * *", new Date("2026-11-24T08:31:00"))!.getMinutes(), 35);
   assert.equal(nextRun("bad"), null);
+});
+
+test("测试队列：高优先级的工作项先执行", async () => {
+  const { work, qa, settings } = setup();
+  settings.patch({ qa: { schedule: "serial", maxParallel: 1, browser: "local", headless: true } });
+  const p = work.saveProject({ name: "演示", key: "DEMO" });
+  const low = await work.create({ projectId: p.id, title: "低优先级", description: GOOD, priority: 4 });
+  const high = await work.create({ projectId: p.id, title: "高优先级", description: GOOD, priority: 1 });
+  const lowRun = qa.enqueue(work.view(work.find(low.key)), "manual");
+  const highRun = qa.enqueue(work.view(work.find(high.key)), "manual");
+  qa.tick();
+  assert.equal(qa.run(highRun)?.priority, 1);
+  assert.equal(qa.run(highRun)?.status, "running");
+  assert.equal(qa.run(lowRun)?.status, "queued");
+  qa.cancel(lowRun);
+  qa.cancel(highRun);
+});
+
+test("工作项执行：任务继承工作项优先级", async () => {
+  const { work, store } = setup();
+  const p = work.saveProject({ name: "演示", key: "DEMO" });
+  const v = await work.create({ projectId: p.id, title: "紧急修复", description: GOOD, priority: 1, assignee: "developer" });
+  await until(() => work.list().find((i) => i.key === v.key)!.status === "in_review");
+  const issue = work.find(v.key);
+  const run = store.listTasks({ issueId: issue.id, rootsOnly: true })[0];
+  assert.equal(run.priority, 1);
 });

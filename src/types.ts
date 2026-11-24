@@ -100,6 +100,8 @@ export interface Task {
   source: TaskSource;
   /** 该运行所属的工作项 */
   issueId: number | null;
+  /** 调度优先级：0 无 · 1 紧急 · 2 高 · 3 中 · 4 低；高优先级先获得执行机会 */
+  priority: number;
   turns: number;
   inputTokens: number;
   outputTokens: number;

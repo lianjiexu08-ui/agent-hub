@@ -43,6 +43,7 @@ export class Store {
         depth INTEGER NOT NULL,
         hops INTEGER NOT NULL,
         source TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
         turns INTEGER NOT NULL DEFAULT 0,
         input_tokens INTEGER NOT NULL DEFAULT 0,
         output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -97,6 +98,7 @@ export class Store {
     // 旧库迁移：tasks 增加 issue_id
     const cols = this.db.prepare(`PRAGMA table_info(tasks)`).all() as { name: string }[];
     if (!cols.some((c) => c.name === "issue_id")) this.db.exec(`ALTER TABLE tasks ADD COLUMN issue_id INTEGER`);
+    if (!cols.some((c) => c.name === "priority")) this.db.exec(`ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(issue_id)`);
   }
 
@@ -187,10 +189,10 @@ export class Store {
     const ts = now();
     this.db
       .prepare(
-        `INSERT INTO tasks(id, agent, input, status, result, error, parent_id, root_id, depth, hops, source, issue_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks(id, agent, input, status, result, error, parent_id, root_id, depth, hops, source, issue_id, priority, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(t.id, t.agent, t.input, t.status, t.result, t.error, t.parentId, t.rootId, t.depth, t.hops, t.source, t.issueId, ts, ts);
+      .run(t.id, t.agent, t.input, t.status, t.result, t.error, t.parentId, t.rootId, t.depth, t.hops, t.source, t.issueId, t.priority, ts, ts);
     return this.getTask(t.id)!;
   }
 
@@ -445,6 +447,7 @@ function rowToTask(r: any): Task {
     hops: r.hops,
     source: r.source,
     issueId: r.issue_id ?? null,
+    priority: r.priority ?? 0,
     turns: r.turns,
     inputTokens: r.input_tokens,
     outputTokens: r.output_tokens,

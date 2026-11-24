@@ -14,9 +14,14 @@ import { McpManager } from "./mcp-client.ts";
 import { buildExternalTools, type ExternalTools, type ToolHandler, type ToolOutput } from "./tools.ts";
 import type { Agent, BusMessage, HubEvent, Task, TaskSource } from "./types.ts";
 import { costOf } from "./pricing.ts";
+import { priorityRank } from "./priority.ts";
+import { PrioritySlots } from "./slots.ts";
+import { builtinReceipt, recordReceipt } from "./receipt.ts";
 
 /** 非内置运行底座（Claude Code 等 CLI）的执行器 */
 export interface CliExecutor {
+  /** 取得该运行底座的一个进程槽位（超过并发上限时按优先级排队） */
+  acquire?(runtime: string, priority: number, signal: AbortSignal): Promise<() => void>;
   run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void }): Promise<{ result: string; cost?: number; inputTokens?: number; outputTokens?: number; transcript?: BetaMessageParam[] }>;
 }
 
@@ -44,25 +49,6 @@ export interface RuntimeOptions {
   maxHops: number; // 总线触发链最大跳数
 }
 
-class Semaphore {
-  private queue: (() => void)[] = [];
-  private active = 0;
-  private limit: number;
-  constructor(limit: number) {
-    this.limit = limit;
-  }
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.active >= this.limit) await new Promise<void>((r) => this.queue.push(r));
-    this.active++;
-    try {
-      return await fn();
-    } finally {
-      this.active--;
-      this.queue.shift()?.();
-    }
-  }
-}
-
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 
 const CallAgentInput = z.object({ agent: z.string(), task: z.string().min(1) });
@@ -73,7 +59,8 @@ class ToolError extends Error {}
 
 export class Runtime {
   readonly events = new EventEmitter();
-  private sem: Semaphore;
+  private sem: PrioritySlots;
+  private modelLimit: number;
   private controllers = new Map<string, AbortController>();
   private store: Store;
   private llm: LLM;
@@ -91,7 +78,8 @@ export class Runtime {
     this.llm = llm;
     this.opts = opts;
     this.mcp = mcp;
-    this.sem = new Semaphore(opts.maxConcurrency);
+    this.modelLimit = opts.maxConcurrency;
+    this.sem = new PrioritySlots(() => this.modelLimit);
     this.events.setMaxListeners(0);
   }
 
@@ -100,6 +88,15 @@ export class Runtime {
   /** 注册一个对所有智能体可用的内置工具 */
   addTool(def: BetaToolUnion & { name: string }, run: ToolHandler, when?: (task: Task, agent: Agent) => boolean) {
     this.extraTools.set(def.name, { def, run, when });
+  }
+
+  /** 调整内置运行底座同时在途的模型请求数（设置里修改后立即生效） */
+  setConcurrency(n: number) {
+    this.modelLimit = Math.max(1, Math.floor(n) || 1);
+    this.sem.pump();
+  }
+  concurrency() {
+    return { model: { limit: this.modelLimit, running: this.sem.running, waiting: this.sem.waiting } };
   }
 
   setHooks(h: RuntimeHooks) {
@@ -146,7 +143,7 @@ export class Runtime {
   submit(
     agentName: string,
     input: string,
-    meta: { parent?: Task; source?: TaskSource; hops?: number; issueId?: number | null } = {},
+    meta: { parent?: Task; source?: TaskSource; hops?: number; issueId?: number | null; priority?: number } = {},
   ): Task {
     if (!this.store.getAgent(agentName)) throw new Error(`unknown agent: ${agentName}`);
     const id = randomUUID();
@@ -163,9 +160,10 @@ export class Runtime {
       hops: meta.hops ?? 0,
       source: meta.source ?? "api",
       issueId: meta.issueId ?? null,
+      priority: meta.priority ?? meta.parent?.priority ?? 0,
     });
     this.emitTask(task);
-    queueMicrotask(() => void this.execute(id));
+    this.enqueueReady(task);
     return task;
   }
 
@@ -216,13 +214,27 @@ export class Runtime {
         agent.name,
         `总线主题「${topic}」收到一条来自 ${from.sender} 的新消息（#${msg.id}）：\n\n${content}\n\n` +
           `请按你的职责处理。如需回应，可用 publish 工具发布到相应主题。`,
-        { source: "bus", hops: hops + 1 },
+        { source: "bus", hops: hops + 1, priority: from.task?.priority ?? 0 },
       );
     }
     return msg;
   }
 
   // ======================= 执行循环 =======================
+
+  /** 同一批提交的任务按优先级启动，避免先提交的低优先级任务抢先占满槽位 */
+  private ready: Task[] = [];
+  private readyTimer: ReturnType<typeof setTimeout> | null = null;
+  private enqueueReady(task: Task) {
+    this.ready.push(task);
+    if (this.readyTimer) return;
+    this.readyTimer = setTimeout(() => {
+      this.readyTimer = null;
+      const batch = this.ready.sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority));
+      this.ready = [];
+      for (const t of batch) void this.execute(t.id);
+    }, 0);
+  }
 
   private async execute(id: string) {
     const task = this.store.getTask(id);
@@ -232,6 +244,14 @@ export class Runtime {
 
     const controller = new AbortController();
     this.controllers.set(id, controller);
+    const viaCli = !!agent.runtime && agent.runtime !== "builtin" && !this.forceBuiltin;
+    // CLI 底座：先排队拿进程槽位，排队期间保持 pending（哨兵不会把它当成卡住）
+    let releaseCli: (() => void) | null = null;
+    if (viaCli && this.cli?.acquire) {
+      try { releaseCli = await this.cli.acquire(agent.runtime, task.priority, controller.signal); }
+      catch { this.controllers.delete(id); return; } // 排队时被取消，cancel() 已写入状态
+      if (controller.signal.aborted || this.store.getTask(id)?.status !== "pending") { releaseCli(); this.controllers.delete(id); return; }
+    }
     this.emitTask(this.store.updateTask(id, { status: "running" }));
 
     const system = this.systemFor(agent) + (this.hooks.systemExtra?.(task, agent) ?? "");
@@ -239,7 +259,7 @@ export class Runtime {
     let outputTokens = 0;
     let cost = 0;
 
-    if (agent.runtime && agent.runtime !== "builtin" && !this.forceBuiltin) {
+    if (viaCli) {
       try {
         if (!this.cli) throw new Error(`运行底座 ${agent.runtime} 不可用`);
         const out = await this.cli.run(task, agent, { system, signal: controller.signal, heartbeat: () => this.touch(id) });
@@ -251,6 +271,7 @@ export class Runtime {
         if (controller.signal.aborted) return;
         return this.finish(id, { status: "failed", error: describeError(err) });
       } finally {
+        releaseCli?.();
         this.controllers.delete(id);
       }
     }
@@ -263,10 +284,20 @@ export class Runtime {
         : task.input;
       const messages: BetaMessageParam[] = [{ role: "user", content: input }];
       this.store.saveMessages(id, messages);
+      recordReceipt(
+        this.store,
+        builtinReceipt({
+          taskId: id, agent: agent.name, model: agent.model, system, input,
+          tools: tools.map((t) => ("name" in t ? String(t.name) : String((t as { type?: string }).type ?? "?"))),
+          skills: agent.skills ?? [], knowledge: (input.match(/^- \[/gm) ?? []).length,
+        }),
+      );
 
       for (let turn = 1; turn <= agent.maxTurns; turn++) {
         if (controller.signal.aborted) return;
 
+        // 排队等模型槽位、以及长时间的模型调用期间每 30 秒更新心跳，避免被哨兵误判为卡住
+        const beat = setInterval(() => this.touch(id), 30_000);
         const response = await this.sem.run(() =>
           this.llm.create(
             {
@@ -282,8 +313,7 @@ export class Runtime {
               fallbacks: "default",
             },
             { signal: controller.signal },
-          ),
-        );
+          ), task.priority, controller.signal).finally(() => clearInterval(beat));
 
         inputTokens +=
           response.usage.input_tokens +

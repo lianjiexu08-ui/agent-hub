@@ -54,11 +54,19 @@ function toolResults(messages: BetaMessageParam[]): string[] | null {
 const text = (t: string): Block => ({ type: "text", text: t });
 const call = (name: string, input: unknown): Block => ({ type: "tool_use", name, input });
 
-function setup(agents: object[], scripts: Record<string, Script>, opts = {}) {
+function setup(
+  agents: object[],
+  scripts: Record<string, Script>,
+  opts: { maxConcurrency?: number; maxDepth?: number; maxHops?: number; llmDelay?: number } = {},
+) {
   const store = new Store(":memory:");
   agents.forEach((a) => store.upsertAgent(AgentSchema.parse(a)));
-  const llm = fakeLLM(scripts);
-  const runtime = new Runtime(store, llm, { maxConcurrency: 4, maxDepth: 3, maxHops: 3, ...opts });
+  const llm = fakeLLM(scripts, opts.llmDelay ?? 5);
+  const runtime = new Runtime(store, llm, {
+    maxConcurrency: opts.maxConcurrency ?? 4,
+    maxDepth: opts.maxDepth ?? 3,
+    maxHops: opts.maxHops ?? 3,
+  });
   return { store, runtime, llm };
 }
 
@@ -79,13 +87,34 @@ test("中心编排：并行委派两个 worker 并汇总", async () => {
       b: () => [text("B 完成")],
     },
   );
-  const task = runtime.submit("boss", "目标");
+  const task = runtime.submit("boss", "目标", { priority: 2 });
   const done = await runtime.waitFor(task.id);
   assert.equal(done.status, "completed");
   assert.equal(done.result, "汇总：A 完成 + B 完成");
   const children = store.listTasks({ parentId: task.id });
   assert.equal(children.length, 2);
-  assert.ok(children.every((c) => c.depth === 1 && c.rootId === task.id && c.source === "delegate"));
+  assert.ok(children.every((c) => c.depth === 1 && c.rootId === task.id && c.source === "delegate" && c.priority === 2));
+});
+
+test("调度优先级：槽位紧张时高优先级先获得执行机会", async () => {
+  const started: string[] = [];
+  const { runtime } = setup(
+    [{ name: "long", delegation: "none" }, { name: "low", delegation: "none" }, { name: "high", delegation: "none" }],
+    {
+      long: () => { started.push("long"); return [text("long")]; },
+      low: () => { started.push("low"); return [text("low")]; },
+      high: () => { started.push("high"); return [text("high")]; },
+    },
+    { maxConcurrency: 1, llmDelay: 60 },
+  );
+  const first = runtime.submit("long", "占住唯一的执行槽", { priority: 3 });
+  await new Promise((r) => setTimeout(r, 10)); // 等它真正拿到槽位
+  const low = runtime.submit("low", "低优先级", { priority: 4 });
+  const high = runtime.submit("high", "高优先级", { priority: 1 });
+  await Promise.all([runtime.waitFor(first.id), runtime.waitFor(low.id), runtime.waitFor(high.id)]);
+  assert.deepEqual(started, ["long", "high", "low"]);
+  assert.equal(low.priority, 4);
+  assert.equal(high.priority, 1);
 });
 
 test("对等调用：无权限的委派返回工具错误", async () => {

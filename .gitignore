@@ -7,3 +7,6 @@ data/
 *.log
 .DS_Store
 data-demo/
+.hub-token
+.hub-password
+data-demo-archive*/

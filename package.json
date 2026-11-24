@@ -5,8 +5,9 @@
   "scripts": {
     "start": "node src/index.ts",
     "demo": "HUB_SIMULATE=1 HUB_DATA=./data-demo node src/index.ts",
+    "demo:lan": "HOST=0.0.0.0 HUB_SIMULATE=1 HUB_DATA=./data-demo node src/index.ts",
     "mcp": "node src/mcp.ts",
-    "test": "node --test test/",
+    "test": "node --test 'test/**/*.test.ts'",
     "typecheck": "tsc"
   },
   "keywords": [

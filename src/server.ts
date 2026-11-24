@@ -2,12 +2,16 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { Store } from "./db.ts";
+import type { Uploads } from "./uploads.ts";
+import { checkPassword, clearedCookie, cookieOf, issueSession, LoginThrottle, loginEnabled, sessionCookie, verifySession, type Security } from "./auth.ts";
 import type { Runtime } from "./runtime.ts";
 import { readFileSync } from "node:fs";
-import { detectRuntimes } from "./runtimes.ts";
+import { detectRuntimeModels, detectRuntimes } from "./runtimes.ts";
 import { AgentSchema, McpServerSchema, ToolSchema, type HubEvent } from "./types.ts";
 
 const PANEL_PATH = new URL("../public/index.html", import.meta.url);
+const ASSET_DIR = new URL("../public/assets/", import.meta.url);
+const ASSET_TYPES: Record<string, string> = { ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8" };
 
 const SubmitTask = z.object({
   agent: z.string(),
@@ -19,9 +23,9 @@ const SubmitTask = z.object({
 
 const Publish = z.object({ content: z.string().min(1), sender: z.string().default("user") });
 
-export interface AppExtras { state(): Promise<unknown>; rpc(method: string, args: unknown[]): Promise<unknown> }
+export interface AppExtras { state(): Promise<unknown>; rpc(method: string, args: unknown[]): Promise<unknown>; uploads?: Uploads }
 
-export function createApp(store: Store, runtime: Runtime, token?: string, extras?: AppExtras) {
+export function createApp(store: Store, runtime: Runtime, security?: Security, extras?: AppExtras) {
   const app = new Hono();
 
   app.onError((err, c) => {
@@ -30,18 +34,89 @@ export function createApp(store: Store, runtime: Runtime, token?: string, extras
     return c.json({ error: err.message }, (status === 404 || status === 409 ? status : 400) as 400);
   });
 
-  if (token) {
+  // ---------- 登录（账号密码） ----------
+  const throttle = new LoginThrottle();
+  app.get("/api/session", (c) => {
+    if (!security) return c.json({ authenticated: true, loginEnabled: false });
+    const s = verifySession(cookieOf(c.req.header("cookie")), security.password);
+    if (!s) return c.json({ authenticated: false, loginEnabled: true });
+    return c.json({ authenticated: true, user: s.user, loginEnabled: true });
+  });
+  app.post("/api/login", async (c) => {
+    if (!security) return c.json({ error: "未启用账号登录" }, 400);
+    const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() || c.req.header("x-real-ip") || "local";
+    const wait = throttle.blocked(ip);
+    if (wait) return c.json({ error: `尝试过于频繁，请 ${wait} 秒后再试` }, 429);
+    const body = (await c.req.json().catch(() => ({}))) as { user?: string; password?: string };
+    if (!checkPassword(body, security)) {
+      throttle.fail(ip);
+      return c.json({ error: "用户名或密码不正确" }, 401);
+    }
+    throttle.ok(ip);
+    c.header("set-cookie", sessionCookie(issueSession(security.user, security.password)));
+    return c.json({ ok: true, user: security.user });
+  });
+  app.post("/api/logout", (c) => {
+    c.header("set-cookie", clearedCookie());
+    return c.json({ ok: true });
+  });
+
+  // 鉴权：账号会话（Cookie）或 API 令牌（Bearer / ?token=）二选一
+  // 注意：不要写成 loginEnabled(security)，类型守卫在已收窄的类型上会把分支推成 never
+  const hasLogin = !!security?.password;
+  const needsAuth = !!security && (hasLogin || !!security.token);
+  if (needsAuth && security) {
+    const cfg = security;
     app.use("*", async (c, next) => {
-      if (c.req.path === "/health" || c.req.path === "/") return next();
-      // 浏览器 EventSource 无法设置请求头，所以也接受 ?token=
-      const ok = c.req.header("authorization") === `Bearer ${token}` || c.req.query("token") === token;
-      if (!ok) return c.json({ error: "unauthorized" }, 401);
+      const p = c.req.path;
+      // 页面、静态资源、健康检查与登录接口本身不需要鉴权
+      if (p === "/" || p === "/health" || p.startsWith("/assets/") || p === "/api/session" || p === "/api/login") return next();
+      const bearer = c.req.header("authorization");
+      const byToken = !!cfg.token && (bearer === `Bearer ${cfg.token}` || c.req.query("token") === cfg.token);
+      const session = hasLogin ? verifySession(cookieOf(c.req.header("cookie")), cfg.password) : null;
+      if (!byToken && !session) return c.json({ error: "unauthorized" }, 401);
       return next();
     });
   }
 
   app.get("/health", (c) => c.json({ ok: true }));
+  /** 上传附件（截图 / 文件）。一次最多 10 个，单个 20 MB */
+  app.post("/api/upload", async (c) => {
+    if (!extras) return c.json({ error: "附件功能未启用" }, 500);
+    const body = await c.req.parseBody({ all: true });
+    const files = Object.values(body).flat().filter((v): v is File => typeof v === "object" && v !== null && "arrayBuffer" in v && "name" in v);
+    if (!files.length) return c.json({ error: "没有收到文件" }, 400);
+    if (files.length > 10) return c.json({ error: "一次最多上传 10 个文件" }, 400);
+    const saved = [];
+    for (const f of files) {
+      const buf = Buffer.from(await f.arrayBuffer());
+      saved.push(extras.uploads!.save({ name: f.name, type: f.type, size: f.size, arrayBuffer: async () => buf.buffer as ArrayBuffer }, buf));
+    }
+    return c.json({ attachments: saved }, 201);
+  });
+  /** 读取附件（图片按原 mime 返回，其它按下载） */
+  app.get("/uploads/:id", (c) => {
+    if (!extras) return c.notFound();
+    const got = extras.uploads!.read(c.req.param("id"));
+    if (!got) return c.notFound();
+    return c.newResponse(new Uint8Array(got.data), 200, {
+      "content-type": got.meta.mime,
+      "cache-control": "private, max-age=86400",
+      "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(got.meta.name)}`,
+    });
+  });
+
   app.get("/runtimes", async (c) => c.json(await detectRuntimes(c.req.query("refresh") === "1")));
+  /** 某个 CLI 底座可用的模型（refresh=1 强制重新检测） */
+  app.get("/runtimes/:id/models", async (c) => {
+    const id = c.req.param("id");
+    if (!["claude-code", "codex", "gemini", "pi", "builtin"].includes(id)) return c.json({ error: "unknown runtime" }, 404);
+    if (id === "builtin") {
+      const models = (await import("./settings.ts")).MODELS.map((m) => ({ id: m.id, name: m.label }));
+      return c.json({ models, source: "内置模型列表", detectedAt: new Date().toISOString() });
+    }
+    return c.json(await detectRuntimeModels(id, { force: c.req.query("refresh") === "1" }));
+  });
 
   // ---------- 面板数据与操作 ----------
   if (extras) {
@@ -58,6 +133,17 @@ export function createApp(store: Store, runtime: Runtime, token?: string, extras
     const { name, input } = (await c.req.json()) as { name: string; input: unknown };
     try { return c.json(await runtime.invokeTool(c.req.param("id"), name, input)); }
     catch (e) { return c.json({ error: (e as Error).message, isError: true }); }
+  });
+  // ---------- 前端静态资源（无构建：styles.css / app.js） ----------
+  app.get("/assets/:file", (c) => {
+    const file = c.req.param("file");
+    const type = ASSET_TYPES[file.slice(file.lastIndexOf("."))];
+    if (!/^[A-Za-z0-9._-]+$/.test(file) || !type) return c.notFound();
+    try {
+      return c.body(readFileSync(new URL(file, ASSET_DIR)), 200, { "content-type": type, "cache-control": "no-cache" });
+    } catch {
+      return c.notFound();
+    }
   });
   app.get("/", (c) => c.html(readFileSync(PANEL_PATH, "utf8"))); // 每次读取，改面板无需重启
 
@@ -139,7 +225,7 @@ export function createApp(store: Store, runtime: Runtime, token?: string, extras
     if (!task) return c.json({ error: "not found" }, 404);
     const children = store.listTasks({ parentId: task.id, limit: 1000 });
     const withMessages = c.req.query("messages") === "1";
-    return c.json({ ...task, children, ...(withMessages ? { messages: store.getMessages(task.id) } : {}) });
+    return c.json({ ...task, children, receipt: store.docGet("receipts", task.id) ?? null, ...(withMessages ? { messages: store.getMessages(task.id) } : {}) });
   });
   /** 整棵调用树（以 root 为根） */
   app.get("/tasks/:id/tree", (c) => {

@@ -10,9 +10,10 @@ import type { LLM, Runtime } from "./runtime.ts";
 import type { Settings } from "./settings.ts";
 import type { HubEvent } from "./types.ts";
 import type { Work } from "./work.ts";
+import type { Attachment, Uploads } from "./uploads.ts";
 import { PHASE_LABEL } from "./work.ts";
 
-export interface ButlerMsg { role: "me" | "ai"; text: string; card?: Record<string, any>; at?: string }
+export interface ButlerMsg { role: "me" | "ai"; text: string; card?: Record<string, any>; attachments?: Attachment[]; at?: string }
 const STATUS: Record<string, string> = { backlog: "待规划", todo: "待办", in_progress: "进行中", in_review: "待审核", done: "完成", canceled: "已取消" };
 
 const BUTLER_SYSTEM = `你是 Agent Hub 的管家，帮用户管理多个项目的工作。用户只参与「需求的制定与确认」和「最终成果验收」，其余由智能体完成。
@@ -24,6 +25,8 @@ const BUTLER_SYSTEM = `你是 Agent Hub 的管家，帮用户管理多个项目�
 回答简洁，用中文。`;
 
 export class Assistant {
+  /** 附件存储（由 index.ts 注入）；没有时退化为纯文本 */
+  uploads: Uploads | null = null;
   private store: Store;
   private runtime: Runtime;
   private work: Work;
@@ -63,20 +66,30 @@ export class Assistant {
 
   private canUseModel() { return !this.simulate; }
 
-  async butler(text: string): Promise<{ fallback?: boolean }> {
+  async butler(text: string, attachmentIds: string[] = []): Promise<{ fallback?: boolean }> {
     if (!this.canUseModel()) return { fallback: true };
     const history = this.conversation().slice(-20);
+    const ids = (attachmentIds ?? []).filter((x) => typeof x === "string").slice(0, 10);
+    const atts = ids.map((id) => this.uploads?.get(id)).filter((x): x is Attachment => !!x);
+    const desc = this.uploads?.describe(ids) ?? { blocks: [], text: "" };
     const messages: BetaMessageParam[] = [];
     for (const m of history) {
       const role = m.role === "me" ? "user" : "assistant";
-      const content = m.text + (m.card ? `\n[已给出${m.card.type === "plan" ? "拆分计划" : "操作"}卡片：${m.card.created ? "已创建" : m.card.done ? "已执行" : "待确认"}]` : "");
+      const content = m.text + (m.attachments?.length ? `\n[附件：${m.attachments.map((a) => a.name).join("、")}]` : "") + (m.card ? `\n[已给出${m.card.type === "plan" ? "拆分计划" : "操作"}卡片：${m.card.created ? "已创建" : m.card.done ? "已执行" : "待确认"}]` : "");
       if (messages.at(-1)?.role === role) (messages.at(-1)!.content as string) += `\n\n${content}`;
       else messages.push({ role, content });
     }
     if (messages[0]?.role === "assistant") messages.shift();
-    if (messages.at(-1)?.role === "user") (messages.at(-1)!.content as string) += `\n\n${text}`;
-    else messages.push({ role: "user", content: text });
-    this.append({ role: "me", text });
+    // 当前这一轮：图片作为视觉块、文本文件内联、其它只列名称
+    const blocks: Record<string, unknown>[] = desc.blocks.map((b) => ({ type: "image", source: { type: "base64", media_type: b.media_type, data: b.data } }));
+    const body = [desc.text ? `附件：\n${desc.text}` : "", text].filter(Boolean).join("\n\n");
+    if (blocks.length) {
+      blocks.push({ type: "text", text: body });
+      if (messages.at(-1)?.role === "user") messages.push({ role: "user", content: blocks as never });
+      else messages.push({ role: "user", content: blocks as never });
+    } else if (messages.at(-1)?.role === "user") (messages.at(-1)!.content as string) += `\n\n${body}`;
+    else messages.push({ role: "user", content: body });
+    this.append({ role: "me", text, attachments: atts.length ? atts : undefined });
 
     const agents = this.store.listAgents().map((a) => `${a.name}（${a.description}）`).join("、");
     const tools: BetaToolUnion[] = [
@@ -90,7 +103,7 @@ export class Assistant {
     let reply = "";
     try {
       for (let turn = 0; turn < 6; turn++) {
-        const res = await this.llm().create({ model: this.settings.modelId(this.settings.get().defaultModel), max_tokens: 4000, system: `${BUTLER_SYSTEM}\n\n可用智能体：${agents}`, messages, tools, output_config: { effort: "medium" } }, { signal: AbortSignal.timeout(120_000) });
+        const res = await this.llm().create({ model: this.settings.assistantModelId(), max_tokens: 4000, system: `${BUTLER_SYSTEM}\n\n可用智能体：${agents}`, messages, tools, output_config: { effort: "medium" } }, { signal: AbortSignal.timeout(120_000) });
         messages.push({ role: "assistant", content: res.content });
         reply = res.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("\n").trim() || reply;
         const calls = res.content.filter((b) => b.type === "tool_use") as { id: string; name: string; input: any }[];
