@@ -27,10 +27,6 @@ export function importSeed(store: Store, data: { agents?: unknown[]; tools?: unk
 import type { Settings } from "./settings.ts";
 import type { Work } from "./work.ts";
 
-export function seedDefault(work: Work) {
-  work.saveProject({ name: "我的项目", key: "PRJ", description: "第一个项目。可以在项目设置里绑定 GitHub 仓库。" });
-}
-
 export async function seedDemo(work: Work, settings: Settings, store: Store) {
   const hub = work.saveProject({ name: "Agent Hub", key: "HUB", description: "多智能体调度平台本身的研发" });
   const web = work.saveProject({ name: "官网改版", key: "WEB", description: "官网文案、页面与 SEO", env: { baseUrl: "https://staging.example.com", preview: "https://web-pr-{pr}.preview.example.com", accounts: ["qa-user-1", "qa-user-2"] } });

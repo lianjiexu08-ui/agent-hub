@@ -3,10 +3,10 @@ import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { Store } from "./db.ts";
 import type { Uploads } from "./uploads.ts";
-import { checkPassword, clearedCookie, cookieOf, issueSession, LoginThrottle, loginEnabled, sessionCookie, verifySession, type Security } from "./auth.ts";
+import { checkPassword, clearedCookie, cookieOf, issueSession, LoginThrottle, loginEnabled, loginUser, sessionCookie, sessionSecret, verifySession, type Security } from "./auth.ts";
 import type { Runtime } from "./runtime.ts";
 import { readFileSync } from "node:fs";
-import { detectRuntimeModels, detectRuntimes } from "./runtimes.ts";
+import { detectRuntimeModels, detectRuntimes, verifyRuntimeModels } from "./runtimes.ts";
 import { AgentSchema, McpServerSchema, ToolSchema, type HubEvent } from "./types.ts";
 
 const PANEL_PATH = new URL("../public/index.html", import.meta.url);
@@ -36,11 +36,51 @@ export function createApp(store: Store, runtime: Runtime, security?: Security, e
 
   // ---------- 登录（账号密码） ----------
   const throttle = new LoginThrottle();
+  /** 首次登录后是否还需要用户自己设置账号密码 */
+  const needsSetup = (s: Security) => !!s.credentials && !s.credentials.initialized;
   app.get("/api/session", (c) => {
     if (!security) return c.json({ authenticated: true, loginEnabled: false });
-    const s = verifySession(cookieOf(c.req.header("cookie")), security.password);
-    if (!s) return c.json({ authenticated: false, loginEnabled: true });
-    return c.json({ authenticated: true, user: s.user, loginEnabled: true });
+    const setup = needsSetup(security);
+    const s = verifySession(cookieOf(c.req.header("cookie")), sessionSecret(security));
+    if (!s) return c.json({ authenticated: false, loginEnabled: true, needsSetup: setup });
+    return c.json({ authenticated: true, user: s.user, loginEnabled: true, needsSetup: setup });
+  });
+  app.post("/api/logout", (c) => {
+    c.header("set-cookie", clearedCookie());
+    return c.json({ ok: true });
+  });
+
+  // 鉴权：账号会话（Cookie）或 API 令牌（Bearer / ?token=）二选一
+  // 注意：不要写成 loginEnabled(security)，类型守卫在已收窄的类型上会把分支推成 never
+  const hasLogin = !!security?.password || !!security?.credentials?.initialized;
+  const needsAuth = !!security && (hasLogin || !!security.token);
+  if (needsAuth && security) {
+    const cfg = security;
+    app.use("*", async (c, next) => {
+      const p = c.req.path;
+      // 页面、静态资源、健康检查与登录接口本身不需要鉴权
+      if (p === "/" || p === "/health" || p.startsWith("/assets/") || p === "/api/session" || p === "/api/login") return next();
+      const bearer = c.req.header("authorization");
+      const byToken = !!cfg.token && (bearer === `Bearer ${cfg.token}` || c.req.query("token") === cfg.token);
+      const session = hasLogin ? verifySession(cookieOf(c.req.header("cookie")), sessionSecret(cfg)) : null;
+      if (!byToken && !session) return c.json({ error: "unauthorized" }, 401);
+      return next();
+    });
+  }
+
+  /** 首次登录后设置自己的账号与密码；已登录才能调用，设置完成后会话按新密钥重新签发 */
+  app.post("/api/setup", async (c) => {
+    if (!security?.credentials) return c.json({ error: "未启用账号登录" }, 400);
+    const body = (await c.req.json().catch(() => ({}))) as { user?: string; password?: string };
+    const user = (body.user ?? "").trim();
+    const password = body.password ?? "";
+    if (!user || user.length > 32) return c.json({ error: "账号不能为空，且不超过 32 个字符" }, 400);
+    if (/\s/.test(user)) return c.json({ error: "账号不能包含空格" }, 400);
+    if (password.length < 6) return c.json({ error: "密码至少 6 位" }, 400);
+    if (password.length > 128) return c.json({ error: "密码最多 128 位" }, 400);
+    security.credentials.set(user, password);
+    c.header("set-cookie", sessionCookie(issueSession(user, sessionSecret(security))));
+    return c.json({ ok: true, user });
   });
   app.post("/api/login", async (c) => {
     if (!security) return c.json({ error: "未启用账号登录" }, 400);
@@ -53,31 +93,10 @@ export function createApp(store: Store, runtime: Runtime, security?: Security, e
       return c.json({ error: "用户名或密码不正确" }, 401);
     }
     throttle.ok(ip);
-    c.header("set-cookie", sessionCookie(issueSession(security.user, security.password)));
-    return c.json({ ok: true, user: security.user });
+    const user = loginUser(security);
+    c.header("set-cookie", sessionCookie(issueSession(user, sessionSecret(security))));
+    return c.json({ ok: true, user, needsSetup: needsSetup(security) });
   });
-  app.post("/api/logout", (c) => {
-    c.header("set-cookie", clearedCookie());
-    return c.json({ ok: true });
-  });
-
-  // 鉴权：账号会话（Cookie）或 API 令牌（Bearer / ?token=）二选一
-  // 注意：不要写成 loginEnabled(security)，类型守卫在已收窄的类型上会把分支推成 never
-  const hasLogin = !!security?.password;
-  const needsAuth = !!security && (hasLogin || !!security.token);
-  if (needsAuth && security) {
-    const cfg = security;
-    app.use("*", async (c, next) => {
-      const p = c.req.path;
-      // 页面、静态资源、健康检查与登录接口本身不需要鉴权
-      if (p === "/" || p === "/health" || p.startsWith("/assets/") || p === "/api/session" || p === "/api/login") return next();
-      const bearer = c.req.header("authorization");
-      const byToken = !!cfg.token && (bearer === `Bearer ${cfg.token}` || c.req.query("token") === cfg.token);
-      const session = hasLogin ? verifySession(cookieOf(c.req.header("cookie")), cfg.password) : null;
-      if (!byToken && !session) return c.json({ error: "unauthorized" }, 401);
-      return next();
-    });
-  }
 
   app.get("/health", (c) => c.json({ ok: true }));
   /** 上传附件（截图 / 文件）。一次最多 10 个，单个 20 MB */
@@ -115,7 +134,9 @@ export function createApp(store: Store, runtime: Runtime, security?: Security, e
       const models = (await import("./settings.ts")).MODELS.map((m) => ({ id: m.id, name: m.label }));
       return c.json({ models, source: "内置模型列表", detectedAt: new Date().toISOString() });
     }
-    return c.json(await detectRuntimeModels(id, { force: c.req.query("refresh") === "1" }));
+    const data = await detectRuntimeModels(id, { force: c.req.query("refresh") === "1" });
+    const verify = c.req.query("verify") === "1" ? await verifyRuntimeModels(id) : null;
+    return c.json(verify ? { ...data, verify } : data);
   });
 
   // ---------- 面板数据与操作 ----------

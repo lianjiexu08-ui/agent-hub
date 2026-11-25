@@ -20,6 +20,11 @@ export interface LinearState {
   type: string;
   position: number;
 }
+/** Linear 上的真人。只在导入方向使用：Hub 的负责人是智能体，两者不是一回事 */
+export interface LinearUser {
+  id: string;
+  name: string;
+}
 export interface LinearIssue {
   id: string;
   identifier: string;
@@ -30,6 +35,10 @@ export interface LinearIssue {
   updatedAt: string;
   state: LinearState;
   labels: string[];
+  /** 创建人。Linear 侧只读字段，只能导入不能回推 */
+  creator?: LinearUser | null;
+  /** 指派人。可能为 null（大量历史单没有指派人），为 null 不代表「该清空」 */
+  assignee?: LinearUser | null;
 }
 export interface LinearIssueRef {
   id: string;
@@ -150,7 +159,7 @@ export class Linear {
         `query TeamIssues($id: String!, $after: String, $filter: IssueFilter) {
           team(id: $id) {
             issues(first: 100, after: $after, filter: $filter) {
-              nodes { id identifier title description priority url updatedAt state { id name type position } labels { nodes { name } } }
+              nodes { id identifier title description priority url updatedAt state { id name type position } creator { id name } assignee { id name } labels { nodes { name } } }
               pageInfo { hasNextPage endCursor }
             }
           }

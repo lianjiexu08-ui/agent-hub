@@ -13,7 +13,7 @@ import type { Work } from "./work.ts";
 import type { Attachment, Uploads } from "./uploads.ts";
 import { PHASE_LABEL } from "./work.ts";
 
-export interface ButlerMsg { role: "me" | "ai"; text: string; card?: Record<string, any>; attachments?: Attachment[]; at?: string }
+export interface ButlerMsg { role: "me" | "ai"; text: string; /** 模型的思考摘要，供界面折叠展示；没有思考时为空 */ thinking?: string; card?: Record<string, any>; attachments?: Attachment[]; at?: string }
 const STATUS: Record<string, string> = { backlog: "待规划", todo: "待办", in_progress: "进行中", in_review: "待审核", done: "完成", canceled: "已取消" };
 
 const BUTLER_SYSTEM = `你是 Agent Hub 的管家，帮用户管理多个项目的工作。用户只参与「需求的制定与确认」和「最终成果验收」，其余由智能体完成。
@@ -94,21 +94,43 @@ export class Assistant {
     const agents = this.store.listAgents().map((a) => `${a.name}（${a.description}）`).join("、");
     const tools: BetaToolUnion[] = [
       { name: "list_projects", description: "列出全部项目及概况", input_schema: { type: "object", properties: {}, additionalProperties: false } },
-      { name: "list_issues", description: "列出工作项，可按项目前缀过滤", input_schema: { type: "object", properties: { project: { type: "string" } }, additionalProperties: false } },
+      { name: "list_issues", description: "列出工作项。可按项目前缀、状态、Linear 创建人过滤；返回里带 Linear 侧的创建人与指派人", input_schema: { type: "object", properties: { project: { type: "string" }, status: { type: "string", description: "backlog / todo / in_progress / in_review / done / canceled" }, creator: { type: "string", description: "Linear 创建人，按包含匹配，如 lianjiexu" } }, additionalProperties: false } },
       { name: "get_issue", description: "查看工作项详情", input_schema: { type: "object", properties: { issue: { type: "string" } }, required: ["issue"], additionalProperties: false } },
       { name: "propose_plan", description: "提出拆分计划，用户确认后创建为工作项", input_schema: { type: "object", properties: { project: { type: "string", description: "项目前缀" }, items: { type: "array", items: { type: "object", properties: { title: { type: "string" }, description: { type: "string" }, assignee: { type: "string" }, priority: { type: "integer" }, labels: { type: "array", items: { type: "string" } } }, required: ["title", "description"] } } }, required: ["project", "items"], additionalProperties: false } },
       { name: "propose_action", description: "提出一个调整操作，用户确认后执行。op: update（args: key, patch）/ run（args: key）/ lead（args: project, mode: off|on_demand|autopilot）/ hotfix（args: project, title, description）", input_schema: { type: "object", properties: { label: { type: "string" }, op: { type: "string", enum: ["update", "run", "lead", "hotfix"] }, args: { type: "object" } }, required: ["label", "op", "args"], additionalProperties: false } },
+      {
+        name: "ask_agent",
+        description: "直接和某个智能体对话：把问题或任务交给它，等它做完后把回复带回来。对方看不到我们的对话历史，问题要写完整自包含。" +
+          "适合「问一下架构师这个方案怎么看」「让研究员查一下 X」这类即时协作；需要留痕、要进看板的工作请用 propose_plan。",
+        input_schema: {
+          type: "object",
+          properties: {
+            agent: { type: "string", description: "目标智能体名称" },
+            question: { type: "string", description: "完整的问题或任务，含背景和期望的输出格式" },
+          },
+          required: ["agent", "question"],
+          additionalProperties: false,
+        },
+      },
     ];
     const cards: Record<string, any>[] = [];
     let reply = "";
+    // 思考过程跨工具轮累计：多轮里每一轮的推理都是同一件事的推进，合并后一次展示
+    const thoughts: string[] = [];
     try {
       for (let turn = 0; turn < 6; turn++) {
-        const res = await this.llm().create({ model: this.settings.assistantModelId(), max_tokens: 4000, system: `${BUTLER_SYSTEM}\n\n可用智能体：${agents}`, messages, tools, output_config: { effort: "medium" } }, { signal: AbortSignal.timeout(120_000) });
+        const res = await this.llm().create({
+          model: this.settings.assistantModelId(), max_tokens: 6000, system: `${BUTLER_SYSTEM}\n\n可用智能体：${agents}`, messages, tools,
+          // 让模型自行决定想多久；summary 模式才会把思考内容回传，否则只有签名
+          thinking: { type: "adaptive", display: "summarized" },
+          output_config: { effort: "medium" },
+        }, { signal: AbortSignal.timeout(120_000) });
         messages.push({ role: "assistant", content: res.content });
+        for (const b of res.content) if (b.type === "thinking" && (b as { thinking?: string }).thinking) thoughts.push((b as { thinking: string }).thinking);
         reply = res.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("\n").trim() || reply;
         const calls = res.content.filter((b) => b.type === "tool_use") as { id: string; name: string; input: any }[];
         if (res.stop_reason !== "tool_use" || !calls.length) break;
-        const results = calls.map((c) => ({ type: "tool_result" as const, tool_use_id: c.id, content: this.butlerTool(c.name, c.input, cards) }));
+        const results = await Promise.all(calls.map(async (c) => ({ type: "tool_result" as const, tool_use_id: c.id, content: await this.butlerTool(c.name, c.input, cards) })));
         messages.push({ role: "user", content: results });
       }
     } catch (e) {
@@ -116,22 +138,80 @@ export class Assistant {
       if (/auth|api.?key|credential|401/i.test(msg)) { const conv = this.conversation(); conv.pop(); this.saveConv(conv); return { fallback: true }; }
       reply = `抱歉，出错了：${msg}`;
     }
-    if (!cards.length) this.append({ role: "ai", text: reply || "好的。" });
-    cards.forEach((card, n) => this.append({ role: "ai", text: n === 0 ? reply || "请确认：" : "还有一项：", card }));
+    const thinking = thoughts.join("\n\n").trim() || undefined;
+    if (!cards.length) this.append({ role: "ai", text: reply || "好的。", thinking });
+    cards.forEach((card, n) => this.append({ role: "ai", text: n === 0 ? reply || "请确认：" : "还有一项：", card, thinking: n === 0 ? thinking : undefined }));
     return {};
   }
-  private butlerTool(name: string, input: any, cards: Record<string, any>[]): string {
+  /** 根据一段项目描述起草项目名、编号前缀和一句话说明；模型不可用时退化为截取 */
+  async draftProject(brief: string): Promise<{ name: string; key: string; description: string }> {
+    const text = String(brief ?? "").trim();
+    if (!text) throw new Error("先说说这个项目要做什么");
+    const flat = text.replace(/\s+/g, " ").trim();
+    const fallback = () => {
+      const name = flat.slice(0, 12) || "新项目";
+      const ascii = (flat.match(/[A-Za-z]+/g) ?? []).join("").slice(0, 4).toUpperCase();
+      return { name, key: ascii || "PRJ", description: flat.slice(0, 80) };
+    };
+    if (!this.canUseModel()) return fallback();
+    try {
+      const res = await this.llm().create({
+        model: this.settings.assistantModelId(),
+        max_tokens: 600,
+        system: "你是产品经理。根据用户对项目的描述，给出项目名、编号前缀、一句话说明。" +
+          '只输出 JSON，不要解释：{"name":"","key":"","description":""}。name 不超过 12 个汉字；key 是 2-5 位大写字母；description 不超过 40 字。',
+        messages: [{ role: "user", content: text }],
+      }, { signal: AbortSignal.timeout(30_000) });
+      const raw = res.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("");
+      const hit = raw.match(/\{[\s\S]*\}/);
+      const o = hit ? JSON.parse(hit[0]) as Record<string, unknown> : null;
+      if (!o?.name) return fallback();
+      const key = String(o.key ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5);
+      return {
+        name: String(o.name).trim().slice(0, 20) || fallback().name,
+        key: key || fallback().key,
+        description: String(o.description ?? "").trim().slice(0, 120),
+      };
+    } catch { return fallback(); }
+  }
+
+  private async butlerTool(name: string, input: any, cards: Record<string, any>[]): Promise<string> {
     try {
       if (name === "list_projects") return JSON.stringify(this.work.projects().map((p) => ({ key: p.key, name: p.name, repo: p.repo?.fullName ?? null, counts: p.counts, lead: p.lead.mode })), null, 1);
       if (name === "list_issues") {
         const pid = input.project ? this.work.projectsRaw().find((p) => p.key === String(input.project).toUpperCase())?.id : undefined;
-        return this.work.list(pid).map((i) => `${i.key} [${STATUS[i.status]}${i.phase ? `·${PHASE_LABEL[i.phase]}` : ""}] ${i.assignee ?? "未指派"} — ${i.title}`).join("\n") || "（无）";
+        const want = String(input.creator ?? "").toLowerCase();
+        const list = this.work.list(pid).filter((i) => {
+          if (input.status && i.status !== input.status) return false;
+          // 创建人按前缀匹配：Linear 返回的是邮箱，用户说的通常只是前半段
+          if (!want) return true;
+          return !!i.linear?.creator?.name?.toLowerCase().includes(want);
+        });
+        return list.map((i) => {
+          const who = i.linear ? ` · Linear 创建人 ${i.linear.creator?.name ?? "未知"}，指派人 ${i.linear.assignee?.name ?? "未指派"}` : "";
+          return `${i.key} [${STATUS[i.status]}${i.phase ? `·${PHASE_LABEL[i.phase]}` : ""}] ${i.assignee ?? "未指派"} — ${i.title}${who}`;
+        }).join("\n") || "（无）";
       }
-      if (name === "get_issue") { const d = this.work.detail(input.issue); return `${d.key} ${d.title}\n状态：${STATUS[d.status]}\n描述：${d.description}\n最近动态：\n${d.activity.slice(-6).map((c) => `[${c.author}] ${c.body.slice(0, 300)}`).join("\n")}`; }
+      if (name === "get_issue") {
+        const d = this.work.detail(input.issue);
+        const link = d.linear ? `\nLinear：${d.linear.identifier} · 创建人 ${d.linear.creator?.name ?? "未知"} · 指派人 ${d.linear.assignee?.name ?? "未指派"}` : "";
+        return `${d.key} ${d.title}\n状态：${STATUS[d.status]}${link}\n描述：${d.description}\n最近动态：\n${d.activity.slice(-6).map((c) => `[${c.author}] ${c.body.slice(0, 300)}`).join("\n")}`;
+      }
       if (name === "propose_plan") {
         const p = this.work.projectsRaw().find((x) => x.key === String(input.project).toUpperCase()) ?? this.work.projectsRaw()[0];
         cards.push({ type: "plan", projectId: p?.id, items: (input.items ?? []).map((x: any) => ({ title: x.title, description: x.description ?? "", assignee: x.assignee ?? "", priority: x.priority ?? 3, labels: x.labels ?? [], on: true })), startNow: false, created: false });
         return "已展示给用户，等待确认。";
+      }
+      if (name === "ask_agent") {
+        const target = String(input.agent ?? "").trim();
+        const question = String(input.question ?? "").trim();
+        if (!target || !question) return "需要提供智能体名称和问题";
+        const a = this.store.getAgent(target);
+        if (!a) return `智能体 ${target} 不存在。可用：${this.store.listAgents().map((x) => x.name).join("、")}`;
+        const r = await this.runtime.callAgent(target, question, { timeoutMs: 180_000 });
+        if (r.timedOut) return `已交给 ${target}，但它还在执行（任务 ${r.taskId.slice(0, 8)}），稍后可以在「调用记录」里看结果。`;
+        if (r.status !== "completed") return `${target} 没能完成（${r.status}）：${r.error ?? "没有返回原因"}`;
+        return `【${target} 的回复】\n${r.result ?? "（空）"}`;
       }
       if (name === "propose_action") {
         const a = input.args ?? {};

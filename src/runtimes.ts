@@ -14,6 +14,12 @@ const CONFIG_DIRS: Record<string, string> = {
   pi: ".pi",
 };
 
+export interface RuntimeLogin {
+  ok: boolean;
+  /** 登录方式或状态说明，例如「OAuth 登录」「2 个供应商已配置 Key」 */
+  method: string;
+}
+
 export interface RuntimeInfo {
   id: string;
   name: string;
@@ -21,6 +27,8 @@ export interface RuntimeInfo {
   installed: boolean;
   path: string | null;
   version: string | null;
+  /** 是否已登录 / 已配置凭据（读的是各 CLI 自己的登录状态，不复制密钥） */
+  login?: RuntimeLogin | null;
 }
 
 /** bin 来自固定列表，不接受外部输入 */
@@ -33,7 +41,8 @@ const CLIS = [
 
 function exec(file: string, args: string[], timeout = 8000): Promise<string | null> {
   return new Promise((resolve) => {
-    execFile(file, args, { timeout, env: process.env }, (err, stdout, stderr) => {
+    // codex debug models 在新版本里会连同模型说明一起输出（已接近 1MB），默认 maxBuffer 会直接截断
+    execFile(file, args, { timeout, env: process.env, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err && !stdout) return resolve(null);
       resolve(`${stdout || stderr}`.trim());
     });
@@ -90,7 +99,17 @@ export async function detectRuntimes(force = false) {
     }),
   );
   const homes = runtimeHomes();
-  const data = { host: hostname(), platform: platform(), runtimes: runtimes.map((r) => ({ ...r, home: homes[r.id] ?? null })) };
+  const claudePath = resolved.get("claude") ?? null;
+  const claudeAuth = claudePath ? parseClaudeAuth(await exec(claudePath, ["auth", "status"], 12_000)) : null;
+  const data = {
+    host: hostname(),
+    platform: platform(),
+    runtimes: runtimes.map((r) => ({
+      ...r,
+      home: homes[r.id] ?? null,
+      login: r.id === "claude-code" ? claudeAuth : runtimeLogin(r.id),
+    })),
+  };
   cache = { at: Date.now(), data };
   return data;
 }
@@ -118,6 +137,75 @@ function readDefaultModel(id: string, dir: string): string | null {
     }
   } catch {
     /* 配置不存在或格式不同：不影响检测 */
+  }
+  return null;
+}
+
+/** 解析 `claude auth status` 的 JSON */
+export function parseClaudeAuth(raw: string | null): RuntimeLogin | null {
+  if (!raw) return null;
+  try {
+    const j = JSON.parse(raw) as { loggedIn?: boolean; authMethod?: string };
+    if (typeof j.loggedIn !== "boolean") return null;
+    const method = j.authMethod === "oauth_token" ? "OAuth 登录" : j.authMethod === "api_key" ? "API Key" : (j.authMethod ?? "");
+    return { ok: j.loggedIn, method: j.loggedIn ? method || "已登录" : "未登录" };
+  } catch {
+    return null;
+  }
+}
+
+/** 解析 codex 的 auth.json：有 tokens 是 ChatGPT 登录，只有 OPENAI_API_KEY 是 Key 登录。只判断键是否存在，不读值 */
+export function parseCodexAuth(raw: string | null): RuntimeLogin | null {
+  if (!raw) return null;
+  try {
+    const j = JSON.parse(raw) as { tokens?: unknown; OPENAI_API_KEY?: unknown };
+    if (j.tokens) return { ok: true, method: "ChatGPT 登录" };
+    if (j.OPENAI_API_KEY) return { ok: true, method: "OpenAI API Key" };
+    return { ok: false, method: "未登录" };
+  } catch {
+    return null;
+  }
+}
+
+/** 解析 pi 的 models.json：统计配置了 Key 的供应商 */
+export function parsePiAuth(raw: string | null): RuntimeLogin | null {
+  if (!raw) return null;
+  try {
+    const j = JSON.parse(raw) as { providers?: Record<string, { apiKey?: string }> };
+    const all = Object.entries(j.providers ?? {});
+    const withKey = all.filter(([, c]) => !!c?.apiKey).length;
+    return withKey ? { ok: true, method: `${withKey} 个供应商已配置 Key` } : { ok: false, method: "供应商未配置 Key" };
+  } catch {
+    return null;
+  }
+}
+
+/** 解析 `pi auth check --provider X --model Y` 的输出 */
+export function parsePiAuthCheck(raw: string | null): { ok: boolean; note: string } {
+  const text = (raw ?? "").trim();
+  const first = text.split("\n").map((x) => x.trim()).filter(Boolean)[0] ?? "";
+  const ok = /^ready$/i.test(first);
+  return { ok, note: ok ? "ready" : first.slice(0, 160) || "没有输出" };
+}
+
+/** 每个 CLI 在本机的登录状态（读配置目录，不读取也不返回任何密钥内容） */
+export function runtimeLogin(id: string): RuntimeLogin | null {
+  const dir = join(homedir(), CONFIG_DIRS[id] ?? "");
+  try {
+    if (id === "codex") {
+      const f = join(dir, "auth.json");
+      return existsSync(f) ? parseCodexAuth(readFileSync(f, "utf8")) : { ok: false, method: "未登录" };
+    }
+    if (id === "pi") {
+      const f = join(dir, "agent", "models.json");
+      return existsSync(f) ? parsePiAuth(readFileSync(f, "utf8")) : { ok: false, method: "供应商未配置" };
+    }
+    if (id === "gemini") {
+      if (!existsSync(join(dir, "oauth_creds.json"))) return { ok: false, method: "未登录" };
+      return { ok: true, method: "Google 登录" };
+    }
+  } catch {
+    return null;
   }
   return null;
 }
@@ -195,6 +283,34 @@ export function parseClaudeModels(settingsJson: string | null): RuntimeModel[] {
   return out;
 }
 
+const verifyCache = new Map<string, { at: number; data: Record<string, { ok: boolean; note: string }> }>();
+
+/**
+ * 逐个验证模型是否真的可用。目前只有 pi 提供这样的命令：
+ *   pi auth check --provider <provider> --model <model>  → 输出 ready 或具体错误（例如 model_not_found）
+ * 其它底座没有对等命令，返回 null 表示「未知」，不要当成失败。
+ */
+export async function verifyRuntimeModels(id: string): Promise<Record<string, { ok: boolean; note: string }> | null> {
+  if (id !== "pi") return null;
+  const hit = verifyCache.get(id);
+  if (hit && Date.now() - hit.at < 10 * 60_000) return hit.data;
+  const list = await detectRuntimeModels(id);
+  const queue = [...list.models];
+  const out: Record<string, { ok: boolean; note: string }> = {};
+  await Promise.all(Array.from({ length: 4 }, async () => {
+    for (;;) {
+      const m = queue.shift();
+      if (!m) return;
+      const at = m.id.indexOf("/");
+      if (at < 0) continue;
+      const raw = await exec("pi", ["auth", "check", "--provider", m.id.slice(0, at), "--model", m.id.slice(at + 1)], 25_000);
+      out[m.id] = parsePiAuthCheck(raw);
+    }
+  }));
+  verifyCache.set(id, { at: Date.now(), data: out });
+  return out;
+}
+
 const modelCache = new Map<string, { at: number; data: RuntimeModels }>();
 
 /** 清空所有运行底座相关的缓存：重新加载配置或升级 CLI 后调用 */
@@ -202,6 +318,7 @@ export function resetRuntimeCaches() {
   cache = null;
   shellCache.clear();
   modelCache.clear();
+  verifyCache.clear();
 }
 
 export async function detectRuntimeModels(id: string, opts: { force?: boolean } = {}): Promise<RuntimeModels> {

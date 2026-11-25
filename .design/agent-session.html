@@ -1,0 +1,427 @@
+<title>Agent Session 设计</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* 布局：单栏技术文档，左对齐、按章节编号；配色取冷灰纸面 + 青绿强调，只用于状态与关键路径 */
+:root {
+  --bg: #fbfbfa;
+  --surface: #ffffff;
+  --surface-2: #f4f4f2;
+  --fg: #17181a;
+  --fg-2: #3c4046;
+  --muted: #6b6f76;
+  --faint: #94989e;
+  --border: #e3e4e5;
+  --border-strong: #cbcdd0;
+  --accent: #0b6b6b;
+  --accent-soft: #e6f2f1;
+  --warn: #8a5a12;
+  --warn-soft: #fbf1e2;
+  --code-bg: #f3f4f3;
+  --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121314;
+    --surface: #191b1c;
+    --surface-2: #1f2223;
+    --fg: #e7e8e9;
+    --fg-2: #c3c7cb;
+    --muted: #8c9197;
+    --faint: #6d7278;
+    --border: #2a2d30;
+    --border-strong: #3a3f43;
+    --accent: #52c8bd;
+    --accent-soft: #16302f;
+    --warn: #d8a35a;
+    --warn-soft: #2e2417;
+    --code-bg: #1e2123;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121314;
+  --surface: #191b1c;
+  --surface-2: #1f2223;
+  --fg: #e7e8e9;
+  --fg-2: #c3c7cb;
+  --muted: #8c9197;
+  --faint: #6d7278;
+  --border: #2a2d30;
+  --border-strong: #3a3f43;
+  --accent: #52c8bd;
+  --accent-soft: #16302f;
+  --warn: #d8a35a;
+  --warn-soft: #2e2417;
+  --code-bg: #1e2123;
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.75;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 96px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 760px; margin: 0 auto; }
+
+/* 页头 */
+header.top {
+  padding-block: 56px 36px;
+  border-bottom: 1px solid var(--border);
+}
+.eyebrow {
+  font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--muted); margin: 0 0 14px;
+}
+h1 {
+  font-size: clamp(30px, 5vw, 40px); line-height: 1.2; font-weight: 650;
+  letter-spacing: -.02em; margin: 0 0 14px; text-wrap: balance;
+}
+.lede {
+  font-size: 17px; line-height: 1.7; color: var(--fg-2); margin: 0 0 24px; max-width: 42em;
+}
+.meta { display: flex; flex-wrap: wrap; gap: 8px 10px; }
+.meta span {
+  font-size: 12.5px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px;
+  background: var(--surface);
+}
+
+/* 章节 */
+section { padding-block: 44px; border-bottom: 1px solid var(--border); }
+section:last-of-type { border-bottom: none; }
+h2 {
+  font-size: 13px; letter-spacing: .1em; text-transform: uppercase; font-weight: 600;
+  color: var(--muted); margin: 0 0 8px;
+  display: flex; align-items: baseline; gap: 10px;
+}
+h2 b { font-size: 20px; letter-spacing: -.01em; text-transform: none; color: var(--fg); font-weight: 620; }
+h3 { font-size: 16.5px; font-weight: 600; margin: 30px 0 10px; letter-spacing: -.01em; }
+p { margin: 0 0 14px; }
+p.tight { margin-bottom: 10px; }
+ul, ol { margin: 0 0 16px; padding-left: 22px; }
+li { margin-bottom: 7px; }
+strong { font-weight: 620; }
+code {
+  font-family: var(--mono); font-size: 13.5px;
+  background: var(--code-bg); border-radius: 4px; padding: 1.5px 5px;
+  border: 1px solid var(--border);
+}
+pre {
+  font-family: var(--mono); font-size: 13px; line-height: 1.7;
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 16px 18px; margin: 0 0 18px; overflow-x: auto;
+}
+pre code { background: none; border: none; padding: 0; font-size: inherit; }
+
+/* 表格 */
+.tablewrap { overflow-x: auto; margin: 0 0 20px; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; min-width: 520px; }
+th, td { text-align: left; padding: 10px 14px 10px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; white-space: nowrap; }
+td:first-child { white-space: nowrap; }
+tbody tr:last-child td { border-bottom: none; }
+
+/* 状态机 */
+.machine {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  margin: 6px 0 18px; font-family: var(--mono); font-size: 12.5px;
+}
+.node {
+  border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 12px;
+  background: var(--surface); color: var(--fg-2); white-space: nowrap;
+}
+.node.live { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.arrow { color: var(--faint); }
+.term { display: flex; flex-direction: column; gap: 6px; }
+.term .node { border-style: dashed; }
+
+/* 决策块 */
+.callout {
+  border-left: 2px solid var(--accent); background: var(--accent-soft);
+  padding: 14px 18px; border-radius: 0 6px 6px 0; margin: 0 0 18px;
+  font-size: 14.5px; line-height: 1.7;
+}
+.callout p:last-child { margin-bottom: 0; }
+.callout.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+.callout .label {
+  display: block; font-size: 11.5px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--accent); margin-bottom: 4px; font-weight: 600;
+}
+.callout.warn .label { color: var(--warn); }
+
+/* 规则条目 */
+.rule {
+  display: grid; grid-template-columns: 22px 1fr; gap: 4px 14px;
+  padding: 14px 0; border-bottom: 1px solid var(--border);
+}
+.rule:last-child { border-bottom: none; }
+.rule .n { font-family: var(--mono); font-size: 12.5px; color: var(--faint); padding-top: 2px; }
+.rule .t { font-weight: 600; }
+.rule .d { color: var(--fg-2); font-size: 14.5px; grid-column: 2; }
+
+/* 阶段 */
+.phase { display: grid; grid-template-columns: 46px 1fr; gap: 2px 16px; padding: 16px 0; border-bottom: 1px solid var(--border); }
+.phase:last-child { border-bottom: none; }
+.phase .tag {
+  font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--accent);
+  border: 1px solid var(--accent); border-radius: 4px; padding: 1px 0; text-align: center; height: 22px; line-height: 20px;
+}
+.phase .h { font-weight: 600; }
+.phase .b { grid-column: 2; color: var(--fg-2); font-size: 14.5px; }
+
+footer { padding-top: 32px; color: var(--faint); font-size: 13px; }
+
+@media (max-width: 560px) {
+  header.top { padding-block: 36px 28px; }
+  section { padding-block: 34px; }
+  table { min-width: 0; font-size: 14px; }
+  th, td { padding-right: 10px; }
+  .machine { font-size: 11.5px; }
+}
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <p class="eyebrow">设计方案 · Agent Hub</p>
+    <h1>智能体会话</h1>
+    <p class="lede">
+      让两个智能体围绕一个议题多轮往返，最后收敛出一条能落地的结论。不是聊天，是一次有预算、有轮次、有终止条件的技术讨论。
+    </p>
+    <div class="meta">
+      <span>状态：设计稿</span>
+      <span>范围：运行时 · 工具 · 存储 · 界面</span>
+      <span>前置：call_agent、消息总线、ask_agent</span>
+    </div>
+  </header>
+
+  <section>
+    <h2><b>01</b> 现有三条通道，各缺一块</h2>
+    <p class="tight">Hub 已经有三种智能体间的通信方式。它们覆盖了「派活」和「广播」，但都不支持「讨论」。</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>通道</th><th>形态</th><th>缺什么</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>call_agent</code></td>
+            <td>同步委派。父任务提交子任务并阻塞等待，拿到最终结果就继续。</td>
+            <td>只有一问一答。对方没有机会反问，发起方也没法追问。</td>
+          </tr>
+          <tr>
+            <td><code>publish</code> / <code>read_topic</code></td>
+            <td>异步广播。订阅主题的智能体被唤醒成新任务，各自处理。</td>
+            <td>没有会话状态。谁被唤醒、回不回、回到哪个话题，全靠智能体自觉。</td>
+          </tr>
+          <tr>
+            <td><code>ask_agent</code></td>
+            <td>管家直接问某个智能体，拿回一条回复。</td>
+            <td>单轮，且结果只留在管家对话里，不进项目。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>真正需要多轮的场景很具体：架构师和前端就接口边界来回确认；测试复现不了，开发要问清楚环境；评审方对一处改动有异议，作者需要解释两轮。这些都不是「派个活」能解决的。</p>
+  </section>
+
+  <section>
+    <h2><b>02</b> 四条设计原则</h2>
+    <div class="rule">
+      <div class="n">01</div><div class="t">有界</div>
+      <div class="d">轮次、时间、token 三重上限，任何一重触发都强制收敛。开一个会话不能变成打开一个无底洞。</div>
+    </div>
+    <div class="rule">
+      <div class="n">02</div><div class="t">串行</div>
+      <div class="d">同一个会话在同一时刻只有一个智能体在说话。交替发言，天然避免两边同时改同一份上下文。</div>
+    </div>
+    <div class="rule">
+      <div class="n">03</div><div class="t">可审计</div>
+      <div class="d">每一轮消息落库，带发言人、轮次、耗时。事后能回放，也能作为工作项的决策依据。</div>
+    </div>
+    <div class="rule">
+      <div class="n">04</div><div class="t">产出是结论，不是记录</div>
+      <div class="d">会话结束必须给一条结论。记录留档，结论进工作项评论或转成新工作项。</div>
+    </div>
+  </section>
+
+  <section>
+    <h2><b>03</b> 核心模型</h2>
+    <p class="tight">两个实体，没有第三个。会话是容器，消息是内容。</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td>string</td><td><code>s_</code> 前缀的短 id</td></tr>
+          <tr><td><code>topic</code></td><td>string</td><td>一句话议题，写进每轮提示，防止话题漂移</td></tr>
+          <tr><td><code>participants</code></td><td>string[2]</td><td>恰好两个发言方。多方自由讨论不在本期</td></tr>
+          <tr><td><code>turn</code></td><td>number</td><td>已进行的轮次</td></tr>
+          <tr><td><code>maxTurns</code></td><td>number</td><td>默认 6，硬上限 12</td></tr>
+          <tr><td><code>deadline</code></td><td>string</td><td>ISO 时间，默认 15 分钟</td></tr>
+          <tr><td><code>tokenBudget</code></td><td>number</td><td>整场会话的 token 上限，默认 60k</td></tr>
+          <tr><td><code>tokensUsed</code></td><td>number</td><td>累计用量，由每轮任务回填</td></tr>
+          <tr><td><code>status</code></td><td>enum</td><td><code>open</code> / <code>closed</code> / <code>aborted</code></td></tr>
+          <tr><td><code>conclusion</code></td><td>string?</td><td>结束时的结论正文</td></tr>
+          <tr><td><code>endReason</code></td><td>enum</td><td><code>conclusion</code> / <code>max_turns</code> / <code>deadline</code> / <code>budget</code> / <code>human</code></td></tr>
+          <tr><td><code>issueId</code></td><td>number?</td><td>关联的工作项，会话由此发起时必填</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>消息表只加三列：<code>sessionId</code>、<code>turn</code>、<code>from</code>。复用现有的 comments 存储结构，只是挂到会话上而不是工作项上。</p>
+  </section>
+
+  <section>
+    <h2><b>04</b> 生命周期</h2>
+    <div class="machine">
+      <span class="node live">open</span>
+      <span class="arrow">→</span>
+      <span class="node">轮流发言</span>
+      <span class="arrow">→</span>
+      <span class="term">
+        <span class="node">closed · 有结论</span>
+        <span class="node">aborted · 触达上限</span>
+      </span>
+    </div>
+    <p class="tight">结束时必须带上 <code>endReason</code>。触达上限的中止不是失败——它同样要求最后一位发言者给出「已讨论到什么程度、还差什么」的结论，而不是直接截断。</p>
+    <div class="callout">
+      <span class="label">关键约定</span>
+      <p>最后一轮由系统注入硬提示：「这是最后一轮，必须给出结论，不能提出新问题。」结论可以为空泛，但必须存在。</p>
+    </div>
+  </section>
+
+  <section>
+    <h2><b>05</b> 协议：三个工具</h2>
+    <p class="tight">智能体不直接操作会话表，只通过工具。所有工具都要求显式说明「接下来该谁说话」，避免含糊。</p>
+    <pre><code>open_session({
+  agent: "architect",          // 对话对象
+  topic: "订单接口是否拆成两个端点",
+  opening: "完整开场，含背景与你的初步立场",
+  maxTurns?: 6,
+  deadlineMinutes?: 15
+}) → { session, turn, reply }   // 同步等到对方第一次回应
+
+reply_session({
+  session: "s_ab12",
+  text: "针对你提的兼容性问题，我的判断是…",
+  next: "architect" | null      // null 表示我认为可以结束了
+}) → { session, turn, reply? }  // 给了 next 就等下一轮
+
+close_session({
+  session: "s_ab12",
+  conclusion: "结论正文：决定是什么、依据是什么、还有哪些未决"
+}) → { session }
+}</code></pre>
+
+    <h3>每轮必须包含三样东西</h3>
+    <ul>
+      <li><strong>回应</strong>：对上一轮的具体回应，不能自顾自说。</li>
+      <li><strong>立场</strong>：同意 / 反对 / 有条件同意，三选一，不允许模糊。</li>
+      <li><strong>下一步</strong>：明确点名下一位发言方，或提出结束。</li>
+    </ul>
+    <p>工具描述里把这三条写成硬要求。这是让对话收敛的主要手段——没有它，两个模型会互相客套二十轮。</p>
+  </section>
+
+  <section>
+    <h2><b>06</b> 调度</h2>
+    <p class="tight">会话消息不是直接投递给模型，而是转成一次普通任务，复用现有的并发、优先级和成本体系。</p>
+    <ol>
+      <li>对方被唤醒时，<code>source</code> 标记为 <code>session</code>，优先级继承发起任务。</li>
+      <li>任务输入 = 议题 + 最近 4 轮消息 + 你的角色 + 剩余轮次 + 本轮要求。</li>
+      <li>同一会话加锁（<code>runningSession</code> 集合），上一个任务没结束就不再提交下一个。</li>
+      <li>任务完成后，若调用了 <code>reply_session</code> 且给了 <code>next</code>，自动提交下一轮。</li>
+    </ol>
+    <pre><code>## 会话 s_ab12 · 第 3/6 轮
+议题：订单接口是否拆成两个端点
+你是：frontend-dev
+
+[architect · 第2轮]
+拆成两个端点会让前端多一次请求，但能独立缓存…
+
+[你 · 第1轮]
+从调用方看，我更希望保持单端点…
+
+请回应上一位发言，然后二选一：
+- reply_session(next="architect") 继续讨论
+- close_session(conclusion="…") 达成结论
+
+这是第 3 轮，还剩 3 轮。</code></pre>
+  </section>
+
+  <section>
+    <h2><b>07</b> 成本与安全</h2>
+    <div class="callout warn">
+      <span class="label">三重封顶，任一触发即中止</span>
+      <p><strong>轮次</strong> 默认 6，硬上限 12 —— 每轮至少一次模型调用，这是最直接的成本闸。<br>
+      <strong>时间</strong> 默认 15 分钟 —— 防止某一方挂住不返回。<br>
+      <strong>Token</strong> 默认 60k —— 从项目预算里扣，超了立刻中止并记录已用量。</p>
+    </div>
+    <ul>
+      <li>会话不计入工作项的 <code>cost</code>，单独记在会话上，避免污染单卡成本。</li>
+      <li>不允许跨项目开会话：参与双方必须属于同一项目上下文，防止把 A 项目的背景泄露给 B 项目的人。</li>
+      <li>会话内容写进调用记录（receipt），和普通任务一样可追溯。</li>
+      <li>人随时可以终止：界面上一个「结束」按钮，走 <code>human</code> 原因，并要求补一条结论。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2><b>08</b> 界面</h2>
+    <p class="tight">不做独立的一级页面。会话挂在发起它的工作项上，作为时间线里的一段。</p>
+    <ul>
+      <li>工作项详情里，会话显示为一组可折叠的对话块，每轮带发言人头像与轮次标记。</li>
+      <li>结束的会话只保留结论，正文默认折叠——它是过程，不是结论。</li>
+      <li>管家发起或参与的会话，同样在管家对话里显示一张卡片，点开跳回工作项。</li>
+      <li>进行中的会话有明确状态：<code>第 3/6 轮 · 已用 12k tokens</code>，让人知道还剩多少余地。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2><b>09</b> 分阶段</h2>
+    <div class="phase">
+      <span class="tag">P0</span><div class="h">两方往返，最小可用</div>
+      <div class="b">会话表 + 三个工具 + 串行锁。只支持固定 6 轮，没有 UI，靠调用记录查看。</div>
+    </div>
+    <div class="phase">
+      <span class="tag">P1</span><div class="h">预算与可见性</div>
+      <div class="b">token 预算、时间上限、工作项时间线、终止原因展示。</div>
+    </div>
+    <div class="phase">
+      <span class="tag">P2</span><div class="h">人工介入</div>
+      <div class="b">界面上插话、中止、手动延长轮次。人在环里，会话不再是黑盒。</div>
+    </div>
+    <div class="phase">
+      <span class="tag">P3</span><div class="h">多方与主持人</div>
+      <div class="b">引入主持人角色协调三方以上讨论。这一阶段才考虑「群聊」，且必须有强制的发言权轮转。</div>
+    </div>
+  </section>
+
+  <section>
+    <h2><b>10</b> 明确不做</h2>
+    <div class="rule">
+      <div class="n">—</div><div class="t">不做开放群聊</div>
+      <div class="d">三方以上自由发言在模型上几乎必然发散，收敛成本远高于收益。P3 之前不碰。</div>
+    </div>
+    <div class="rule">
+      <div class="n">—</div><div class="t">不替代 call_agent</div>
+      <div class="d">简单委派继续用一问一答，便宜且快。会话只在「需要对方反问」时才值得开。</div>
+    </div>
+    <div class="rule">
+      <div class="n">—</div><div class="t">不自动开场</div>
+      <div class="d">会话必须由智能体或人显式发起。系统不根据「有分歧」去猜该不该开会话——猜错的成本是白烧 token。</div>
+    </div>
+    <div class="rule">
+      <div class="n">—</div><div class="t">不建议 CLI 底座跑会话</div>
+      <div class="d">Claude Code 这类底座单轮延迟以十秒计，六轮就是一分钟以上。会话默认走内置模型，CLI 底座只做最终执行。</div>
+    </div>
+  </section>
+
+  <footer>
+    与现有 <code>call_agent</code>、消息总线、<code>ask_agent</code> 并存，不替换。落地顺序见第 09 节。
+  </footer>
+</div>

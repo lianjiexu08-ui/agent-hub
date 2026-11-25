@@ -21,6 +21,8 @@ const touch = (i: GhI) => { i.updated_at = new Date().toISOString(); };
 // 150 个 open issue，用来验证分页
 const issues: GhI[] = Array.from({ length: 150 }, (_, n) => ({ number: n + 1, title: `issue ${n + 1}`, body: "", state: "open", state_reason: null, labels: [], updated_at: new Date(Date.now() - 3600_000).toISOString() }));
 const patches: { n: number; body: unknown }[] = [];
+/** 打/摘标签的调用记录，用来验证「待审核」标签是否同步 */
+const labelCalls: { method: string; n: number; labels?: string[]; label?: string }[] = [];
 const server = createServer(async (req, res) => {
   let body = "";
   for await (const c of req) body += c;
@@ -37,6 +39,10 @@ const server = createServer(async (req, res) => {
   }
   const m = /^\/repos\/o\/r\/issues\/(\d+)$/.exec(url.pathname);
   if (req.method === "PATCH" && m) { patches.push({ n: Number(m[1]), body: JSON.parse(body) }); return res.end("{}"); }
+  const add = /^\/repos\/o\/r\/issues\/(\d+)\/labels$/.exec(url.pathname);
+  if (req.method === "POST" && add) { labelCalls.push({ method: "POST", n: Number(add[1]), labels: JSON.parse(body).labels }); return res.end("[]"); }
+  const del = /^\/repos\/o\/r\/issues\/(\d+)\/labels\/(.+)$/.exec(url.pathname);
+  if (req.method === "DELETE" && del) { labelCalls.push({ method: "DELETE", n: Number(del[1]), label: decodeURIComponent(del[2]) }); return res.end("{}"); }
   res.statusCode = 404; res.end("{}");
 });
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -70,4 +76,33 @@ test("GitHub：分页导入全部 open issue；远端关闭 / not planned / 重�
   assert.ok(sinceSeen.length >= 2, "增量同步带 since");
   assert.equal(gh(1).status, "todo");
   assert.equal(gh(1).github!.state, "open");
+});
+
+
+test("GitHub：完成全流程进入待审核时打 in-review 标签，完成后摘掉", async () => {
+  const store = new Store(":memory:");
+  store.upsertAgent(AgentSchema.parse({ name: "developer" }));
+  const settings = new Settings(store);
+  const github = new GitHub(() => "ghp_test", base);
+  const runtime = new Runtime(store, simulatedLLM({ delayMs: [1, 2] }), { maxConcurrency: 2, maxDepth: 2, maxHops: 2 });
+  const work = new Work(store, runtime, { notify: new Notifier(store, () => settings.get().notify), settings, github, linear: new Linear(() => null), workspace: new Workspace("/tmp/agent-hub-test-ws", () => null), simulate: false });
+  const p = work.saveProject({ name: "REV", key: "REV" });
+  await work.connectRepo(p.id, "o/r");
+  await work.sync(p.id);
+  const item = work.list(p.id).find((i) => i.github?.number === 3)!;
+
+  labelCalls.length = 0;
+  await work.update(item.key, { status: "in_review" });
+  assert.deepEqual(labelCalls, [{ method: "POST", n: 3, labels: ["in-review"] }], "进入待审核时打标签");
+  assert.equal(work.find(item.key).github!.reviewed, true);
+
+  labelCalls.length = 0;
+  await work.update(item.key, { status: "done" });
+  assert.ok(labelCalls.some((c) => c.method === "DELETE" && c.n === 3 && JSON.stringify(c).includes("in-review")), "完成后摘掉标签");
+  assert.equal(work.find(item.key).github!.reviewed, false);
+
+  // 重复设置同一状态不应重复调用
+  labelCalls.length = 0;
+  await work.update(item.key, { status: "done" });
+  assert.equal(labelCalls.length, 0, "状态没变就不重复打接口");
 });

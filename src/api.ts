@@ -11,7 +11,7 @@ import type { Work } from "./work.ts";
 import type { QA } from "./qa.ts";
 import type { Automation } from "./automation.ts";
 import type { Assistant } from "./assistant.ts";
-import { AgentSchema } from "./types.ts";
+import { AgentSchema, BUILTIN_TOOL_META, McpServerSchema, ToolSchema } from "./types.ts";
 import { detectRuntimes } from "./runtimes.ts";
 import { PRESETS } from "./providers.ts";
 
@@ -19,6 +19,9 @@ import type { Uploads } from "./uploads.ts";
 export interface Services {
   uploads?: Uploads;
   store: Store; runtime: Runtime; settings: Settings; notifier: Notifier; work: Work; qa: QA; automation: Automation; assistant: Assistant; simulate: boolean; /** 热重载：重新读配置并重新检测运行底座 */ reload?: () => Promise<unknown>; /** 进程级重启：拉起新进程后退出 */ restart?: () => unknown }
+
+/** 掩码占位：保存时遇到它表示"沿用原值" */
+const MASK = "••••";
 
 export function buildApi(s: Services) {
   const { store, settings, notifier, work, qa, automation, assistant } = s;
@@ -39,8 +42,14 @@ export function buildApi(s: Services) {
     health: work.health(),
     butler: assistant.conversation(),
     tools: store.listTools(),
-    mcpServers: store.listMcpServers(),
+    // MCP 的 env / headers 里常有令牌：只回传键名，值一律掩码
+    mcpServers: store.listMcpServers().map((m) => ({
+      ...m,
+      env: m.transport === "stdio" ? Object.fromEntries(Object.keys(m.env ?? {}).map((k) => [k, MASK])) : {},
+      headers: m.transport === "http" ? Object.fromEntries(Object.keys(m.headers ?? {}).map((k) => [k, MASK])) : {},
+    })),
     runtimes: await detectRuntimes(),
+    builtinTools: BUILTIN_TOOL_META,
     providerPresets: PRESETS,
     concurrency: { ...s.runtime.concurrency(), cli: (s.runtime.cli as { stats?: () => unknown } | null)?.stats?.() ?? {} },
   });
@@ -98,6 +107,7 @@ export function buildApi(s: Services) {
     "settings.verifyProvider": (id, f) => settings.verifyProvider(id, f),
     "settings.listProviderModels": (id) => settings.listProviderModels(id),
     "settings.setAssistantModel": (m) => settings.patch({ assistantModel: m ?? "" }),
+    "assistant.draftProject": (brief) => assistant.draftProject(String(brief ?? "")),
     "settings.removeProvider": (id) => settings.removeProvider(id),
     "settings.saveModel": (m) => settings.saveModel(m),
     "settings.removeModel": (id) => settings.removeModel(id),
@@ -115,6 +125,30 @@ export function buildApi(s: Services) {
     "system.restart": () => s.restart?.(),
     "studio.saveAgent": (a, orig) => saveAgent(a, orig),
     "studio.deleteAgent": (n) => store.deleteAgent(n),
+    "studio.saveTool": (t) => store.upsertTool(ToolSchema.parse(t)),
+    "studio.saveMcp": (raw) => {
+      const parsed = McpServerSchema.parse(raw);
+      // 界面回传的是掩码值：把这些键还原成已保存的真实值，避免编辑时把令牌覆盖成 ••••
+      const prev = store.getMcpServer(parsed.name);
+      const restore = (before: Record<string, string> | undefined, after: Record<string, string>) =>
+        Object.fromEntries(Object.entries(after).map(([k, v]) => [k, v === MASK && before?.[k] ? before[k] : v]));
+      if (parsed.transport === "stdio" && prev?.transport === "stdio") parsed.env = restore(prev.env, parsed.env);
+      if (parsed.transport === "http" && prev?.transport === "http") parsed.headers = restore(prev.headers, parsed.headers);
+      const saved = store.upsertMcpServer(parsed);
+      void s.runtime.mcp.reset(parsed.name); // 改了配置就断开重连，下次使用时按新配置连
+      return saved;
+    },
+    "studio.deleteMcp": (name) => {
+      if (!store.deleteMcpServer(name)) throw new Error(`MCP 服务器 ${name} 不存在`);
+      void s.runtime.mcp.reset(name);
+      for (const a of store.listAgents().filter((x) => x.mcp.includes(name))) store.upsertAgent({ ...a, mcp: a.mcp.filter((x) => x !== name) });
+      return { ok: true };
+    },
+    "studio.deleteTool": (n) => {
+      if (!store.deleteTool(n)) throw new Error(`自定义工具 ${n} 不存在`);
+      for (const a of store.listAgents().filter((x) => x.tools.includes(n))) store.upsertAgent({ ...a, tools: a.tools.filter((x) => x !== n) });
+      return { ok: true };
+    },
     "studio.saveSkill": (sk, orig) => settings.saveSkill(sk, orig),
     "studio.deleteSkill": (id) => { settings.deleteSkill(id); for (const a of store.listAgents().filter((a) => a.skills.includes(id))) store.upsertAgent({ ...a, skills: a.skills.filter((x) => x !== id) }); },
     "knowledge.add": (pid, kind, text) => settings.addKnowledge(pid, kind, text),

@@ -9,6 +9,9 @@ import type { GitHub } from "./github.ts";
 
 interface Proj { id: string; repo: { fullName: string; defaultBranch?: string } | null }
 
+/** 需要工作目录的扩展工具：读写文件、检索代码、执行命令 */
+export const WORKSPACE_TOOLS = ["read_file", "write_file", "list_files", "search_repo", "run_command"];
+
 function git(args: string[], cwd: string): Promise<string> {
   return new Promise((res, rej) => {
     execFile("git", args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -35,8 +38,15 @@ export class Workspace {
     this.root = resolve(root);
     this.token = token;
   }
-  enabledFor(p: Proj | undefined, agent: { runtime?: string } | undefined): boolean {
-    return !!p?.repo && !!this.token() && !!agent?.runtime && agent.runtime !== "builtin";
+  /**
+   * 是否给这个智能体准备独立工作目录：
+   * - CLI 底座必须有（它们是按目录干活的）
+   * - 内置循环只有在开启文件/命令类工具时才需要，否则不该在服务器上开目录
+   */
+  enabledFor(p: Proj | undefined, agent: { runtime?: string; builtinTools?: string[] } | undefined): boolean {
+    if (!p?.repo || !this.token() || !agent) return false;
+    if (agent.runtime && agent.runtime !== "builtin") return true;
+    return (agent.builtinTools ?? []).some((t) => WORKSPACE_TOOLS.includes(t));
   }
   private repoDir(p: Proj) { return join(this.root, "repos", p.repo!.fullName.replace("/", "__")); }
   dir(p: Proj, key: string) { return join(this.root, "worktrees", p.repo!.fullName.replace("/", "__"), key); }

@@ -5,19 +5,28 @@
  * - 登录失败按来源地址限速，避免被暴力猜
  */
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import type { Credentials } from "./credentials.ts";
 
 export const SESSION_COOKIE = "hub_session";
 const SESSION_TTL_MS = 7 * 24 * 3600_000;
 
 export interface Security {
-  /** 账号密码登录；不设置时不启用登录 */
+  /** 初始账号与密码（环境变量）；用户自己设置过后由 credentials 优先 */
   user: string;
   password: string;
   /** API 令牌（Bearer / ?token=），与登录并存 */
   token?: string;
+  /** 用户在首次登录后设置的账号密码（data/auth.json） */
+  credentials?: Credentials;
 }
 
-export const loginEnabled = (s?: Security | null): s is Security => !!s?.password;
+export const loginEnabled = (s?: Security | null): s is Security => !!s?.password || !!s?.credentials?.initialized;
+
+/** 会话签名密钥：用户设置过密码就用随机会话密钥（改密码即换），否则用初始密码 */
+export const sessionSecret = (s: Security): string => s.credentials?.secret || s.password;
+
+/** 当前生效的账号名 */
+export const loginUser = (s: Security): string => s.credentials?.user || s.user;
 
 const b64 = (s: string) => Buffer.from(s).toString("base64url");
 const sign = (payload: string, secret: string) => createHmac("sha256", secret).update(payload).digest("base64url");
@@ -50,10 +59,11 @@ export function verifySession(cookie: string | null | undefined, secret: string)
   }
 }
 
-/** 校验账号密码；两者都用常量时间比较 */
+/** 校验账号密码：用户设置过就用 scrypt 校验，否则比对初始密码（两者都用常量时间比较） */
 export function checkPassword(input: { user?: string; password?: string }, s: Security): boolean {
   const user = (input.user ?? "").trim();
   const pass = input.password ?? "";
+  if (s.credentials?.initialized) return s.credentials.verify(user, pass);
   return safeEqual(user, s.user) && safeEqual(pass, s.password);
 }
 

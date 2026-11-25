@@ -3,7 +3,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseClaudeModels, parseCodexModels, parsePiModels } from "../src/runtimes.ts";
+import { parseClaudeModels, parseCodexModels, parsePiModels, parseClaudeAuth, parseCodexAuth, parsePiAuth, parsePiAuthCheck } from "../src/runtimes.ts";
 
 test("codex：解析模型目录，跳过不可见的模型", () => {
   const raw = JSON.stringify({
@@ -54,4 +54,30 @@ test("claude-code：别名 + 配置里的默认模型，不读令牌", () => {
   assert.equal(parseClaudeModels(null).length, 4);
   // 配置损坏时不抛错
   assert.equal(parseClaudeModels("{not json").length, 4);
+});
+
+
+test("登录态：claude / codex / pi 各自解析成「可用 + 方式」，坏数据不误判", () => {
+  assert.deepEqual(parseClaudeAuth('{"loggedIn":true,"authMethod":"oauth_token"}'), { ok: true, method: "OAuth 登录" });
+  assert.deepEqual(parseClaudeAuth('{"loggedIn":false,"authMethod":"none"}'), { ok: false, method: "未登录" });
+  assert.equal(parseClaudeAuth("not json"), null);
+  assert.equal(parseClaudeAuth(""), null);
+
+  assert.deepEqual(parseCodexAuth('{"tokens":{"id_token":"x"}}'), { ok: true, method: "ChatGPT 登录" });
+  assert.deepEqual(parseCodexAuth('{"OPENAI_API_KEY":"sk-x"}'), { ok: true, method: "OpenAI API Key" });
+  assert.deepEqual(parseCodexAuth("{}"), { ok: false, method: "未登录" });
+
+  assert.deepEqual(parsePiAuth('{"providers":{"a":{"apiKey":"k"},"b":{"apiKey":"k2"},"c":{}}}'), { ok: true, method: "2 个供应商已配置 Key" });
+  assert.deepEqual(parsePiAuth('{"providers":{"c":{}}}'), { ok: false, method: "供应商未配置 Key" });
+  assert.equal(parsePiAuth(null), null);
+});
+
+test("模型可用性：pi auth check 的 ready 才算可用，其它输出带回原因", () => {
+  assert.deepEqual(parsePiAuthCheck("ready"), { ok: true, note: "ready" });
+  assert.equal(parsePiAuthCheck("READY\n")?.ok, true);
+  const bad = parsePiAuthCheck('Warning: x\n404: {"code":"model_not_found"}');
+  assert.equal(bad.ok, false);
+  assert.match(bad.note, /Warning/);
+  assert.equal(parsePiAuthCheck("").ok, false);
+  assert.equal(parsePiAuthCheck(null).ok, false);
 });

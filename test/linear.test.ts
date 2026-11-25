@@ -25,7 +25,8 @@ const STATES: LinearState[] = [
   { id: "s-cancel", name: "Canceled", type: "canceled", position: 5 },
 ];
 
-type Remote = { id: string; identifier: string; title: string; description: string; priority: number; url: string; updatedAt: string; stateId: string; labels: string[] };
+type Person = { id: string; name: string };
+type Remote = { id: string; identifier: string; title: string; description: string; priority: number; url: string; updatedAt: string; stateId: string; labels: string[]; creator?: Person | null; assignee?: Person | null };
 const remote: Remote[] = [
   { id: "lin-1", identifier: "ENG-1", title: "登录页白屏", description: "验收标准：\n- 登录页正常显示\n- 无控制台报错", priority: 2, url: "https://linear.app/x/issue/ENG-1", updatedAt: new Date().toISOString(), stateId: "s-todo", labels: ["bug"] },
   { id: "lin-2", identifier: "ENG-2", title: "已完成的旧需求", description: "", priority: 0, url: "https://linear.app/x/issue/ENG-2", updatedAt: new Date().toISOString(), stateId: "s-done", labels: [] },
@@ -33,10 +34,12 @@ const remote: Remote[] = [
 ];
 const updates: { id: string; input: Record<string, unknown> }[] = [];
 const comments: { issueId: string; body: string }[] = [];
+/** 下一次 issueUpdate 返回失败，用来验证失败会被记录下来 */
+let failUpdate = false;
 const issueQueries: { after?: string | null; filter?: { updatedAt?: { gt: string } } | null }[] = [];
 let seq = 100;
 const state = (id: string) => STATES.find((s) => s.id === id)!;
-const toIssue = (r: Remote) => ({ ...r, state: state(r.stateId), labels: { nodes: r.labels.map((name) => ({ name })) } });
+const toIssue = (r: Remote) => ({ ...r, state: state(r.stateId), labels: { nodes: r.labels.map((name) => ({ name })) }, creator: r.creator ?? null, assignee: r.assignee ?? null });
 
 const server = createServer(async (req, res) => {
   let body = "";
@@ -63,6 +66,7 @@ const server = createServer(async (req, res) => {
     return ok({ issueCreate: { success: true, issue: { id: r.id, identifier: r.identifier, url: r.url, state: state(r.stateId) } } });
   }
   if (query.includes("issueUpdate")) {
+    if (failUpdate) { res.statusCode = 200; res.end(JSON.stringify({ errors: [{ message: "You do not have permission to update this issue" }] })); return; }
     updates.push({ id: variables.id, input: variables.input });
     const r = remote.find((x) => x.id === variables.id)!;
     if (variables.input.stateId) r.stateId = variables.input.stateId;
@@ -186,7 +190,8 @@ test("拉回远端：完成、优先级、进行中不被回推、分页读取",
   const msg = await work.syncLinear(p.id);
   assert.match(msg, /拉回远端变更 1 个/);
   assert.equal(byRef("ENG-1").priority, 1);
-  assert.equal(byRef("ENG-1").status, "backlog");
+  // 远端推进到 In Progress，本地跟着变成「进行中」（此前会停在待办，导致恢复后对不上）
+  assert.equal(byRef("ENG-1").status, "in_progress");
   assert.ok(!updates.some((u) => u.id === r1.id), "刚拉回的不回推");
 
   // 远端完成 / 取消
@@ -230,4 +235,147 @@ test("分页与增量：超过 100 条分页读取；定时同步只读有更新
   // 增量也能导入新建的 issue
   remote.push({ id: "fresh-1", identifier: "ENG-NEW", title: "新建的", description: "", priority: 2, url: "u", updatedAt: new Date().toISOString(), stateId: "s-todo", labels: [] });
   assert.match(await work.syncLinear(p.id, { incremental: true }), /导入 1 个/);
+});
+
+test("状态同步失败：不会被静默吞掉，工作项与同步日志都能看到", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "x", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+  const p = work.saveProject({ name: "失败", key: "FAIL" });
+  await work.connectLinear(p.id, "team-1");
+  // 自己建一个已关联 Linear 的工作项，避免依赖前面用例改动过的远端数据
+  const v = await work.create({ projectId: p.id, title: "同步失败用例", description: "验收标准：\n- 甲\n- 乙", status: "backlog", linear: true });
+  assert.ok(v.linear, "已创建对应的 Linear issue");
+
+  failUpdate = true;
+  await work.update(v.key, { status: "todo", priority: 1 });
+  failUpdate = false;
+
+  const activity = work.detail(v.key).activity.map((c) => c.body).join("\n");
+  assert.match(activity, /状态没能同步到远端/, "工作项里能看到失败原因");
+  assert.match(activity, /permission/, "带上远端返回的原因");
+  assert.ok(work.syncLogOf(p.id).some((l) => l.kind === "warn" && /同步失败/.test(l.text)), "同步日志里也有一条");
+
+  // 本地状态照常生效，不因远端失败而回滚
+  assert.equal(work.find(v.key).status, "todo");
+
+  // 同样的错误不重复刷评论
+  failUpdate = true;
+  await work.update(v.key, { status: "backlog" });
+  failUpdate = false;
+  const times = work.detail(v.key).activity.filter((c) => /状态没能同步到远端/.test(c.body)).length;
+  assert.equal(times, 1, "同一错误只记录一次");
+});
+
+test("导入不修改 Linear 状态：本地按远端映射，不会把 Todo 覆盖成 Backlog", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "lin_…test", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+
+  // 还原远端到初始状态，避免受其他用例影响
+  remote.find((r) => r.id === "lin-1")!.stateId = "s-todo";
+  remote.find((r) => r.id === "lin-3")!.stateId = "s-backlog";
+
+  const p = work.saveProject({ name: "导入不写回", key: "IMPT" });
+  await work.connectLinear(p.id, "team-1");
+  updates.length = 0;
+
+  await work.syncLinear(p.id);
+
+  // 本地状态按远端映射
+  const list = work.list(p.id);
+  assert.equal(list.find((i) => i.linear!.identifier === "ENG-1")!.status, "todo", "Todo 映射为待办");
+  assert.equal(list.find((i) => i.linear!.identifier === "ENG-3")!.status, "backlog", "Backlog 映射为待规划");
+
+  // 关键：没有把状态写回远端
+  assert.equal(updates.length, 0, `导入不应产生任何写回，实际：${JSON.stringify(updates)}`);
+  assert.equal(remote.find((r) => r.id === "lin-1")!.stateId, "s-todo", "Linear 上的状态保持原样");
+  assert.equal(remote.find((r) => r.id === "lin-3")!.stateId, "s-backlog");
+
+  // 再次同步也不应写回（本地与远端已一致）
+  updates.length = 0;
+  await work.syncLinear(p.id);
+  assert.equal(updates.length, 0, "第二次同步仍然不写回");
+});
+
+test("In Review 不降级：导入映射为待审核，重复同步不会改成 In Progress 或 Backlog", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "x", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+
+  const r = remote.find((x) => x.id === "lin-1")!;
+  r.stateId = "s-review"; // 远端是 In Review
+  const p = work.saveProject({ name: "评审不回退", key: "REVW" });
+  await work.connectLinear(p.id, "team-1");
+  updates.length = 0;
+
+  await work.syncLinear(p.id);
+  const item = work.list(p.id).find((i) => i.linear!.identifier === "ENG-1")!;
+  assert.equal(item.status, "in_review", "started + 名称含 Review → 待审核");
+  assert.equal(updates.length, 0, "导入时不写回");
+  assert.equal(r.stateId, "s-review", "Linear 上仍是 In Review");
+
+  // 连续同步三次，状态必须保持不变
+  for (let n = 0; n < 3; n++) await work.syncLinear(p.id);
+  assert.equal(r.stateId, "s-review", "多次同步后仍是 In Review");
+  assert.equal(updates.length, 0, "全程没有产生写回");
+  assert.equal(work.list(p.id).find((i) => i.linear!.identifier === "ENG-1")!.status, "in_review");
+});
+
+test("创建人与指派人：导入记真名、为 null 不覆盖、远端变了就刷新，且从不回推", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "lin_…test", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+
+  // 还原远端：ENG-1 有创建人和指派人，ENG-3 没有指派人（历史单的典型状态）
+  const r1 = remote.find((r) => r.id === "lin-1")!;
+  const r3 = remote.find((r) => r.id === "lin-3")!;
+  r1.stateId = "s-todo";
+  r3.stateId = "s-backlog";
+  r1.creator = { id: "u-lit", name: "litong" };
+  r1.assignee = { id: "u-lian", name: "lianjie" };
+  r3.creator = { id: "u-wei", name: "weihe" };
+  r3.assignee = null;
+
+  const p = work.saveProject({ name: "人员同步", key: "PEOP" });
+  await work.connectLinear(p.id, "team-1");
+  updates.length = 0;
+
+  await work.syncLinear(p.id);
+
+  const list = work.list(p.id);
+  const i1 = list.find((i) => i.linear!.identifier === "ENG-1")!;
+  const i3 = list.find((i) => i.linear!.identifier === "ENG-3")!;
+
+  assert.equal(i1.linear!.creator?.name, "litong", "创建人按远端记下");
+  assert.equal(i1.linear!.creator?.id, "u-lit");
+  assert.equal(i1.linear!.assignee?.name, "lianjie", "指派人按远端记下");
+  assert.equal(i3.linear!.creator?.name, "weihe");
+  assert.equal(i3.linear!.assignee, null, "远端没有指派就记 null，不拿本地值去补");
+
+  // 关键：Hub 的 assignee 是智能体名，不能被 Linear 的真人覆盖
+  assert.equal(i1.assignee, null, "Linear 指派人不会写进 Hub 的负责人字段");
+  assert.equal(updates.length, 0, `导入不应产生任何写回，实际：${JSON.stringify(updates)}`);
+
+  // 远端换人：本地镜像跟着刷新，仍然不写回
+  r1.assignee = { id: "u-wei", name: "weihe" };
+  await work.syncLinear(p.id);
+  const after = work.list(p.id).find((i) => i.linear!.identifier === "ENG-1")!;
+  assert.equal(after.linear!.assignee?.name, "weihe", "远端改了指派人，镜像跟着更新");
+  assert.equal(after.linear!.creator?.name, "litong", "创建人不变");
+  assert.equal(updates.length, 0, "全程没有把人员写回 Linear");
+
+  // 远端撤回指派：镜像回到 null，同样不打扰远端
+  r1.assignee = null;
+  await work.syncLinear(p.id);
+  assert.equal(work.list(p.id).find((i) => i.linear!.identifier === "ENG-1")!.linear!.assignee, null);
+  assert.equal(updates.length, 0);
 });

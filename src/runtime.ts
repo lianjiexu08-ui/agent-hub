@@ -167,6 +167,19 @@ export class Runtime {
     return task;
   }
 
+  /**
+   * 直接调用一个智能体并等待结果（管家、外部入口用）。
+   * 与智能体之间的 call_agent 不同：这里没有父任务，也不受 delegation 限制，
+   * 调用方拿到的是最终回复文本。
+   */
+  async callAgent(agentName: string, input: string, opts: { timeoutMs?: number; priority?: number } = {}): Promise<{ taskId: string; status: string; result: string | null; error: string | null; timedOut: boolean }> {
+    if (!this.store.getAgent(agentName)) throw new Error(`智能体 ${agentName} 不存在`);
+    const task = this.submit(agentName, input, { source: "api", hops: 0, priority: opts.priority ?? 2 });
+    const done = await this.waitFor(task.id, opts.timeoutMs ?? 120_000);
+    const timedOut = !TERMINAL.has(done.status);
+    return { taskId: task.id, status: done.status, result: done.result ?? null, error: done.error ?? null, timedOut };
+  }
+
   /** 等待任务结束（completed / failed / cancelled） */
   waitFor(id: string, timeoutMs?: number): Promise<Task> {
     const current = this.store.getTask(id);

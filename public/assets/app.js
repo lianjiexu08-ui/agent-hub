@@ -60,26 +60,46 @@ function updateAuthButton() {
   b.textContent = session.loginEnabled ? (session.authenticated ? "退出" : "登录") : "";
   b.style.display = session.loginEnabled ? "" : "none";
 }
-/** 登录页：整页覆盖，不使用浏览器原生输入框 */
+/** 登录页：左右分栏。左侧讲清楚产品做什么（五段研发流程），右侧是克制的登录表单 */
+const AUTH_MARK = '<svg viewBox="0 0 24 24" class="auth-logo" aria-hidden="true" focusable="false">'
+  + '<g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">'
+  + '<path d="M12 8.8V4.2"/><path d="M9.4 13.3 5.3 16.6"/><path d="M14.6 13.3l4.1 3.3"/></g>'
+  + '<circle cx="12" cy="12" r="3.2" fill="currentColor"/>'
+  + '<g fill="currentColor"><circle cx="12" cy="3.4" r="1.5"/><circle cx="4.4" cy="17.6" r="1.5"/><circle cx="19.6" cy="17.6" r="1.5"/></g>'
+  + '</svg>';
+
+/** 与任务中心的生命周期一致：理解 → 设计 → 开发 → 测试 → 评审 */
+const AUTH_STAGES = [
+  ["01", "需求理解", "澄清边界与验收标准"],
+  ["02", "方案设计", "拆任务、定接口、排优先级"],
+  ["03", "并行开发", "每个任务独立工作区"],
+  ["04", "自动验收", "跑测试，不通过就退回重做"],
+  ["05", "评审合并", "人工把关后合并到主干"],
+];
+
+const authField = (label, el, forId) => h("div", { class: "auth-field" },
+  h("label", { class: "auth-label", for: forId }, label), el);
+
 function showLogin(message = "") {
   if ($("#loginScreen")) {
     const el = $("#loginError");
     if (el) el.textContent = message;
     return;
   }
-  const user = h("input", { id: "loginUser", placeholder: "用户名", autocomplete: "username", spellcheck: "false" });
+  const user = h("input", { id: "loginUser", class: "auth-input-el", "aria-label": "账号", autocomplete: "username", spellcheck: "false" });
   user.value = session.user || "admin";
-  const pass = h("input", { id: "loginPass", type: "password", placeholder: "密码", autocomplete: "current-password" });
-  const eye = h("button", { type: "button", class: "login-eye", title: "显示密码", "aria-label": "显示密码", onclick: () => {
+  const pass = h("input", { id: "loginPass", class: "auth-input-el", type: "password", "aria-label": "密码", autocomplete: "current-password" });
+  const reveal = h("button", { type: "button", class: "auth-reveal", title: "显示密码", "aria-label": "显示密码", onclick: () => {
     const show = pass.type === "password";
     pass.type = show ? "text" : "password";
-    eye.title = show ? "隐藏密码" : "显示密码";
-    eye.textContent = show ? "隐藏" : "显示";
+    reveal.textContent = show ? "隐藏" : "显示";
+    reveal.title = show ? "隐藏密码" : "显示密码";
     pass.focus();
   } }, "显示");
-  const errEl = h("div", { id: "loginError", class: "login-error", role: "alert" }, message);
-  const btn = h("button", { class: "login-submit primary", type: "submit" }, h("span", {}, "登录"), h("span", { class: "login-spin", "aria-hidden": "true" }));
-  const form = h("form", { class: "login-card", onsubmit: async (e) => {
+  const errEl = h("div", { id: "loginError", class: "auth-error", role: "alert" }, message);
+  const btn = h("button", { class: "auth-submit login-submit", type: "submit" }, h("span", {}, "登录"), h("span", { class: "auth-spin", "aria-hidden": "true" }));
+
+  const form = h("form", { class: "auth-form", onsubmit: async (e) => {
     e.preventDefault();
     btn.disabled = true; btn.classList.add("busy");
     errEl.textContent = "";
@@ -87,7 +107,7 @@ function showLogin(message = "") {
       const res = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user: user.value.trim(), password: pass.value }) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "登录失败");
-      session = { checked: true, authenticated: true, loginEnabled: true, user: data.user };
+      session = { checked: true, authenticated: true, loginEnabled: true, user: data.user, needsSetup: !!data.needsSetup };
       $("#loginScreen")?.remove();
       updateAuthButton();
       try { await refreshState(); } catch { /* 下面会重试 */ }
@@ -96,37 +116,137 @@ function showLogin(message = "") {
       await loadAll();
       renderAssigneeFilter();
       renderBoard();
+      await route();
+      landing();
     } catch (err) {
       errEl.textContent = err.message;
       btn.disabled = false; btn.classList.remove("busy");
       pass.focus(); pass.select();
     }
   } },
-    h("div", { class: "login-head" },
-      h("div", { class: "logo" }, h("span", { class: "logo-mark lg" }), h("h1", {}, "Agent Hub")),
-      h("p", { class: "login-sub" }, "登录后继续管理项目、智能体与交付。")),
-    h("label", { class: "login-field" }, h("span", {}, "用户名"), user),
-    h("label", { class: "login-field" }, h("span", {}, "密码"), h("div", { class: "login-pass" }, pass, eye)),
+    authField("账号", h("div", { class: "auth-control" }, user), "loginUser"),
+    authField("密码", h("div", { class: "auth-control" }, pass, reveal), "loginPass"),
     errEl,
-    btn,
-    h("div", { class: "login-foot" }, h("span", { class: "login-dot" }), "内网部署 · 凭据只保存在服务器"));
+    btn);
 
-  const aside = h("aside", { class: "login-aside" },
-    h("div", { class: "la-badge" }, "AI 研发协作"),
-    h("h2", {}, "人只负责提需求，", h("br"), "其余的交给智能体。"),
-    h("p", { class: "la-lead" }, "需求理解、计划、编码、测试、评审由智能体按固定生命周期完成；你只需要确认需求和最终验收。"),
-    h("ul", { class: "la-points" },
-      ["项目绑定仓库，工作项与 issue 双向同步",
-       "同一批智能体跨项目调度，优先级决定先后",
-       "测试与安全护栏通过后自动合并，随时可回滚"].map((t) => h("li", {}, h("span", { class: "la-tick", "aria-hidden": "true" }, "✓"), t))),
-    h("div", { class: "la-deco", "aria-hidden": "true" }));
+  const brand = h("div", { class: "auth-brand" });
+  brand.innerHTML = AUTH_MARK + '<span class="auth-wordmark">Agent Hub</span>';
+  const pitch = h("div", { class: "auth-pitch" },
+    h("h2", { class: "auth-headline" },
+      h("span", {}, "把研发流程交给"),
+      h("span", {}, "一支智能体团队")),
+    h("p", { class: "auth-lede" }, "需求拆解、并行开发、自动验收到评审合并，全部在同一个工作台上流转；每一步的产物与记录都可追溯。"),
+    h("ul", { class: "auth-stages" }, ...AUTH_STAGES.map(([n, name, note]) => h("li", {},
+      h("span", { class: "auth-stage-idx" }, n),
+      h("span", { class: "auth-stage-name" }, name),
+      h("span", { class: "auth-stage-note" }, note)))));
+  const aside = h("aside", { class: "auth-aside" }, brand, pitch,
+    h("p", { class: "auth-aside-foot" }, h("span", { class: "auth-dot", "aria-hidden": "true" }), "本地部署 · 数据与密钥不出内网"));
 
-  document.body.append(h("div", { id: "loginScreen", class: "login-screen" }, h("div", { class: "login-shell" }, aside, form)));
+  const main = h("main", { class: "auth-main" },
+    h("div", { class: "auth-panel" },
+      h("h1", { class: "auth-title" }, "登录"),
+      h("p", { class: "auth-sub" }, "使用管理员账号继续"),
+      form,
+      h("p", { class: "auth-note" }, "连续输错 5 次将锁定 60 秒")),
+    h("footer", { class: "auth-foot" }, h("span", {}, "Agent Hub"), h("span", {}, "v1.0.0")));
+
+  document.body.append(h("div", { id: "loginScreen", class: "auth" }, aside, main));
   setTimeout(() => (user.value ? pass : user).focus());
+}
+
+/** 首次登录后弹窗：把部署时的初始密码换成自己的账号密码 */
+function setupField(label, el, forId) {
+  return h("div", { class: "setup-field" }, h("label", { class: "setup-label", for: forId }, label), el);
+}
+
+function showSetupModal() {
+  if ($("#setupModal")) return;
+  const user = h("input", { id: "setupUser", class: "setup-input", "aria-label": "账号", autocomplete: "username", spellcheck: "false", maxlength: "32" });
+  user.value = session.user || "admin";
+  const pass = h("input", { id: "setupPass", class: "setup-input", type: "password", "aria-label": "新密码", autocomplete: "new-password" });
+  const pass2 = h("input", { id: "setupPass2", class: "setup-input", type: "password", "aria-label": "确认密码", autocomplete: "new-password" });
+  const err = h("div", { class: "setup-error", role: "alert" });
+  const save = h("button", { class: "setup-save", type: "submit" }, "保存并继续");
+
+  const skip = () => {
+    try { sessionStorage.setItem("hub_setup_skipped", "1"); } catch { /* 隐私模式 */ }
+    $("#setupModal")?.remove();
+    if (!modelsReady()) gotoModelSettings();
+  };
+
+  const form = h("form", { class: "setup-form", onsubmit: async (e) => {
+    e.preventDefault();
+    err.textContent = "";
+    const name = user.value.trim();
+    if (!name) { err.textContent = "账号不能为空"; user.focus(); return; }
+    if (pass.value.length < 6) { err.textContent = "密码至少 6 位"; pass.focus(); pass.select(); return; }
+    if (pass.value !== pass2.value) { err.textContent = "两次输入的密码不一致"; pass2.focus(); pass2.select(); return; }
+    save.disabled = true;
+    try {
+      const res = await fetch("/api/setup", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user: name, password: pass.value }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "保存失败");
+      session.needsSetup = false;
+      session.user = data.user;
+      $("#setupModal")?.remove();
+      toast("账号与密码已更新，下次请用新密码登录", "review");
+      if (!modelsReady()) gotoModelSettings();
+    } catch (e2) {
+      err.textContent = e2.message;
+      save.disabled = false;
+    }
+  } },
+    setupField("账号", user, "setupUser"),
+    setupField("新密码", pass, "setupPass"),
+    setupField("确认密码", pass2, "setupPass2"),
+    err,
+    h("div", { class: "setup-actions" },
+      h("button", { type: "button", class: "setup-later", onclick: skip }, "稍后再说"),
+      save));
+
+  document.body.append(h("div", { id: "setupModal", class: "setup-overlay", role: "dialog", "aria-modal": "true", "aria-labelledby": "setupTitle",
+    onkeydown: (e) => { if (e.key === "Escape") skip(); } },
+    h("div", { class: "setup-card" },
+      h("h2", { id: "setupTitle", class: "setup-title" }, "设置你的账号与密码"),
+      h("p", { class: "setup-sub" }, "当前使用的是部署时的初始密码。首次登录请换成自己的账号和密码，保存后初始密码立即失效。"),
+      form,
+      h("p", { class: "setup-note" }, "密码至少 6 位。凭证以 scrypt 哈希保存在服务器的 data/auth.json，忘记时删除该文件即可退回初始密码。"))));
+  setTimeout(() => pass.focus());
+}
+
+/** 给设置页的某个区块加锚点，便于直接滚过去 */
+const withId = (el, id = "settings-models") => { el.id = id; return el; };
+
+/** 是否已有可用的模型连接：配置过 API Key 或用本机登录并验证通过 */
+function modelsReady() {
+  const st = settings.get();
+  const hasProvider = (st?.providers ?? []).some((p) => (p.method === "key" || p.method === "profile") && p.verifiedAt);
+  const hasRuntime = (S.runtimes?.runtimes ?? []).some((r) => r.id !== "builtin" && r.installed);
+  return hasProvider || hasRuntime;
+}
+
+/** 还没有可用的模型连接时，直接落到「设置 → 模型」，并滚到模型区块 */
+function gotoModelSettings() {
+  showView("settings");
+  requestAnimationFrame(() => $("#settings-models")?.scrollIntoView({ block: "start", behavior: "smooth" }));
+}
+
+/** 进入界面后的落地页：先初始化账号，再看模型连接是否已配置 */
+function landing() {
+  // 地址栏里已经有明确的视图（用户刷新前就在别的页面）就不要抢回来
+  if (/view=|issue=|task=/.test(location.hash)) return;
+  if (session.needsSetup) {
+    let skipped = false;
+    try { skipped = sessionStorage.getItem("hub_setup_skipped") === "1"; } catch { /* 隐私模式 */ }
+    if (!skipped) { showSetupModal(); return; }
+  }
+  if (!modelsReady()) gotoModelSettings();
 }
 
 async function logout() {
   try { await fetch("/api/logout", { method: "POST" }); } catch { /* 忽略 */ }
+  try { sessionStorage.removeItem("hub_setup_skipped"); } catch { /* 隐私模式 */ }
   session = { checked: true, authenticated: false, loginEnabled: true, user: null };
   location.reload();
 }
@@ -338,14 +458,7 @@ function connect() {
 
 async function loadAll() {
   try { await Promise.all([loadAgents(), loadRoots()]); } catch (e) { console.error(e); }
-  if (/task=/.test(location.hash)) showView("tasks");
-  const v = /view=(\w+)/.exec(location.hash);
-  if (v) showView(v[1]);
-  const m = /task=([\w-]+)/.exec(location.hash);
-  if (m && !state.selRoot) {
-    // 链接可能指向子任务：定位到它的根
-    try { const t = await api(`/tasks/${m[1]}`); selectRoot(t.rootId, t.id); } catch {}
-  }
+  // 地址栏的恢复统一交给 route()：这里再跑一次会把子选择（studio、tab）覆盖成默认值
 }
 // ======================= 工作项 =======================
 const IS = {
@@ -444,6 +557,21 @@ const issuesApi = {
 
 // ---------- 小部件 ----------
 const ui = { view: "board", q: "", assignee: "", showCanceled: false, openKey: null, feedbackOpen: false, pendingDrawer: false, draft: "", feedbackDraft: "" };
+
+/** 看板筛选条件存在本机：刷新、换视图回来都保持原样（按浏览器分别保存，不进服务端） */
+const UI_PREFS_KEY = "hub_ui_prefs";
+function saveUiPrefs() {
+  try { localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ assignee: ui.assignee, showCanceled: ui.showCanceled })); } catch { /* 隐私模式 */ }
+}
+function loadUiPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem(UI_PREFS_KEY) || "{}");
+    if (typeof p.assignee === "string") ui.assignee = p.assignee;
+    if (typeof p.showCanceled === "boolean") ui.showCanceled = p.showCanceled;
+  } catch { /* 解析失败就用默认值 */ }
+  const box = $("#showCanceled");
+  if (box) box.checked = ui.showCanceled;
+}
 const hasAgent = (n) => (S.agents ?? []).some((a) => a.name === n);
 const agentNames = () => (studio.agents().length ? studio.agents() : state.agents.length ? state.agents : [{ name: "orchestrator" }, { name: "researcher" }, { name: "reviewer" }, { name: "writer" }]).map((a) => a.name);
 const hue = (s) => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) % 360, 7);
@@ -550,7 +678,12 @@ setInterval(() => { if (viewActive("center")) renderCenter(); }, 15000);
 // ---------- 看板 ----------
 async function renderBoard() {
   renderProjBar();
-  const all = await issuesApi.list(curProject()?.id ?? "__none");
+  const cur = curProject();
+  if (!cur) return fill($("#board"), h("div", { class: "empty-board" },
+    h("div", { style: "font-size:15px;font-weight:600;margin-bottom:6px" }, "还没有项目"),
+    h("div", { class: "muted", style: "font-size:13px;margin-bottom:14px" }, "项目是工作空间：工作项、看板、负责人和仓库绑定都在项目下面。先创建一个，再往里放任务。"),
+    h("button", { class: "primary", onclick: () => openNewProject() }, "创建第一个项目")));
+  const all = await issuesApi.list(cur.id);
   const q = ui.q.trim().toLowerCase();
   const visible = all.filter((i) =>
     (!q || `${i.key} ${i.title} ${i.description} ${i.labels.join(" ")}`.toLowerCase().includes(q)) &&
@@ -725,7 +858,9 @@ async function renderDrawer() {
           : h("span", { class: "muted", style: "font-size:12.5px" }, "项目未绑定仓库"),
       h("label", {}, "Linear"), d.linear
         ? h("div", { class: "row" }, linearTag(d.linear), h("span", { class: "muted", style: "font-size:12.5px" }, `${d.linear.state === "closed" ? "已关闭" : "open"} · ${ago(d.linear.syncedAt)}同步`),
-            h("a", { class: "link", style: "font-size:12.5px", href: d.linear.url, target: "_blank", rel: "noopener" }, "在 Linear 打开"))
+            h("a", { class: "link", style: "font-size:12.5px", href: d.linear.url, target: "_blank", rel: "noopener" }, "在 Linear 打开"),
+            (d.linear.creator || d.linear.assignee) ? h("span", { class: "muted", style: "font-size:12.5px" },
+              [d.linear.creator ? `创建人 ${d.linear.creator.name}` : null, d.linear.assignee ? `指派人 ${d.linear.assignee.name}` : "未指派"].filter(Boolean).join(" · ")) : null)
         : curProject()?.linear
           ? h("div", { class: "row" }, h("span", { class: "muted", style: "font-size:12.5px" }, "未关联"),
               linearPushable(curProject()) ? h("button", { onclick: () => issuesApi.pushToLinear(d.key).then(() => toast("已在 Linear 创建 issue", "ok")).catch(fail) }, "创建 Linear issue") : null)
@@ -840,7 +975,7 @@ $("#drawer").addEventListener("focusout", () => setTimeout(() => {
 }));
 $("#scrim").addEventListener("click", () => { if (qaOpen) closeRun(); if (ui.openKey) closeDrawer(); });
 $("#issueSearch").addEventListener("input", (e) => { ui.q = e.target.value; renderIssuesView(); });
-$("#showCanceled").addEventListener("change", (e) => { ui.showCanceled = e.target.checked; renderBoard(); });
+$("#showCanceled").addEventListener("change", (e) => { ui.showCanceled = e.target.checked; saveUiPrefs(); renderBoard(); });
 $("#newIssueBtn").onclick = () => openCreate();
 $("#hotfixBtn").onclick = () => openHotfix();
 
@@ -886,7 +1021,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "/") { e.preventDefault(); $("#issueSearch").focus(); }
 });
 function renderAssigneeFilter() {
-  const el = select([["", "全部负责人"], ["__none", "未指派"], ...agentNames().map((n) => [n, n])], ui.assignee, (v) => { ui.assignee = v; renderIssuesView(); }, { id: "issueAssignee" });
+  const el = select([["", "全部负责人"], ["__none", "未指派"], ...agentNames().map((n) => [n, n])], ui.assignee, (v) => { ui.assignee = v; saveUiPrefs(); renderIssuesView(); }, { id: "issueAssignee" });
   $("#issueAssignee").replaceWith(el);
 }
 function initIssues() {
@@ -943,14 +1078,20 @@ function selectStudio(kind, id, opts = {}) {
   loadDraft();
   renderStudio();
   $("#studioMain").scrollTop = 0;
+  if (viewActive("config")) setHash("config", { studio: kind, sel: id });
 }
 function touch() {
   const bar = $("#savebar");
   if (bar) bar.classList.toggle("clean", !isDirty());
 }
 
+/** 重新拉取自定义工具与 MCP 列表。保存/删除后必须调用，否则列表要等重新进入视图才更新 */
+async function reloadStudioData() {
+  try { [st.realTools, st.realMcp] = await Promise.all([api("/tools"), api("/mcp-servers")]); } catch { /* 拉取失败时保留旧数据 */ }
+}
+
 async function loadConfig() {
-  try { [st.realTools, st.realMcp] = await Promise.all([api("/tools"), api("/mcp-servers")]); } catch {}
+  await reloadStudioData();
   if (!st.sel.id && st.sel.kind === "agent") { st.sel.id = studio.agents()[0]?.name ?? null; loadDraft(); }
   renderStudio();
 }
@@ -985,7 +1126,7 @@ function renderStudioSide() {
       : null,
     h("div", { class: "side-head" }, h("span", {}, "连接")),
     h("div", { class: "side-item" + (st.sel.kind === "tools" ? " sel" : ""), onclick: () => selectStudio("tools", "tools") },
-      h("span", { class: "skill-icon", style: "color:var(--muted);background:var(--panel-2)" }, "⚙"), h("div", { class: "meta" }, h("div", { class: "t" }, "自定义工具"), h("div", { class: "s" }, `${st.realTools.length} 个 webhook 工具`))),
+      h("span", { class: "skill-icon", style: "color:var(--muted);background:var(--panel-2)" }, "⚙"), h("div", { class: "meta" }, h("div", { class: "t" }, "工具目录"), h("div", { class: "s" }, `内置 ${(S.builtinTools ?? []).length} 个 · 自定义 ${st.realTools.length} 个`))),
     h("div", { class: "side-item" + (st.sel.kind === "mcp" ? " sel" : ""), onclick: () => selectStudio("mcp", "mcp") },
       h("span", { class: "skill-icon", style: "color:var(--muted);background:var(--panel-2)" }, "⇄"), h("div", { class: "meta" }, h("div", { class: "t" }, "MCP 服务器"), h("div", { class: "s" }, `${st.realMcp.length} 个服务器`))),
     null,
@@ -1092,10 +1233,18 @@ function agentEditor() {
       }, { style: "max-width:320px" })),
       deleg === "list" ? h("div", { class: "checks" }, others.map((o) => checkbox(d.delegation.includes(o.name), (on) => toggleIn(d.delegation, o.name, on), o.name, o.description))) : null,
       field("订阅主题", listIn(d, "subscribe", "如 drafts, reviews（逗号分隔）"), "主题上有新消息时自动唤醒这个智能体")),
-    section("工具", "除内置的调度、消息总线、工作项工具外，额外可用的能力。",
+    section("工具", "内置工具始终可用；文件、命令类会真的在服务器上读写执行，按需开启。",
+      field("始终可用", (() => {
+        const meta = (S.builtinTools ?? []).filter((t) => t.always);
+        const byGroup = {};
+        for (const t of meta) (byGroup[t.group] ??= []).push(t.name);
+        return h("div", { class: "chips" }, Object.entries(byGroup).map(([g, names]) => h("span", { class: "chip", style: "padding:0 8px;cursor:default", title: names.join("、") }, `${g} ${names.length}`)));
+      })(), "协作、工作项、流程、检索类；具体清单见左侧「工具目录」"),
       h("div", { class: "checks" },
         checkbox(d.serverTools.includes("web_search"), (on) => toggleIn(d.serverTools, "web_search", on), "联网搜索", "web_search，由 Anthropic 服务端执行"),
         checkbox(d.serverTools.includes("web_fetch"), (on) => toggleIn(d.serverTools, "web_fetch", on), "网页抓取", "web_fetch，读取对话中出现的链接")),
+      field("扩展工具", builtinToolToggles(d),
+        "开启文件或命令工具后，这个任务会在项目仓库的独立工作目录里执行；命令受超时与输出上限约束，路径不能逃出该目录"),
       field("自定义工具", st.realTools.length
         ? h("div", { class: "checks" }, st.realTools.map((t) => checkbox(d.tools.includes(t.name), (on) => toggleIn(d.tools, t.name, on), t.name, t.description)))
         : h("div", { class: "muted", style: "font-size:13px" }, "还没有注册 webhook 工具")),
@@ -1161,29 +1310,211 @@ function skillEditor() {
 }
 
 // ---------- 工具 / MCP（真实数据，只读） ----------
+/** 可选的内置工具：默认全关，按智能体开启。risk 决定标记颜色 */
+function builtinToolToggles(d) {
+  const meta = (S.builtinTools ?? []).filter((t) => t.always === false);
+  d.builtinTools ??= [];
+  if (!meta.length) return h("div", { class: "muted", style: "font-size:13px" }, "没有可选的扩展工具");
+  return h("div", { class: "checks" }, meta.map((t) => {
+    const marked = t.risk === "exec" ? h("span", { class: "err-text" }, "可执行命令")
+      : t.risk === "write" ? h("span", { style: "color:var(--accent)" }, "可写文件")
+      : null;
+    return checkbox(d.builtinTools.includes(t.name), (on) => toggleIn(d.builtinTools, t.name, on), t.name,
+      h("span", {}, t.desc, marked ? h("span", { style: "margin-left:6px;font-size:11.5px" }, `· ${marked.textContent}`) : null));
+  }));
+}
+
 function toolsView() {
+  const meta = S.builtinTools ?? [];
+  const groups = [...new Set(meta.map((t) => t.group))];
+  const usageOf = (name, always) => {
+    if (always) return "全部智能体";
+    const names = studio.agents().filter((a) => (a.builtinTools ?? []).includes(name)).map((a) => a.name);
+    return names.length ? names.join("、") : "未启用";
+  };
+  const riskTag = (r) => (r === "exec" ? h("span", { class: "tag", style: "color:var(--failed);border-color:currentColor" }, "执行")
+    : r === "write" ? h("span", { class: "tag", style: "color:var(--accent);border-color:currentColor" }, "写入")
+    : r === "read" ? h("span", { class: "tag" }, "只读") : null);
+
+  const form = sg.toolForm;
+  const toolForm = form ? (() => {
+    const f = { name: "", description: "", url: "", timeoutMs: 60000, input_schema: '{"type":"object","properties":{}}', ...form };
+    const name = h("input", { placeholder: "如 lookup_order（字母数字下划线）", oninput: (e) => (f.name = e.target.value) });
+    name.value = f.name;
+    const desc = h("input", { placeholder: "一句话说明这个工具做什么", oninput: (e) => (f.description = e.target.value) });
+    desc.value = f.description;
+    const url = h("input", { placeholder: "https://example.com/hooks/lookup_order", oninput: (e) => (f.url = e.target.value) });
+    url.value = f.url;
+    const timeout = h("input", { type: "number", min: 1, max: 600, style: "max-width:120px", oninput: (e) => (f.timeoutMs = Number(e.target.value) * 1000 || 60000) });
+    timeout.value = Math.round(f.timeoutMs / 1000);
+    const schema = h("textarea", { class: "prompt-area", style: "min-height:110px;font-family:var(--mono)", oninput: (e) => (f.input_schema = e.target.value) }, f.input_schema);
+    const status = h("span", { style: "font-size:12.5px" });
+    const save = async () => {
+      let parsed;
+      try { parsed = JSON.parse(f.input_schema || "{}"); }
+      catch { status.className = "err-text"; status.textContent = "input_schema 不是合法 JSON"; return; }
+      status.className = "muted"; status.textContent = "保存中…";
+      try {
+        await rpc("studio.saveTool", { name: f.name.trim(), description: f.description.trim(), url: f.url.trim(), timeoutMs: f.timeoutMs, input_schema: parsed, headers: {} });
+        sg.toolForm = null;
+        await Promise.all([refreshState(), reloadStudioData()]); renderStudio();
+        toast(`已保存工具 ${f.name}`, "ok");
+      } catch (err) { status.className = "err-text"; status.textContent = err.message; }
+    };
+    return h("div", { class: "card" },
+      h("div", { class: "ttl" }, form.name ? `编辑 ${form.name}` : "新建自定义工具"),
+      field("名称", name, "调用时模型看到的名字，不能与内置工具重名"),
+      field("说明", desc, "模型据此判断什么时候调用，写清楚输入输出"),
+      field("地址", url, "Hub 会 POST {input, context:{taskId, agent}} 到这个地址，期望返回 {content} 或纯文本"),
+      field("超时", h("div", { class: "row" }, timeout, h("span", { class: "muted", style: "font-size:12.5px" }, "秒"))),
+      field("input_schema", schema, "JSON Schema，描述参数结构"),
+      h("div", { class: "row" },
+        h("button", { class: "primary", onclick: save }, "保存"),
+        h("button", { onclick: () => { sg.toolForm = null; renderStudio(); } }, "取消"),
+        status));
+  })() : null;
+
   return [
-    h("div", { class: "ed-head" }, h("div", {}, h("h2", {}, "自定义工具"), h("div", { class: "sub" }, "以 HTTP webhook 实现，在智能体的「工具」里勾选启用。注册方式：PUT /tools/:name"))),
-    st.realTools.length ? h("div", { class: "grid" }, st.realTools.map((t) => h("div", { class: "card" },
-      h("b", {}, t.name), h("div", { class: "muted" }, t.description), kv(["URL", h("code", {}, t.url), "超时", `${t.timeoutMs} ms`], { style: "margin-top:6px" }),
-      h("details", {}, h("summary", { class: "muted" }, "input_schema"), h("pre", {}, JSON.stringify(t.input_schema, null, 2))))))
-      : h("div", { class: "empty" }, "还没有注册自定义工具"),
+    h("div", { class: "ed-head" }, h("div", {}, h("h2", {}, "工具目录"), h("div", { class: "sub" }, "智能体能调用的全部能力：内置的始终可用，扩展的按智能体开启"))),
+    h("div", { class: "ed-section" }, h("div", { class: "lbl" }, h("b", {}, "内置工具"), h("span", {}, "由 Hub 直接实现，不需要额外依赖")),
+      h("div", { class: "fields" }, groups.map((g) => h("div", {},
+        h("b", { style: "font-size:13px" }, g),
+        h("table", { class: "map-table", style: "width:100%;margin-top:6px" },
+          h("tr", {}, h("th", {}, "工具"), h("th", {}, "作用"), h("th", {}, "级别"), h("th", {}, "谁在用")),
+          meta.filter((t) => t.group === g).map((t) => h("tr", {},
+            h("td", {}, h("code", {}, t.name)),
+            h("td", { style: "font-size:12.5px" }, t.desc),
+            h("td", {}, riskTag(t.risk) ?? h("span", { class: "muted", style: "font-size:12px" }, "无副作用")),
+            h("td", { class: "muted", style: "font-size:12px;max-width:260px" }, usageOf(t.name, t.always))))))))),
+    h("div", { class: "ed-section" }, h("div", { class: "lbl" }, h("b", {}, "自定义工具"), h("span", {}, `HTTP webhook 实现，${st.realTools.length} 个`)),
+      h("div", { class: "fields" },
+        st.realTools.length ? h("div", { class: "grid" }, st.realTools.map((t) => h("div", { class: "card" },
+          h("div", { class: "row" }, h("b", {}, t.name), h("span", { style: "margin-left:auto" }),
+            h("button", { onclick: () => { sg.toolForm = { ...t, input_schema: JSON.stringify(t.input_schema, null, 2) }; renderStudio(); } }, "编辑"),
+            h("button", { class: "danger", onclick: () => { if (!confirm(`删除工具 ${t.name}？使用它的智能体会失去这个能力。`)) return; rpc("studio.deleteTool", t.name).then(async () => { await Promise.all([refreshState(), reloadStudioData()]); renderStudio(); toast("已删除", "ok"); }).catch(fail); } }, "删除")),
+          h("div", { class: "muted" }, t.description),
+          kv(["URL", h("code", {}, t.url), "超时", `${t.timeoutMs} ms`], { style: "margin-top:6px" }),
+          h("details", {}, h("summary", { class: "muted" }, "input_schema"), h("pre", {}, JSON.stringify(t.input_schema, null, 2))))))
+          : h("div", { class: "muted", style: "font-size:13px" }, "还没有自定义工具。适合把内部系统的查询能力接进来，例如查订单、查日志、触发构建。"),
+        toolForm ?? h("div", {}, h("a", { class: "link", style: "font-size:13px", onclick: () => { sg.toolForm = {}; renderStudio(); } }, "+ 新建自定义工具")))),
   ];
 }
+/** 常用 MCP 服务器预设：点一下就把表单填好，只留需要用户决定的部分（令牌、路径、连接串） */
+const MCP_PRESETS = [
+  { name: "playwright", label: "Playwright", desc: "浏览器自动化：打开页面、点击、填表、截图、读控制台与网络请求。验收前端改动最有用。", transport: "stdio", command: "npx", args: "-y\n@playwright/mcp@latest", env: "", needs: null },
+  { name: "context7", label: "Context7 文档", desc: "按库名查最新版本文档，避免模型用过期 API。", transport: "stdio", command: "npx", args: "-y\n@upstash/context7-mcp@latest", env: "", needs: null },
+  { name: "sequential-thinking", label: "结构化思考", desc: "把复杂问题拆成可回溯的推理步骤，适合排障与方案权衡。", transport: "stdio", command: "npx", args: "-y\n@modelcontextprotocol/server-sequential-thinking", env: "", needs: null },
+  { name: "memory", label: "长期记忆", desc: "跨会话保存实体与关系，适合需要记住项目约定的智能体。", transport: "stdio", command: "npx", args: "-y\n@modelcontextprotocol/server-memory", env: "MEMORY_FILE_PATH=<改成服务器上一个可写路径>", needs: "填一个可写路径" },
+  { name: "filesystem", label: "文件系统", desc: "按目录读写文件。Hub 已内置 worktree 内的读写工具，这个用于访问额外目录。", transport: "stdio", command: "npx", args: "-y\n@modelcontextprotocol/server-filesystem\n<改成要开放的绝对路径>", env: "", needs: "填要开放的目录" },
+  { name: "postgres", label: "PostgreSQL", desc: "只读查询数据库，适合排查数据问题、核对线上状态。", transport: "stdio", command: "npx", args: "-y\n@modelcontextprotocol/server-postgres\npostgresql://user:pass@host:5432/db", env: "", needs: "替换连接串" },
+  { name: "fetch", label: "网页抓取", desc: "抓取网页并转成 Markdown。需要服务器装有 uv。", transport: "stdio", command: "uvx", args: "mcp-server-fetch", env: "", needs: "需要 uv" },
+  { name: "github-remote", label: "GitHub（托管）", desc: "GitHub 官方远程 MCP，读写 issue、PR、代码。", transport: "http", url: "https://api.githubcopilot.com/mcp/", headers: "Authorization: Bearer <粘贴 GitHub 令牌>", needs: "填 GitHub 令牌" },
+  { name: "github", label: "GitHub（本地）", desc: "GitHub MCP 的本地实现，用 npx 启动。", transport: "stdio", command: "npx", args: "-y\n@modelcontextprotocol/server-github", env: "GITHUB_PERSONAL_ACCESS_TOKEN=<粘贴 GitHub 令牌>", needs: "填 GitHub 令牌" },
+];
+
 function mcpView() {
+  const form = sg.mcpForm;
+  const linesOf = (pairs) => pairs.map(([k, v]) => `${k}=${v}`).join("\n");
+  const mcpForm = form ? (() => {
+    const f = { name: "", transport: "stdio", command: "", args: "", env: "", url: "", headers: "", timeoutMs: 120000, ...form };
+    const name = h("input", { placeholder: "如 github（字母数字下划线）", oninput: (e) => (f.name = e.target.value) });
+    name.value = f.name;
+    const transport = select([["stdio", "stdio：在服务器上启动一个进程"], ["http", "http：连接远程 MCP 服务"]], f.transport, (v) => { f.transport = v; sg.mcpForm = { ...f }; renderStudio(); }, { style: "max-width:340px" });
+
+    const command = h("input", { placeholder: "npx", oninput: (e) => (f.command = e.target.value) });
+    command.value = f.command;
+    const args = h("textarea", { class: "prompt-area", style: "min-height:56px;font-family:var(--mono)", placeholder: "每行一个参数，例如：\n-y\n@modelcontextprotocol/server-github", oninput: (e) => (f.args = e.target.value) }, f.args);
+    const env = h("textarea", { class: "prompt-area", style: "min-height:56px;font-family:var(--mono)", placeholder: "每行一个，KEY=VALUE，例如：\nGITHUB_PERSONAL_ACCESS_TOKEN=github_pat_xxx", oninput: (e) => (f.env = e.target.value) }, f.env);
+    const url = h("input", { placeholder: "https://api.githubcopilot.com/mcp/", oninput: (e) => (f.url = e.target.value) });
+    url.value = f.url;
+    const headers = h("textarea", { class: "prompt-area", style: "min-height:56px;font-family:var(--mono)", placeholder: "每行一个，KEY: VALUE，例如：\nAuthorization: Bearer github_pat_xxx", oninput: (e) => (f.headers = e.target.value) }, f.headers);
+    const timeout = h("input", { type: "number", min: 1, max: 600, style: "max-width:120px", oninput: (e) => (f.timeoutMs = Number(e.target.value) * 1000 || 120000) });
+    timeout.value = Math.round(f.timeoutMs / 1000);
+    const status = h("span", { style: "font-size:12.5px" });
+
+    const save = async () => {
+      const parsePairs = (text, sep) => Object.fromEntries(text.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+        const i = l.indexOf(sep);
+        return i < 0 ? ["", ""] : [l.slice(0, i).trim(), l.slice(i + sep.length).trim()];
+      }).filter(([k]) => k));
+      const payload = f.transport === "stdio"
+        ? { name: f.name.trim(), transport: "stdio", command: f.command.trim(), args: f.args.split("\n").map((x) => x.trim()).filter(Boolean), env: parsePairs(f.env, "="), timeoutMs: f.timeoutMs }
+        : { name: f.name.trim(), transport: "http", url: f.url.trim(), headers: parsePairs(f.headers, ":"), timeoutMs: f.timeoutMs };
+      status.className = "muted"; status.textContent = "保存中…";
+      try {
+        await rpc("studio.saveMcp", payload);
+        sg.mcpForm = null;
+        await Promise.all([refreshState(), reloadStudioData()]); renderStudio();
+        toast(`已保存 MCP 服务器 ${f.name}`, "ok");
+      } catch (err) { status.className = "err-text"; status.textContent = err.message; }
+    };
+
+    return h("div", { class: "card" },
+      h("div", { class: "ttl" }, form.name ? `编辑 ${form.name}` : "新建 MCP 服务器"),
+      h("div", { class: "muted", style: "font-size:12.5px;margin-bottom:6px" }, "从下方「常用服务器」点一个预设可以自动填好，也可以手动填写。"),
+      field("名称", name, "智能体通过这个名字勾选它"),
+      field("传输方式", transport, "stdio 会在服务器上启动进程；http 连接远程服务，可带认证头"),
+      f.transport === "stdio"
+        ? [field("命令", command, "可执行文件，如 npx、uvx、node"), field("参数", args), field("环境变量", env, "只保存在服务端，不会显示回浏览器")]
+        : [field("地址", url), field("请求头", headers, "用于认证，只保存在服务端")],
+      field("超时", h("div", { class: "row" }, timeout, h("span", { class: "muted", style: "font-size:12.5px" }, "秒"))),
+      h("div", { class: "row" },
+        h("button", { class: "primary", onclick: save }, "保存"),
+        h("button", { onclick: () => { sg.mcpForm = null; renderStudio(); } }, "取消"),
+        status));
+  })() : null;
+
   return [
-    h("div", { class: "ed-head" }, h("div", {}, h("h2", {}, "MCP 服务器"), h("div", { class: "sub" }, "hub 作为 MCP 客户端连接，在智能体的「工具」里勾选启用。注册方式：PUT /mcp-servers/:name"))),
-    st.realMcp.length ? h("div", { class: "grid" }, st.realMcp.map((s) => {
-      const out = h("div", {});
-      return h("div", { class: "card" }, h("div", { class: "row" }, h("b", {}, s.name), h("span", { class: "tag" }, s.transport),
-          h("button", { style: "margin-left:auto", onclick: async (e) => {
-            e.target.disabled = true; fill(out, h("span", { class: "muted" }, "连接中…"));
-            try { const ts = await api(`/mcp-servers/${s.name}/tools`); fill(out, h("div", { class: "s-completed" }, `✓ ${ts.length} 个工具`), h("div", { class: "muted", style: "font-size:13px" }, ts.map((t) => t.name).join(", "))); }
-            catch (err) { fill(out, h("div", { class: "s-failed" }, err.message)); }
-            e.target.disabled = false;
-          } }, "检测连接")),
-        h("code", { class: "muted" }, s.transport === "stdio" ? [s.command, ...s.args].join(" ") : s.url), out);
-    })) : h("div", { class: "empty" }, "还没有注册 MCP 服务器"),
+    h("div", { class: "ed-head" }, h("div", {}, h("h2", {}, "MCP 服务器"), h("div", { class: "sub" }, "Hub 作为 MCP 客户端连接外部工具服务；注册后在智能体的「工具」里勾选启用"))),
+    h("div", { class: "ed-section" }, h("div", { class: "fields" },
+      h("div", { class: "callout" },
+        h("div", {}, h("b", {}, "这里的 GitHub 只给智能体用，不会让 Hub 获得仓库授权。"),
+          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" },
+            "绑定仓库、克隆代码、提交 PR 由 Hub 自己做，需要在「设置 → 集成与通知 → GitHub」或「项目设置」里单独连接。两处可以用同一个令牌。"))))),
+    h("div", { class: "ed-section" }, h("div", { class: "lbl" }, h("b", {}, "已注册"), h("span", {}, `${st.realMcp.length} 个服务器`)),
+      h("div", { class: "fields" },
+        st.realMcp.length ? h("div", { class: "grid" }, st.realMcp.map((m) => {
+          const out = h("div", {});
+          const used = studio.agents().filter((a) => (a.mcp ?? []).includes(m.name)).map((a) => a.name);
+          return h("div", { class: "card" },
+            h("div", { class: "row" }, h("b", {}, m.name), h("span", { class: "tag" }, m.transport),
+              h("span", { style: "margin-left:auto" }),
+              h("button", { onclick: async (e) => {
+                e.target.disabled = true; fill(out, h("span", { class: "muted" }, "连接中…"));
+                try { const ts = await api(`/mcp-servers/${m.name}/tools`); fill(out, h("div", { class: "s-completed" }, `✓ ${ts.length} 个工具`), h("div", { class: "muted", style: "font-size:13px" }, ts.map((t) => t.name).join(", "))); }
+                catch (err) { fill(out, h("div", { class: "s-failed" }, err.message)); }
+                e.target.disabled = false;
+              } }, "检测连接"),
+              h("button", { onclick: () => {
+                sg.mcpForm = m.transport === "stdio"
+                  ? { ...m, args: (m.args ?? []).join("\n"), env: linesOf(Object.entries(m.env ?? {})) }
+                  : { ...m, headers: linesOf(Object.entries(m.headers ?? {})), command: "", args: "", env: "" };
+                renderStudio();
+              } }, "编辑"),
+              h("button", { class: "danger", onclick: () => {
+                if (!confirm(`删除 ${m.name}？${used.length ? `${used.join("、")} 将失去这些工具。` : ""}`)) return;
+                rpc("studio.deleteMcp", m.name).then(async () => { await Promise.all([refreshState(), reloadStudioData()]); renderStudio(); toast("已删除", "ok"); }).catch(fail);
+              } }, "删除")),
+            h("code", { class: "muted" }, m.transport === "stdio" ? [m.command, ...(m.args ?? [])].join(" ") : m.url),
+            used.length ? h("div", { class: "muted", style: "font-size:12px;margin-top:6px" }, `使用者：${used.join("、")}`) : h("div", { class: "muted", style: "font-size:12px;margin-top:6px" }, "还没有智能体使用"),
+            out);
+        })) : h("div", { class: "muted", style: "font-size:13px" }, "还没有注册 MCP 服务器。"),
+        mcpForm ?? h("div", {}, h("a", { class: "link", style: "font-size:13px", onclick: () => { sg.mcpForm = {}; renderStudio(); } }, "+ 新建 MCP 服务器")))),
+    h("div", { class: "ed-section" }, h("div", { class: "lbl" }, h("b", {}, "常用服务器"), h("span", {}, "点「填入」把表单填好，需要令牌或路径的已标出")),
+      h("div", { class: "fields" }, h("div", { class: "grid" }, MCP_PRESETS.map((p) => {
+        const registered = st.realMcp.some((m) => m.name === p.name);
+        return h("div", { class: "card" },
+          h("div", { class: "row" }, h("b", {}, p.label), h("span", { class: "tag" }, p.transport),
+            registered ? h("span", { class: "tag", style: "color:var(--accent);border-color:currentColor" }, "已注册") : null,
+            h("span", { style: "margin-left:auto" }),
+            h("button", { onclick: () => {
+              sg.mcpForm = { name: p.name, transport: p.transport, command: p.command ?? "", args: p.args ?? "", env: p.env ?? "", url: p.url ?? "", headers: p.headers ?? "", timeoutMs: 180000 };
+              renderStudio();
+              $("#studioMain").scrollTop = 0;
+            } }, registered ? "重新填入" : "填入")),
+          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, p.desc),
+          p.needs ? h("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, `需要：${p.needs}`) : null);
+      })))),
   ];
 }
 
@@ -1285,7 +1616,7 @@ function openBuilder(target) {
       demoFlag(""),
       h("span", { style: "margin-left:auto" }), h("button", { onclick: () => closeModal() }, "✕")),
     h("div", { class: "b-chat" }, h("div", { class: "b-msgs", id: "bMsgs" }), h("div", { class: "suggests", id: "bSuggests" }),
-      h("div", { class: "b-input" },
+    h("div", { class: "b-input" },
         h("textarea", { id: "bInput", placeholder: "描述你的需要…（Enter 发送，Shift+Enter 换行）", oninput: (e) => (bd.input = e.target.value),
           onkeydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); bSend(e.target.value); } } }),
         h("button", { class: "primary", onclick: () => bSend($("#bInput").value) }, "发送"))),
@@ -1411,6 +1742,21 @@ const modelLabel = (id) => settings.model(id)?.label ?? MODELS.find((m) => m.id 
 
 // ======================= 通用：视图切换 =======================
 const VIEW_TITLES = { home: "首页", issues: "工作项", center: "任务中心", testing: "测试", automation: "自动化", insights: "洞察", tasks: "调用记录", bus: "总线消息", config: "智能体与工具", project: "项目设置", settings: "设置" };
+/** 把视图与子选择写进地址栏；刷新后 route() 据此恢复 */
+function setHash(view, params = {}) {
+  const q = new URLSearchParams({ view });
+  for (const [k, v] of Object.entries(params)) if (v != null && v !== "") q.set(k, String(v));
+  const next = "#" + q.toString();
+  if (location.hash !== next) history.replaceState(null, "", next);
+}
+
+/** 当前视图的子选择，供 showView 写回地址栏 */
+function hashParamsOf(v) {
+  if (v === "settings") return { tab: sg.tab };
+  if (v === "config") return { studio: st.sel.kind, sel: st.sel.id };
+  return {};
+}
+
 function showView(v) {
   const navV = v === "bus" ? "tasks" : v;
   document.querySelectorAll("nav button").forEach((x) => {
@@ -1420,7 +1766,7 @@ function showView(v) {
   });
   document.querySelectorAll(".view").forEach((x) => x.classList.toggle("active", x.id === "view-" + v));
   if (v === "tasks") { if (state.selRoot) history.replaceState(null, "", "#task=" + state.selRoot); }
-  else if (v !== "issues" || !ui.openKey) history.replaceState(null, "", "#view=" + v);
+  else if (v !== "issues" || !ui.openKey) setHash(v, hashParamsOf(v));
   if (v === "home") renderHome();
   if (v === "issues") renderBoard();
   if (v === "center") renderCenter();
@@ -1436,6 +1782,54 @@ function showView(v) {
 const GH_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
 const ghIcon = () => { const e = h("span", { class: "ghi" }); e.innerHTML = GH_ICON; return e; };
 const ghTag = (g) => g ? h("span", { class: "gh" + (g.state === "closed" ? " closed" : ""), title: `GitHub ${g.repo ?? ""} #${g.number}（${g.state === "closed" ? "已关闭" : "open"}）` }, ghIcon(), `#${g.number}`) : null;
+/** 轻量 Markdown：先整体转义再按行处理，避免把模型输出当 HTML 执行。只覆盖常用语法。 */
+function mdHtml(src) {
+  const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const inline = (t) => esc(t)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  const lines = String(src ?? "").split("\n");
+  const out = [];
+  let list = null;
+  let i = 0;
+  const closeList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  const blockStart = /^\s*(```|#{1,4}\s|>\s?|[-*+]\s|\d+[.)]\s)/;
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = line.match(/^\s*```/);
+    if (fence) {
+      closeList();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) body.push(lines[i++]);
+      i++;
+      out.push(`<pre><code>${esc(body.join("\n"))}</code></pre>`);
+      continue;
+    }
+    if (!line.trim()) { closeList(); i++; continue; }
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) { closeList(); const n = heading[1].length; out.push(`<h${n}>${inline(heading[2])}</h${n}>`); i++; continue; }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { closeList(); out.push("<hr>"); i++; continue; }
+    if (/^\s*>\s?/.test(line)) { closeList(); out.push(`<blockquote>${inline(line.replace(/^\s*>\s?/, ""))}</blockquote>`); i++; continue; }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (ul) { if (list !== "ul") { closeList(); out.push("<ul>"); list = "ul"; } out.push(`<li>${inline(ul[1])}</li>`); i++; continue; }
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ol) { if (list !== "ol") { closeList(); out.push("<ol>"); list = "ol"; } out.push(`<li>${inline(ol[1])}</li>`); i++; continue; }
+    closeList();
+    const para = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() && !blockStart.test(lines[i])) para.push(lines[i++]);
+    out.push(`<p>${para.map(inline).join("<br>")}</p>`);
+  }
+  closeList();
+  return out.join("");
+}
+/** 渲染成 Markdown 的气泡：内容由 mdHtml 产出，样式靠 .md 关掉 pre-wrap */
+const mdEl = (text, cls = "bubble ai md") => { const el = h("div", { class: cls }); el.innerHTML = mdHtml(text); return el; };
+
 const linearTag = (l) => l ? h("span", { class: "gh lin" + (l.state === "closed" ? " closed" : ""), title: `Linear ${l.identifier}` }, h("span", { class: "lin-mark", "aria-hidden": "true" }), l.identifier) : null;
 const linearPushable = (p) => !!p?.linear && ["two_way", "push"].includes(p.linear.mode);
 const pbadge = (p) => h("span", { class: "pbadge", style: `--hue:${hue(p?.key ?? "?")}` }, (p?.key ?? "?").slice(0, 3));
@@ -1492,27 +1886,83 @@ function renderProjBar() {
 
 // ======================= 新建项目 =======================
 function openNewProject() {
-  const name = h("input", { class: "title-input", placeholder: "项目名称，如 官网改版" });
-  const key = h("input", { placeholder: "编号前缀，如 WEB", style: "max-width:180px;text-transform:uppercase" });
-  const desc = h("input", { placeholder: "一句话描述（可选）" });
-  name.addEventListener("input", () => { if (!key.dataset.touched) key.value = (name.value.match(/[A-Za-z]+/g) ?? []).join("").slice(0, 4).toUpperCase(); });
-  key.addEventListener("input", () => (key.dataset.touched = "1"));
+  const gh = settings.get().github;
+  const used = new Set(issuesApi.projects().filter((x) => x.repo).map((x) => x.repo.fullName));
+  // 表单状态独立存着：切换运行方式会重绘，不能把用户已经填的内容弄丢
+  const st = { brief: "", name: "", key: "", description: "", mode: "local", repo: "" };
+
+  const body = () => {
+    const brief = h("textarea", { rows: 3, placeholder: "说说这个项目要做什么，比如：给官网加一个博客模块，支持 Markdown 和标签，第一期先能发布文章",
+      oninput: (e) => (st.brief = e.target.value) });
+    brief.value = st.brief;
+    const name = h("input", { class: "title-input", placeholder: "项目名称，如 官网改版", oninput: (e) => { st.name = e.target.value; if (!st.keyTouched) { st.key = (st.name.match(/[A-Za-z]+/g) ?? []).join("").slice(0, 4).toUpperCase(); renderKey(); } } });
+    name.value = st.name;
+    const key = h("input", { placeholder: "编号前缀，如 WEB", style: "max-width:180px;text-transform:uppercase", oninput: (e) => { st.keyTouched = true; st.key = e.target.value.toUpperCase(); } });
+    key.value = st.key;
+    const renderKey = () => { key.value = st.key; };
+    const desc = h("input", { placeholder: "一句话描述（可选）", oninput: (e) => (st.description = e.target.value) });
+    desc.value = st.description;
+
+    const asking = h("span", { class: "muted", style: "font-size:12.5px" });
+    const draftBtn = h("button", { onclick: async (e) => {
+      if (!st.brief.trim()) return toast("先说说这个项目要做什么", "err");
+      e.target.disabled = true; asking.textContent = "管家正在起草…";
+      try {
+        const d = await rpc("assistant.draftProject", st.brief);
+        st.name = d.name || st.name; st.key = (d.key || st.key).toUpperCase(); st.description = d.description || st.description;
+        name.value = st.name; key.value = st.key; desc.value = st.description;
+        asking.textContent = "已起草，可以改";
+      } catch (err) { asking.textContent = ""; fail(err); } finally { e.target.disabled = false; }
+    } }, "让管家起草");
+
+    const modeBtn = (m, label, hint) => h("button", { class: st.mode === m ? "primary" : "", style: "text-align:left;flex:1;padding:10px 14px;height:auto",
+      onclick: () => { st.mode = m; redraw(); } },
+      h("div", { style: "font-weight:600" }, label), h("div", { style: "font-size:12px;opacity:.75;margin-top:2px;font-weight:400" }, hint));
+
+    const repoBlock = st.mode !== "github" ? null : !gh.connected
+      ? h("div", { class: "callout warn", style: "margin-top:10px" },
+          h("div", {}, h("b", {}, "还没有连接 GitHub")),
+          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" },
+            "可以先建项目，之后在「项目设置 → GitHub 仓库」里补令牌和仓库；不影响现在开始干。"))
+      : (() => {
+          const pick = select([["", "选择仓库…"], ...gh.repos.map((r) => [r, used.has(r) ? `${r}（已绑定其他项目）` : r])], st.repo, (v) => (st.repo = v), { style: "max-width:360px;margin-top:10px" });
+          [...pick.options].forEach((o) => { if (used.has(o.value)) o.disabled = true; });
+          return h("div", {}, pick, h("div", { class: "muted", style: "font-size:12.5px;margin-top:6px" }, `以 ${gh.login} 的身份访问`));
+        })();
+
+    const wrap = h("div", { class: "modal", onclick: (e) => e.stopPropagation() },
+      h("div", { class: "dr-head" }, h("span", {}, "新建项目")),
+      h("div", { class: "fields" },
+        brief,
+        h("div", { class: "row", style: "gap:10px;align-items:center" }, draftBtn, asking)),
+      name,
+      h("div", { class: "modal-props" }, key, desc),
+      h("div", { style: "margin-top:14px" }, h("div", { style: "font-size:12.5px;color:var(--muted);margin-bottom:8px" }, "代码放在哪"),
+        h("div", { class: "row", style: "gap:10px;align-items:stretch" },
+          modeBtn("local", "仅本地", "在服务器的工作区里开发，不往 GitHub 推代码"),
+          modeBtn("github", "绑定 GitHub", "工作项与 issue 同步，智能体在仓库里改代码并提 PR"))),
+      repoBlock,
+      h("div", { class: "modal-foot" }, h("span", { class: "hint" }, "工作项编号会以前缀开头，如 WEB-1"),
+        h("button", { onclick: () => closeModal() }, "取消"), h("button", { class: "primary", onclick: submit }, "创建")));
+    return wrap;
+  };
+
+  const redraw = () => fill($("#modal"), body());
+
   const submit = async () => {
+    if (!st.name.trim() || !st.key.trim()) return toast("名称和编号前缀都要填", "err");
     try {
-      const p = await issuesApi.saveProject({ name: name.value, key: key.value, description: desc.value });
+      const p = await issuesApi.saveProject({ name: st.name.trim(), key: st.key.trim().toUpperCase(), description: st.description.trim() });
+      if (st.mode === "github" && st.repo) await issuesApi.connectRepo(p.id, st.repo);
       closeModal(true);
       setProject(p.id);
       showView("project");
-      toast(`已创建项目 ${p.name}，可以接着绑定 GitHub 仓库`, "ok");
+      toast(st.mode === "github" && st.repo ? `已创建 ${p.name} 并绑定 ${st.repo}` : `已创建 ${p.name}（本地）`, "ok");
     } catch (e) { fail(e); }
   };
-  fill($("#modal"), h("div", { class: "modal", onclick: (e) => e.stopPropagation() },
-    h("div", { class: "dr-head" }, h("span", {}, "新建项目")), name,
-    h("div", { class: "modal-props" }, key, desc),
-    h("div", { class: "modal-foot" }, h("span", { class: "hint" }, "工作项编号会以前缀开头，如 WEB-1"),
-      h("button", { onclick: () => closeModal() }, "取消"), h("button", { class: "primary", onclick: submit }, "创建"))));
+
+  redraw();
   $("#modal").classList.add("open"); $("#modal").setAttribute("aria-hidden", "false");
-  setTimeout(() => name.focus());
 }
 
 // ======================= 项目设置页 =======================
@@ -1538,7 +1988,28 @@ function renderProjectPage() {
       h("a", { class: "link", href: `https://github.com/${p.repo.fullName}`, target: "_blank", rel: "noopener" }, "在 GitHub 打开"),
       h("button", { class: "danger", onclick: async () => { if (confirm(`解绑 ${p.repo.fullName}？已关联的工作项会保留 GitHub 编号，但不再同步。`)) { await issuesApi.disconnectRepo(p.id); pg.draft = null; renderProjectPage(); } } }, "解绑"));
   } else if (!gh.connected) {
-    repoBlock = h("div", { class: "callout warn" }, "还没有授权 GitHub，授权后才能选择仓库。", h("button", { class: "primary", onclick: () => showView("settings") }, "去设置授权"));
+    // Hub 绑仓库用的是它自己的令牌；MCP 里的 GitHub 只给智能体调 API，两者不通用，这里直接给输入框避免来回跳
+    const tok = h("input", { type: "password", autocomplete: "off", placeholder: "ghp_… 或 github_pat_…", style: "max-width:320px" });
+    const st = h("span", { style: "font-size:12.5px" });
+    repoBlock = h("div", { class: "fields" },
+      h("div", { class: "callout warn" },
+        h("div", {}, h("b", {}, "需要 Hub 自己的 GitHub 令牌才能绑定仓库。"),
+          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" },
+            "这和 MCP 里的 GitHub 是两回事：MCP 让智能体能调 GitHub API，绑仓库、克隆、提 PR 由 Hub 自己做，需要单独授权。"))),
+      h("div", { class: "row", style: "flex-wrap:nowrap" }, tok,
+        h("button", { class: "primary", onclick: async (e) => {
+          if (!tok.value.trim()) { st.className = "err-text"; st.textContent = "先填令牌"; return; }
+          e.target.disabled = true; st.className = "muted"; st.textContent = "验证中…";
+          try {
+            await settings.githubPAT(tok.value.trim());
+            pg.draft = null; renderProjectPage();
+            toast("GitHub 已连接，可以选仓库了", "ok");
+          } catch (err) { st.className = "err-text"; st.textContent = err.message; e.target.disabled = false; }
+        } }, "验证并连接")),
+      h("div", { class: "help" },
+        "令牌在 ", h("a", { class: "link", href: "https://github.com/settings/tokens/new", target: "_blank", rel: "noopener" }, "GitHub → Settings → Developer settings"),
+        " 创建，勾 repo（私有仓库）或 public_repo；要改 CI 再加 workflow。"),
+      st);
   } else {
     const used = new Set(issuesApi.projects().filter((x) => x.repo).map((x) => x.repo.fullName));
     const pick = select([["", "选择仓库…"], ...gh.repos.map((r) => [r, used.has(r) ? `${r}（已绑定其他项目）` : r])], pg.repoPick, (v) => (pg.repoPick = v), { style: "max-width:320px" });
@@ -1560,7 +2031,47 @@ function renderProjectPage() {
       field("编号前缀", inp(d, "key", { upper: 1, style: "max-width:180px;text-transform:uppercase" }), "2–6 位大写字母或数字"),
       field("描述", inp(d, "description"))),
     section("GitHub 仓库", "一个项目对应一个仓库（一个仓库也只能绑定一个项目）。工作项与 issue 同步，智能体在这个仓库里改代码、提 PR。", repoBlock),
-    section("同步设置", "控制工作项与 GitHub issue 如何互相同步。",
+    section("工作项来源", "工作项从哪个系统导入。可以只接一个，也可以两边都接；不导入时也可以纯手动创建。", (() => {
+        const cur = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
+        const opts = [
+          ["github", p.repo ? `GitHub 仓库 · ${p.repo.fullName} 的所有 issue` : "GitHub 仓库（还没绑定）"],
+          ["linear", p.linear ? `Linear 团队 · ${p.linear.teamName}` : "Linear 团队（还没绑定）"],
+          ["both", "两边都导入"],
+          ["manual", "只手动创建，不导入"],
+        ];
+        const el = select(opts, cur, (v) => {
+          if (v === "github" && !p.repo) return toast("先在下面绑定 GitHub 仓库", "err");
+          if (v === "linear" && !p.linear) return toast("先在下面绑定 Linear 团队", "err");
+          if (v === "both" && (!p.repo || !p.linear)) return toast("两边都导入需要同时绑定仓库和团队", "err");
+          d.sync.source = v;
+          if (v === "github" || v === "both") d.sync.mode = d.sync.mode === "off" ? "two_way" : d.sync.mode;
+          if (v === "linear" || v === "both") { if (d.linear) d.linear.mode = d.linear.mode === "off" ? "two_way" : d.linear.mode; }
+          touchP(); renderProjectPage();
+        }, { style: "max-width:380px" });
+        return h("div", { class: "row" }, el, h("button", {
+          onclick: async (e) => {
+            const src = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
+            if (src === "manual") return toast("当前来源是「仅手动创建」，没有可导入的", "err");
+            e.target.disabled = true; e.target.textContent = "导入中…";
+            try {
+              const out = [];
+              if (src === "github" || src === "both") out.push(await issuesApi.sync(p.id));
+              if (src === "linear" || src === "both") out.push(await issuesApi.syncLinear(p.id));
+              toast(out.join("；"), "ok");
+              renderProjectPage(); renderBoard();
+            } catch (err) { fail(err); }
+            finally { e.target.disabled = false; e.target.textContent = "立即导入"; }
+          },
+        }, "立即导入"));
+      })()),
+    section("GitHub 同步", p.repo ? `工作项与 ${p.repo.fullName} 的 issue 如何互相同步。` : "绑定仓库后才能开启同步。下面的设置只影响 GitHub，Linear 有自己的一组。",
+      (() => {
+        const src = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
+        if (src === "github" || src === "both") return null;
+        return h("div", { class: "callout warn" },
+          h("div", {}, h("b", {}, "当前工作项来源不含 GitHub，下面这些设置不会执行。"),
+            h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "要启用，把上面的「工作项来源」改成 GitHub 仓库或两边都导入。")));
+      })(),
       field("同步方向", select(SYNC_MODES, d.sync.mode, (v) => { d.sync.mode = v; touchP(); renderProjectPage(); }, { style: "max-width:320px", disabled: p.repo ? null : "" }),
         p.repo ? "" : "绑定仓库后可开启"),
       ["two_way", "import"].includes(d.sync.mode) ? field("导入范围", h("div", { class: "row" },
@@ -1571,9 +2082,10 @@ function renderProjectPage() {
         checkboxP(d.sync.postDeliverable, (on) => { d.sync.postDeliverable = on; touchP(); }, "智能体的交付结果回写为 GitHub 评论")) : null,
       field("状态映射", h("table", { class: "map-table" },
         h("tr", {}, h("th", {}, "工作项状态"), h("th", {}, "GitHub issue")),
-        h("tr", {}, h("td", {}, "待规划 / 待办 / 进行中 / 待审核"), h("td", {}, "open")),
+        h("tr", {}, h("td", {}, "待规划 / 待办 / 进行中"), h("td", {}, "open")),
+        h("tr", {}, h("td", {}, "待审核"), h("td", {}, h("code", {}, "open"), " + ", h("code", {}, S.github?.reviewLabel || "in-review"), " 标签")),
         h("tr", {}, h("td", {}, "完成"), h("td", {}, "closed（completed）")),
-        h("tr", {}, h("td", {}, "已取消"), h("td", {}, "closed（not planned）"))), "GitHub 上关闭或重新打开 issue 时，工作项状态也会对应变化")),
+        h("tr", {}, h("td", {}, "已取消"), h("td", {}, "closed（not planned）"))), "GitHub 只有 open / closed，所以「待审核」用标签表示：进入待审核时打上、离开时摘掉。GitHub 上关闭或重新打开 issue 时，工作项状态也会对应变化")),
     linearSection(p),
     leadSection(p),
     section("同步记录", p.lastSyncAt ? `上次同步：${new Date(p.lastSyncAt).toLocaleString()}` : "还没有同步过",
@@ -1622,6 +2134,13 @@ function linearSection(p) {
         renderProjectPage();
       } }, "同步 Linear"),
       h("button", { class: "danger", onclick: async () => { if (confirm(`解绑 Linear 团队 ${cfg.teamName}？已关联的工作项会保留 Linear 编号，但不再同步。`)) { await issuesApi.disconnectLinear(p.id); renderProjectPage(); } } }, "解绑")),
+    (() => {
+      const src = p.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
+      if (src === "linear" || src === "both") return null;
+      return h("div", { class: "callout warn" },
+        h("div", {}, h("b", {}, "当前工作项来源不含 Linear，下面这些设置不会执行。"),
+          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "要启用，把上面的「工作项来源」改成 Linear 团队或两边都导入。")));
+    })(),
     field("同步方向", select(LINEAR_MODES, cfg.mode, (v) => save({ mode: v }), { style: "max-width:320px" })),
     ["two_way", "import"].includes(cfg.mode) ? field("导入范围", h("div", { class: "row" },
       select([["all", "所有未完成的 issue"], ["label", "只导入带指定标签的 issue"]], cfg.importScope, (v) => save({ importScope: v }), { style: "max-width:260px" }),
@@ -1645,7 +2164,7 @@ function checkboxP(checked, onchange, label, small) {
 }
 
 // ======================= 设置页：模型服务 / 模型 / GitHub =======================
-const sg = { editing: null, modelForm: null };
+const sg = { editing: null, modelForm: null, toolForm: null, mcpForm: null };
 function renderSettings() {
   const S = settings.get();
   const usage = (mid) => studio.agents().filter((a) => a.model === mid).map((a) => a.name);
@@ -1799,20 +2318,23 @@ function renderSettings() {
   }
 
   const enabled = S.models.filter((m) => m.enabled);
+
+  // 自定义模型服务：没有可用运行底座时使用
+  const customService = h("div", {},
+    S.providers.map((p) => sg.editing === p.id ? provForm(p) : h("div", { class: "callout", style: "margin-bottom:6px" },
+      h("span", { class: "ai-mark" }, "A"), h("div", {}, h("b", {}, p.name), h("div", {}, provStatus(p))),
+      h("span", { style: "margin-left:auto" }),
+      h("span", { class: "muted", style: "font-size:12.5px" }, `${S.models.filter((m) => m.providerId === p.id).length} 个模型`),
+      h("button", { onclick: () => { sg.editing = p.id; renderSettings(); } }, p.verifiedAt ? "修改" : "配置"),
+      S.providers.length > 1 ? h("button", { class: "danger", onclick: () => settings.removeProvider(p.id).then(renderSettings).catch(fail) }, "移除") : null)),
+    sg.editing === "new" ? provForm(null) : h("div", {}, h("a", { class: "link", style: "font-size:13px", onclick: () => { sg.editing = "new"; renderSettings(); } }, "+ 添加连接")),
+    h("div", { class: "muted", style: "font-size:12px" }, "支持两种协议：Anthropic（Messages API）与 OpenAI（Chat Completions）。官方与兼容端点都可以，例如 DeepSeek、Kimi、智谱、通义、豆包、SiliconFlow、OpenRouter、Ollama、vLLM 等。"));
+
   fill($("#settingsPage"), h("div", { class: "studio-inner" },
     h("div", { class: "ed-head" }, h("div", {}, h("h2", {}, "设置"), h("div", { class: "sub" }, "全局配置，所有项目共用")),
       h("div", { class: "actions" }, demoFlag(""))),
-    runtimesSection(),
-    section("模型服务", "内置运行底座调用模型使用的连接与凭据。可以配置多个连接，例如个人账号和团队账号。",
-      S.providers.map((p) => sg.editing === p.id ? provForm(p) : h("div", { class: "callout", style: "margin-bottom:6px" },
-        h("span", { class: "ai-mark" }, "A"), h("div", {}, h("b", {}, p.name), h("div", {}, provStatus(p))),
-        h("span", { style: "margin-left:auto" }),
-        h("span", { class: "muted", style: "font-size:12.5px" }, `${S.models.filter((m) => m.providerId === p.id).length} 个模型`),
-        h("button", { onclick: () => { sg.editing = p.id; renderSettings(); } }, p.verifiedAt ? "修改" : "配置"),
-        S.providers.length > 1 ? h("button", { class: "danger", onclick: () => settings.removeProvider(p.id).then(renderSettings).catch(fail) }, "移除") : null)),
-      sg.editing === "new" ? provForm(null) : h("div", {}, h("a", { class: "link", style: "font-size:13px", onclick: () => { sg.editing = "new"; renderSettings(); } }, "+ 添加连接")),
-      h("div", { class: "muted", style: "font-size:12px" }, "支持两种协议：Anthropic（Messages API）与 OpenAI（Chat Completions）。官方与兼容端点都可以，例如 DeepSeek、Kimi、智谱、通义、豆包、SiliconFlow、OpenRouter、Ollama、vLLM 等。")),
-    section("模型", "智能体只能绑定已启用的模型。默认模型用于新建智能体。",
+    runtimesSection(customService),
+    withId(section("模型", "内置运行底座（走自定义模型服务）的智能体只能绑定这里已启用的模型，默认模型用于新建智能体；CLI 底座的模型见上方对应卡片。",
       h("table", { class: "map-table", style: "width:100%" },
         h("tr", {}, h("th", {}, "模型"), h("th", {}, "连接"), h("th", {}, "智能体"), h("th", {}, "启用"), h("th", {}, "默认"), h("th", {})),
         S.models.map((m) => {
@@ -1834,7 +2356,7 @@ function renderSettings() {
               !m.builtin ? [" ", h("a", { class: "link", style: "font-size:12.5px;color:var(--failed)", onclick: () => { if (usage(m.id).length) return fail(new Error("还有智能体在用这个模型")); settings.removeModel(m.id).then(renderSettings).catch(fail); } }, "删除")] : null));
         })),
       sg.modelForm ? modelForm() : h("div", {}, h("a", { class: "link", style: "font-size:13px", onclick: () => { sg.modelForm = {}; renderSettings(); } }, "+ 添加模型")),
-      field("默认思考强度", select(EFFORTS, S.defaultEffort, (v) => settings.patch({ defaultEffort: v }), { style: "max-width:320px" }), `已启用 ${enabled.length} 个模型`)),
+      field("默认思考强度", select(EFFORTS, S.defaultEffort, (v) => settings.patch({ defaultEffort: v }), { style: "max-width:320px" }), `已启用 ${enabled.length} 个模型`))),
     section("GitHub", "用于项目绑定仓库、同步 issue、提交和合并 PR。", ghBlock),
     section("Linear", "用于项目绑定 Linear 团队，工作项与 Linear issue 双向同步。", lnBlock),
   ));
@@ -1992,21 +2514,42 @@ async function createPlan(card) {
   saveButler();
   return keys;
 }
+/** 执行一张卡片，不负责提示与重绘，供单张和批量共用 */
+async function execCard(card) {
+  if (card.op === "update") await issuesApi.update(card.args.key, card.args.patch);
+  if (card.op === "run") await issuesApi.run(card.args.key);
+  if (card.op === "lead") await issuesApi.setLead(card.args.projectId, { mode: card.args.mode });
+  if (card.op === "hotfix") {
+    const p = issuesApi.project(card.args.projectId);
+    const i = await issuesApi.create({ ...card.args, assignee: null, hotfix: true, github: !!p?.repo && ["two_way", "push"].includes(p.sync.mode), linear: linearPushable(p) });
+    card.label += `（${i.key}）`;
+  }
+  card.done = true;
+}
 async function runAction(card) {
   try {
-    if (card.op === "update") await issuesApi.update(card.args.key, card.args.patch);
-    if (card.op === "run") await issuesApi.run(card.args.key);
-    if (card.op === "lead") await issuesApi.setLead(card.args.projectId, { mode: card.args.mode });
-    if (card.op === "hotfix") {
-      const p = issuesApi.project(card.args.projectId);
-      const i = await issuesApi.create({ ...card.args, assignee: null, hotfix: true, github: !!p?.repo && ["two_way", "push"].includes(p.sync.mode), linear: linearPushable(p) });
-      card.label += `（${i.key}）`;
-    }
-    card.done = true;
+    await execCard(card);
     saveButler();
     renderHome();
     toast(`已执行：${card.label}`, "ok");
   } catch (e) { fail(e); }
+}
+/** 待确认的卡片 */
+const pendingActions = () => butler.msgs.map((m) => m.card).filter((c) => c?.type === "action" && !c.done && !c.dismissed);
+/** 一次执行全部待确认卡片：批量改状态不该让人点十几下 */
+async function runAllActions() {
+  const cards = pendingActions();
+  if (!cards.length) return;
+  let ok = 0;
+  const errs = [];
+  for (const c of cards) {
+    try { await execCard(c); ok++; } catch (e) { errs.push(`${c.label}：${e.message}`); }
+  }
+  saveButler();
+  await refreshState();
+  renderHome();
+  if (errs.length) toast(`完成 ${ok} 项，失败 ${errs.length} 项：${errs[0]}`, "err");
+  else toast(`已执行 ${ok} 项`, "ok");
 }
 
 function planCard(m) {
@@ -2070,6 +2613,12 @@ function attachChips(list, onRemove) {
 }
 
 let butlerDraft = "";
+/** 管家对话默认只渲染最近 20 条，更早的折叠在顶部，滚到顶或点按钮再往前加载 */
+let butlerShown = 20;
+/** 上次渲染时的消息总数：用来判断「有没有新消息」和「对话是否被清空」 */
+let butlerSeen = 0;
+/** 加载更早消息后要恢复的滚动锚点，避免一加载就跳走 */
+let butlerRestore = null;
 async function sendButler(text) {
   text = (text ?? "").trim();
   const atts = homeAtt.pending.slice();
@@ -2098,8 +2647,18 @@ async function sendButler(text) {
 
 async function renderHome() {
   if (!viewActive("home")) return;
-  const msgsEl = $("#homeMsgs");
-  const keepBottom = !msgsEl || msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 40;
+  // 注意：这里拿到的还是上一轮的节点。fill 之后会换成新节点，
+  // 所以「是否贴底」必须现在算，不能等替换完成后再读新节点的 scrollTop（永远是 0）
+  const prevBox = $("#homeMsgs");
+  const nearBottom = !prevBox || prevBox.scrollHeight - prevBox.scrollTop - prevBox.clientHeight < 40;
+  const prevH = prevBox?.scrollHeight ?? 0;
+  const prevTop = prevBox?.scrollTop ?? 0;
+  const total = butler.msgs.length;
+  if (total < butlerSeen) butlerShown = 20; // 清空或回滚时回到默认窗口
+  const shown = Math.min(butlerShown, total);
+  const visible = butler.msgs.slice(total - shown);
+  const hasOlder = total > shown;
+  const grew = total > butlerSeen;
   const all = await issuesApi.list();
   const att = issuesApi.attention();
   const projects = issuesApi.projects();
@@ -2109,12 +2668,18 @@ async function renderHome() {
   const hr = new Date().getHours();
   const welcome = butler.msgs.length ? null : h("div", { class: "hero" },
     h("h1", {}, `${hr < 6 ? "夜深了" : hr < 12 ? "早上好" : hr < 18 ? "下午好" : "晚上好"}，今天想推进什么？`),
-    h("p", {}, `我是管家，能看到全部 ${projects.length} 个项目的工作项和执行情况。和我说说需求，我来拆成工作项放进对应项目；也可以让我调整任务、汇总进展，或开关项目负责人的持续迭代。`));
+    h("p", {}, projects.length
+      ? `我是管家，能看到全部 ${projects.length} 个项目的工作项和执行情况。和我说说需求，我来拆成工作项放进对应项目；也可以让我调整任务、汇总进展，或开关项目负责人的持续迭代。`
+      : "我是管家。现在还没有项目——先创建一个项目（工作项、看板和仓库绑定都在项目下面），然后把想法告诉我，我来拆成工作项。",
+      projects.length ? null : h("div", { style: "margin-top:12px" }, h("button", { class: "primary", onclick: () => openNewProject() }, "创建第一个项目"))));
   const fileInput = h("input", { type: "file", multiple: "true", style: "display:none", onchange: (e) => { uploadFiles(e.target.files).catch(fail); e.target.value = ""; } });
-  const msgs = butler.msgs.map((m) => m.role === "me"
+  const msgs = visible.map((m) => m.role === "me"
     ? h("div", { class: "bubble me" }, m.text, attachChips(m.attachments))
     : h("div", { class: "ai-row" }, h("span", { class: "ai-mark" }, "✦"), h("div", { class: "ai-col" },
-        h("div", { class: "bubble ai" }, m.text),
+        m.thinking ? h("details", { class: "think" },
+          h("summary", {}, "思考过程", h("span", { class: "muted" }, ` ${m.thinking.length} 字`)),
+          h("div", { class: "think-body" }, m.thinking)) : null,
+        mdEl(m.text),
         m.card?.type === "plan" ? planCard(m) : m.card?.type === "action" ? actionCard(m) : null)));
 
   fill($("#homeChat"),
@@ -2130,9 +2695,20 @@ async function renderHome() {
       })(),
       demoFlag(),
       butler.msgs.length ? h("button", { style: S.simulate ? "" : "margin-left:auto", onclick: () => { if (confirm("清空与管家的对话？")) act("assistant.clear").then(renderHome); } }, "清空") : null),
-    h("div", { class: "b-msgs", id: "homeMsgs" }, welcome, msgs,
+    h("div", { class: "b-msgs", id: "homeMsgs" },
+      hasOlder ? h("button", { class: "load-older", onclick: () => { butlerShown += 20; butlerRestore = { h: prevH, top: prevTop }; renderHome(); } },
+        `加载更早的对话（还有 ${total - shown} 条）`) : null,
+      welcome, msgs,
       butlerBusy ? h("div", { class: "ai-row" }, h("span", { class: "ai-mark" }, "✦"), h("div", { class: "bubble ai typing" }, "正在思考")) : null),
-    h("div", { class: "suggests" }, (butler.msgs.length ? BUTLER_SUGGESTS.slice(0, 2) : BUTLER_SUGGESTS).map((s) => h("button", { onclick: () => sendButler(s) }, s))),
+    (() => {
+      const pend = pendingActions();
+      if (pend.length < 2) return null;
+      return h("div", { class: "bulk-bar" },
+        h("span", {}, `有 ${pend.length} 项等你确认`),
+        h("span", { style: "margin-left:auto" }),
+        h("button", { onclick: () => { pend.forEach((c) => (c.dismissed = true)); saveButler(); renderHome(); } }, "全部取消"),
+        h("button", { class: "primary", onclick: runAllActions }, `全部执行（${pend.length}）`));
+    })(),
     h("div", { class: "b-input" },
       fileInput,
       attachChips(homeAtt.pending, (n) => { homeAtt.pending.splice(n, 1); renderHome(); }),
@@ -2147,7 +2723,20 @@ async function renderHome() {
       h("button", { class: "primary", onclick: () => sendButler($("#homeInput").value) }, "发送")));
 
   const box = $("#homeMsgs");
-  if (keepBottom) box.scrollTop = box.scrollHeight;
+  if (butlerRestore) {
+    // 往前加载：新内容的增量高度要补回去，视口停在原来那句话上
+    box.scrollTop = box.scrollHeight - butlerRestore.h + butlerRestore.top;
+    butlerRestore = null;
+  } else if (nearBottom || grew || !prevBox) box.scrollTop = box.scrollHeight;
+  else box.scrollTop = prevTop;
+  butlerSeen = total;
+  // 滚到顶自动往前加载一段
+  box.addEventListener("scroll", () => {
+    if (!hasOlder || box.scrollTop > 24) return;
+    butlerShown += 20;
+    butlerRestore = { h: box.scrollHeight, top: box.scrollTop };
+    renderHome();
+  });
 
   fill($("#homeSide"),
     h("div", { class: "center-block" }, h("div", { class: "bh" }, "项目", h("span", { class: "muted" }, `${projects.length} 个`),
@@ -2496,7 +3085,7 @@ async function loadRuntimeModels(id, force = false) {
   if (rtModels.loading[id]) return rtModels.cache[id];
   if (!force && rtModels.cache[id]) return rtModels.cache[id];
   rtModels.loading[id] = true;
-  try { rtModels.cache[id] = await api(`/runtimes/${id}/models${force ? "?refresh=1" : ""}`); }
+  try { rtModels.cache[id] = await api(`/runtimes/${id}/models?${force ? "refresh=1&" : ""}verify=1`); }
   catch (e) { rtModels.cache[id] = { models: [], source: `检测失败：${e.message}` }; }
   rtModels.loading[id] = false;
   return rtModels.cache[id];
@@ -2531,14 +3120,22 @@ const rtInstalled = (id) => id === "builtin" ? true : rtState.data?.runtimes.fin
 const rtCfg = (id) => { const S = settings.get(); S.runtimes ??= {}; return (S.runtimes[id] ??= { template: rtDef(id).template ?? "", max: 2 }); };
 
 /** 设置页：运行底座 */
-function runtimesSection() {
+function runtimesSection(customService) {
   const d = rtState.data;
+  // 内置底座能否真正调用：模拟模式，或至少有一条验证过的连接
+  const builtinReady = simulateMode() || (settings.get()?.providers ?? []).some((p) => (p.method === "key" || p.method === "profile") && p.verifiedAt);
   const card = (r) => {
     const info = d?.runtimes.find((x) => x.id === r.id);
     const cfg = r.id === "builtin" ? null : rtCfg(r.id);
-    const status = r.id === "builtin" ? h("span", { class: "ok-text", style: "font-size:12.5px" }, "✓ 始终可用")
+    const loginTag = info?.installed && info.login ? (info.login.ok
+      ? h("span", { class: "ok-text", style: "font-size:12.5px", title: "读的是该 CLI 自己的登录状态" }, `· ${info.login.method}`)
+      : h("span", { class: "err-text", style: "font-size:12.5px", title: "在该机器上登录一次即可，Hub 不会保存密钥" }, `· ${info.login.method}`)) : null;
+    const status = r.id === "builtin" ? (builtinReady
+        ? h("span", { class: "ok-text", style: "font-size:12.5px" }, "✓ 始终可用")
+        : h("span", { class: "err-text", style: "font-size:12.5px" }, "需先配置自定义模型服务"))
       : !d ? h("span", { class: "muted", style: "font-size:12.5px" }, rtState.loading ? "检测中…" : rtState.error ? `检测失败：${rtState.error}` : "未检测")
-      : info?.installed ? h("span", { class: "ok-text", style: "font-size:12.5px" }, `✓ 已安装 ${info.version ?? ""}`) : h("span", { class: "err-text", style: "font-size:12.5px" }, "未安装");
+      : info?.installed ? h("span", { style: "font-size:12.5px" }, h("span", { class: "ok-text" }, `✓ 已安装 ${info.version ?? ""}`), loginTag)
+        : h("span", { class: "err-text", style: "font-size:12.5px" }, "未安装");
     const tpl = cfg ? h("textarea", { class: "prompt-area", style: "min-height:54px", onchange: (e) => { cfg.template = e.target.value; settings.patch({}); toast("命令模板已保存", "ok"); } }, cfg.template) : null;
     const max = cfg ? (() => { const el = h("input", { type: "number", min: 1, max: 20, style: "width:70px", onchange: (e) => { cfg.max = Math.max(1, Number(e.target.value) || 1); settings.patch({}); } }); el.value = cfg.max; return el; })() : null;
     const used = studio.agents().filter((a) => (a.runtime ?? "builtin") === r.id).map((a) => a.name);
@@ -2546,8 +3143,10 @@ function runtimesSection() {
     const live = r.id === "builtin" ? C.model : C.cli?.[r.id];
     const liveTag = live && (live.running || live.waiting) ? h("span", { class: "tag", title: "当前运行中 / 排队中" }, `运行 ${live.running} · 排队 ${live.waiting}`) : null;
     const modelMax = r.id === "builtin" ? (() => { const el = h("input", { type: "number", min: 1, max: 64, style: "width:70px", "aria-label": "模型并发", onchange: (e) => { settings.get().concurrency = { ...(settings.get().concurrency ?? {}), model: Math.max(1, Number(e.target.value) || 1) }; settings.patch({}).then(() => toast("模型并发已更新，立即生效", "ok")); } }); el.value = settings.get().concurrency?.model ?? 8; return el; })() : null;
+    const detected = r.id === "builtin" ? null : rtModels.cache[r.id]?.models?.length;
     return h("details", { class: "case", open: null },
       h("summary", {}, h("span", { class: "ai-mark", style: "width:22px;height:22px;font-size:11px" }, r.short[0]), h("span", { class: "ctitle" }, r.name), status,
+        detected ? h("span", { class: "tag", title: "该底座检测到的可用模型数" }, `${detected} 个模型`) : null,
         used.length ? h("span", { class: "muted", style: "font-size:12px", title: used.join("、") }, `· ${used.length} 个智能体`) : null, liveTag),
       h("div", { class: "steps-list fields", style: "gap:8px" },
         h("div", { class: "muted", style: "font-size:12.5px" }, r.desc),
@@ -2566,15 +3165,27 @@ function runtimesSection() {
             return h("span", { class: "muted", style: "font-size:12.5px" }, "正在检测…");
           }
           const list = data.models ?? [];
+          const verify = data.verify ?? null;
+          const bad = verify ? list.filter((m) => verify[m.id]?.ok === false).length : 0;
           return h("div", {},
-            h("div", { class: "chips" }, list.length ? list.map((m) => h("span", { class: "chip", style: "padding:0 8px;cursor:default", title: m.note ?? "" }, m.name && m.name !== m.id ? `${m.name}（${m.id}）` : m.id)) : h("span", { class: "muted", style: "font-size:12.5px" }, "没有检测到可用模型")),
+            h("div", { class: "chips" }, list.length ? list.map((m) => {
+              const v = verify?.[m.id];
+              const badOne = v && v.ok === false;
+              return h("span", { class: "chip" + (badOne ? " err-text" : ""), style: "padding:0 8px;cursor:default", title: v ? (v.ok ? "已验证可用" : `不可用：${v.note}`) : (m.note ?? "") },
+                m.name && m.name !== m.id ? `${m.name}（${m.id}）` : m.id, badOne ? " ✕" : v ? " ✓" : null);
+            }) : h("span", { class: "muted", style: "font-size:12.5px" }, "没有检测到可用模型")),
+            verify && bad ? h("div", { class: "err-text", style: "font-size:12px;margin-top:4px" }, `${bad} 个模型经检测不可用（供应商返回的模型名不存在）；这些模型被智能体选中时会在启动后立刻失败，建议在下面改选可用的。`) : null,
             h("div", { class: "row", style: "margin-top:4px" },
               h("a", { class: "link", style: "font-size:12px", onclick: async (e) => { e.target.textContent = "检测中…"; await loadRuntimeModels(r.id, true); renderSettings(); } }, "重新检测"),
               h("span", { class: "muted", style: "font-size:12px" }, data.source ?? "")));
         })(), "在「智能体与工具」里给每个智能体选择具体使用哪个模型") : null,
+        r.id === "builtin" && !builtinReady ? field("缺少凭据", h("div", { class: "row" },
+          h("span", { class: "muted", style: "font-size:12.5px" }, "内置底座走 Anthropic Messages API，需要一条可用的连接"),
+          h("button", { onclick: () => { sg.editing = settings.get().providers.find((p) => !p.verifiedAt)?.id ?? "new"; renderSettings(); } }, "去配置模型服务")),
+          "也可以让智能体改用本机已登录的 CLI 底座（在「智能体与工具」里改）") : null,
         modelMax ? field("模型并发", h("div", { class: "row" }, modelMax, h("span", { class: "muted", style: "font-size:12.5px" }, "同时在途的模型请求数，所有内置智能体共享；超出时按优先级排队，修改后立即生效")), "受 Anthropic 账号的速率限制约束，调太大会遇到 429") : null));
   };
-  return section("运行底座", "智能体实际在哪里运行。编码类任务建议交给成熟的 CLI 智能体，其他任务可用内置循环。检测的是 Hub 所在的机器（部署后即服务器）。",
+  return section("模型接入", "模型有两个来源：本机已安装并登录的 CLI 底座，或自定义模型服务。有可用的底座就直接用它的模型，没有底座再接自定义服务。检测的是 Hub 所在的机器（部署后即服务器）。",
     h("div", { class: "callout" }, h("span", { class: "busy-dot on" }), h("b", {}, "执行节点"), h("span", {}, d ? `本节点 ${d.host}（${d.platform}）` : "本节点"),
       h("span", { style: "margin-left:auto" }), h("button", { disabled: "", title: "规划中：接入其他服务器作为执行节点" }, "+ 添加执行节点"),
       h("button", { onclick: async (e) => { e.target.disabled = true; e.target.textContent = "检测中…"; await loadRuntimes(true); renderSettings(); } }, "重新检测"),
@@ -2601,7 +3212,24 @@ function runtimesSection() {
           if (Date.now() - t0 > 30_000) { clearInterval(timer); toast("重启超时，请检查服务器日志", "err"); e.target.disabled = false; e.target.textContent = "重启服务"; }
         }, 800);
       }, title: "结束当前进程并拉起新进程；运行中的任务会被中断" }, "重启服务")),
-    h("div", {}, RUNTIME_DEFS.map(card)));
+    (() => {
+      const ready = RUNTIME_DEFS.filter((r) => {
+        if (r.id === "builtin") return builtinReady;
+        const x = rtState.data?.runtimes.find((y) => y.id === r.id);
+        return !!x?.installed && !!x?.login?.ok;
+      }).map((r) => r.name);
+      return h("div", { style: "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:2px 0 10px" },
+        h("span", { class: ready.length ? "ok-text" : "err-text", style: "font-size:12.5px" },
+          ready.length ? `当前可用的模型来源：${ready.join("、")}` : "当前没有可用的模型来源：先在本机登录一个底座，或在下面配置自定义模型服务"));
+    })(),
+    h("div", { style: "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:2px 0 6px" },
+      h("b", { style: "font-size:13px" }, "运行底座"),
+      h("span", { class: "muted", style: "font-size:12.5px" }, "已安装的直接可用；智能体选用哪个底座，就用哪个底座的模型")),
+    h("div", {}, RUNTIME_DEFS.map(card)),
+    h("div", { style: "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:16px 0 6px" },
+      h("b", { style: "font-size:13px" }, "自定义模型服务"),
+      h("span", { class: "muted", style: "font-size:12.5px" }, "没有可用底座、或想用别的服务商时在这里配置；内置运行底座的智能体使用这里的模型")),
+    customService);
 }
 
 /** 智能体编辑：运行底座选择 + 对应的模型设置 */
@@ -2804,7 +3432,7 @@ document.addEventListener("click", (e) => { if (!$("#notifPanel").contains(e.tar
 notify.on(renderBell);
 
 // ======================= 设置页扩展：标签页 + 通知 / 预算 / 安全护栏 =======================
-const SETTINGS_TABS = [["run", "运行与模型", ["运行底座", "模型服务", "模型"]], ["integrations", "集成与通知", ["GitHub", "Linear", "通知"]], ["safety", "预算与安全", ["预算", "安全护栏"]]];
+const SETTINGS_TABS = [["run", "运行与模型", ["模型接入", "模型"]], ["integrations", "集成与通知", ["GitHub", "Linear", "通知"]], ["safety", "预算与安全", ["预算", "安全护栏"]]];
 sg.tab = "run";
 function numIn(v, on, attrs = {}) { const el = h("input", { type: "number", min: 0, style: "max-width:120px", ...attrs, onchange: (e) => on(Number(e.target.value) || 0) }); el.value = v; return el; }
 function listEditor(arr, onSave, placeholder) {
@@ -2864,7 +3492,7 @@ renderSettings = function () {
   inner.append(...[notifySection(), budgetSection(), guardSection()].flat());
   const tabOf = (label) => SETTINGS_TABS.find((t) => t[2].includes(label))?.[0];
   inner.querySelectorAll(":scope > .ed-section").forEach((s) => { s.style.display = tabOf(s.querySelector(".lbl b")?.textContent) === sg.tab ? "" : "none"; });
-  inner.querySelector(".ed-head")?.after(h("div", { class: "seg", style: "margin-bottom:6px" }, SETTINGS_TABS.map(([v, l]) => h("button", { class: sg.tab === v ? "on" : "", onclick: () => { sg.tab = v; renderSettings(); } }, l))));
+  inner.querySelector(".ed-head")?.after(h("div", { class: "seg", style: "margin-bottom:6px" }, SETTINGS_TABS.map(([v, l]) => h("button", { class: sg.tab === v ? "on" : "", onclick: () => { sg.tab = v; setHash("settings", { tab: v }); renderSettings(); } }, l))));
 };
 
 // ======================= 项目页扩展：项目知识 =======================
@@ -3076,7 +3704,20 @@ async function route() {
     try { const t = await api(`/tasks/${task[1]}`); selectRoot(t.rootId, t.id); } catch {}
     return;
   }
-  if (view) tab(view[1]);
+  if (view) {
+    const v = view[1];
+    const q = new URLSearchParams(hash.replace(/^#/, ""));
+    if (v === "settings" && q.get("tab")) sg.tab = q.get("tab");
+    if (v === "config" && q.get("studio")) {
+      // 直接设置选择，不走 selectStudio（避免刷新时弹未保存确认）
+      st.sel = { kind: q.get("studio"), id: q.get("sel") || null };
+      st.attachTo = null;
+      loadDraft();
+    }
+    tab(v);
+    return;
+  }
+  tab("home");
 }
 window.addEventListener("hashchange", route);
 
@@ -3085,10 +3726,13 @@ window.addEventListener("hashchange", route);
   updateAuthButton();
   if (session.loginEnabled && !session.authenticated) { showLogin(); return; }
   try { await refreshState(); } catch (e) { console.error(e); }
+  loadUiPrefs();
   connect();
   initIssues();
   await loadAll();
   renderAssigneeFilter();
   renderBoard();
+  await route(); // 恢复刷新前的界面
+  landing();
 })();
 setInterval(() => { if (state.tree && state.tree.status === "running") renderTree(); }, 5000);

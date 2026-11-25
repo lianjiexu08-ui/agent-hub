@@ -1,6 +1,51 @@
 import { z } from "zod";
 
 /** 委派策略：any = 可调用任意智能体；none = 不能调用；string[] = 白名单 */
+/** 需要按智能体显式开启的扩展工具 */
+export const OPTIONAL_BUILTIN_TOOL_NAMES = [
+  "read_file",
+  "write_file",
+  "list_files",
+  "search_repo",
+  "run_command",
+  "search_knowledge",
+] as const;
+export type OptionalBuiltinTool = (typeof OPTIONAL_BUILTIN_TOOL_NAMES)[number];
+
+/** 工具目录：用于界面展示与说明，不参与执行 */
+export interface BuiltinToolMeta {
+  name: string;
+  group: "协作" | "工作项" | "流程" | "检索" | "文件" | "执行";
+  desc: string;
+  /** 是否默认提供；false 表示需要在智能体上显式开启 */
+  always: boolean;
+  /** 危险级别，界面上据此标色 */
+  risk: "none" | "read" | "write" | "exec";
+}
+
+export const BUILTIN_TOOL_META: BuiltinToolMeta[] = [
+  { name: "list_agents", group: "协作", desc: "列出可调用的其他智能体及其职责", always: true, risk: "none" },
+  { name: "call_agent", group: "协作", desc: "把子任务交给另一个智能体执行并等待结果", always: true, risk: "none" },
+  { name: "publish", group: "协作", desc: "向共享消息总线的主题发布消息，唤醒订阅者", always: true, risk: "none" },
+  { name: "read_topic", group: "协作", desc: "读取总线上某主题最近的消息", always: true, risk: "none" },
+  { name: "list_issues", group: "工作项", desc: "列出当前项目的工作项", always: true, risk: "none" },
+  { name: "get_issue", group: "工作项", desc: "读取工作项详情、阶段与评论", always: true, risk: "none" },
+  { name: "create_issue", group: "工作项", desc: "新建工作项（可指定负责人、优先级、父项）", always: true, risk: "none" },
+  { name: "update_issue", group: "工作项", desc: "修改状态、负责人、优先级等字段", always: true, risk: "none" },
+  { name: "comment_issue", group: "工作项", desc: "在工作项下追加评论", always: true, risk: "none" },
+  { name: "report_phase", group: "流程", desc: "报告当前阶段结果，推进或回退生命周期", always: true, risk: "none" },
+  { name: "report_case", group: "流程", desc: "验收阶段提交测试用例结果", always: true, risk: "none" },
+  { name: "load_skill", group: "检索", desc: "按需加载挂载技能的完整指令", always: true, risk: "none" },
+  { name: "search_knowledge", group: "检索", desc: "检索项目知识库（团队沉淀的约定与结论）", always: false, risk: "read" },
+  { name: "web_search", group: "检索", desc: "联网搜索（Anthropic 服务端工具，按次计费）", always: true, risk: "none" },
+  { name: "web_fetch", group: "检索", desc: "抓取指定网页正文", always: true, risk: "none" },
+  { name: "browser", group: "执行", desc: "用无头浏览器打开页面并读取内容（验收用）", always: true, risk: "read" },
+  { name: "read_file", group: "文件", desc: "读取工作目录里的文件", always: false, risk: "read" },
+  { name: "list_files", group: "文件", desc: "列出工作目录结构", always: false, risk: "read" },
+  { name: "search_repo", group: "文件", desc: "在工作目录里按关键词检索代码", always: false, risk: "read" },
+  { name: "write_file", group: "文件", desc: "在工作目录里写入或覆盖文件", always: false, risk: "write" },
+  { name: "run_command", group: "执行", desc: "在工作目录里执行 shell 命令（装依赖、跑测试、构建）", always: false, risk: "exec" },
+];
 export const AgentSchema = z.object({
   name: z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/),
   description: z.string().default(""),
@@ -19,6 +64,11 @@ export const AgentSchema = z.object({
   mcp: z.array(z.string()).default([]),
   /** 挂载的技能 id */
   skills: z.array(z.string()).default([]),
+  /**
+   * 可选的扩展内置工具。默认不给：内置循环只有协作、工作项、检索这些零风险工具。
+   * 文件与命令类会真的在服务器上读写、执行，按智能体逐个开启。
+   */
+  builtinTools: z.array(z.enum(OPTIONAL_BUILTIN_TOOL_NAMES)).default([]),
   /** 运行底座：builtin（Hub 内置循环）或 claude-code / codex / gemini / pi */
   runtime: z.string().default("builtin"),
   /** CLI 底座使用的模型名（留空为 CLI 默认） */
