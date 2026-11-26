@@ -21,6 +21,7 @@ import type { CiStatus, GitHub } from "./github.ts";
 import { pickState, statusForStateType, type Linear, type LinearState } from "./linear.ts";
 import type { Workspace } from "./workspace.ts";
 import { backoffMs, isTransientError } from "./transient.ts";
+import { existsSync } from "node:fs";
 
 export const PHASES = ["understand", "plan", "do", "test", "review"] as const;
 export type Phase = (typeof PHASES)[number];
@@ -277,6 +278,9 @@ export class Work {
     return {
       ...i, key: this.key(i), projectName: p?.name ?? "", projectKey: p?.key ?? "",
       deps, waitingDeps: deps.some((d) => !d.met),
+      live: this.liveOf(i, runs, deps),
+      /** 正在进行时：此刻具体在做的那一步（会随运行刷新） */
+      now: this.liveDetail(i, runs),
       description: full ? body : body.slice(0, 600),
       descriptionTruncated: !full && body.length > 600,
       descriptionLength: body.length,
@@ -576,6 +580,14 @@ export class Work {
     if (!p) return false;
     if (i.pr?.local === "local" && i.pr.state === "merged") return true;
     return this.sourceOf(p) === "linear" && !!i.linear && !i.pr;
+  }
+
+  /** 已交付但代码没登记的单：重新登记并走一遍交付后的审核 / 合并（兜底修复用） */
+  async redeliver(ref: string | number) {
+    const i = this.find(ref);
+    if (i.status !== "in_review" || !i.lifecycleDone) throw new WorkError("只有已交付、待审核的工作项可以重新登记");
+    await this.afterDeliver(i);
+    this.emit("issue");
   }
 
   /** 提测不通过被打回：带上 Linear 上的最新反馈，退回给原智能体在原分支上修，修完照常重新交付 */
@@ -1295,7 +1307,9 @@ export class Work {
     let n = 0;
     for (const r of [...runs].reverse()) {
       if (r.status === "completed") { if (n === 0 && !i.lifecycleDone) n = 1; break; }
-      if (r.status === "failed" && /interrupted by service restart/.test(r.error ?? "")) continue;
+      // 不是这张单自己的问题，不该消耗重试次数：服务重启中断、网络抖动、被停止 / 取消
+      if (r.status === "cancelled") continue;
+      if (r.status === "failed" && (/interrupted by service restart|服务重启/.test(r.error ?? "") || isTransientError(r.error))) continue;
       if (TERMINAL.has(r.status)) n++;
     }
     return n;
@@ -1303,7 +1317,77 @@ export class Work {
 
   // ---------- 依赖 ----------
   /** 依赖算满足：已完成，或 PR 已合并（代码已进主干，后续工作可以基于它） */
-  private depMet(d: Issue) { return d.status === "done" || d.pr?.state === "merged"; }
+  /**
+   * 这张单此刻在发生什么（看板卡片上的状态标记）。不论在哪一列，只要有东西在动或在等，都要让人看得出来。
+   * tone：run = 正在进行；wait = 在排队 / 等条件；need = 等人；fail = 出问题了
+   */
+  private liveOf(i: Issue, runs: Task[], deps: { key: string; met: boolean }[]): { text: string; tone: "run" | "wait" | "need" | "fail"; title?: string } | null {
+    const active = runs.filter((r) => !TERMINAL.has(r.status));
+    const qa = this.qa?.runsFor(this.key(i)).find((r) => r.status === "queued" || r.status === "running");
+    if (active.length) {
+      const queued = active.every((r) => r.status === "pending");
+      if (queued) return { text: "排队中", tone: "wait", title: "并发已满，按优先级等待" };
+      return { text: i.phase ? `${PHASE_LABEL[i.phase]}中` : "执行中", tone: "run" };
+    }
+    if (qa) return qa.status === "running" ? { text: "验收中", tone: "run" } : { text: "验收排队", tone: "wait", title: "共用测试环境，一次只跑一个" };
+    if (i.blocked && i.leadDeciding) return { text: "负责人确认需求", tone: "run" };
+    if (i.blocked) return { text: "等你确认需求", tone: "need" };
+    if ((i.netRetries ?? 0) > 0 && i.status === "in_progress") return { text: "网络重试中", tone: "wait", title: "网络异常，稍后从中断的阶段继续" };
+    const waiting = deps.filter((d) => !d.met);
+    if (waiting.length && ["todo", "backlog"].includes(i.status)) return { text: "等依赖", tone: "wait", title: `等 ${waiting.map((d) => d.key).join("、")} 完成` };
+    if (this.pauseStarts && i.assignee && i.status === "todo") return { text: "重启后开始", tone: "wait" };
+    const last = runs.at(-1);
+    if (i.status === "todo" && last?.status === "failed") return { text: "上次失败", tone: "fail", title: last.error ?? "" };
+    if (i.status === "in_review" && i.pr?.guard && i.pr.state === "open") return { text: "等你确认合并", tone: "need", title: i.pr.guard };
+    if (i.status === "in_review" && i.pr?.local === "local" && i.pr.state === "merged") return { text: "待提测", tone: "wait", title: "已合并本地开发分支，等人工提测" };
+    if (i.status === "todo" && i.assignee && !last) return { text: "待开始", tone: "wait" };
+    return null;
+  }
+  /**
+   * 运行中的这张单此刻在做什么：取最深一层还在跑的任务（比如开发正在等 code-reviewer，就看 code-reviewer），
+   * 读它对话记录里最后一步——调用了什么工具、或者最后说了什么。验收中的单看当前用例与最后一步浏览器操作。
+   */
+  private liveDetail(i: Issue, runs: Task[]): { who: string; action: string; since: string; step?: string } | null {
+    const root = runs.find((r) => !TERMINAL.has(r.status));
+    const qa = this.qa?.runsFor(this.key(i)).find((r) => r.status === "running") as
+      { cases: { id: string; title: string; status: string | null; steps: { desc: string; cmd: string; at?: string }[] }[]; startedAt?: string } | undefined;
+    if (!root && qa) {
+      const n = qa.cases.findIndex((c) => c.status === "running");
+      const c = qa.cases[n >= 0 ? n : 0];
+      const st = c?.steps.filter((x) => x.at).at(-1);
+      return { who: "tester", action: st ? describeTool(st.cmd.replace(/^browser /, "browser "), "") : "准备中", since: qa.startedAt ?? now(), step: c ? `用例 ${n + 1}/${qa.cases.length}：${c.title.slice(0, 40)}` : undefined };
+    }
+    if (!root) return null;
+    // 最深一层还在跑的子任务
+    let cur: Task = root;
+    for (let d = 0; d < 5; d++) {
+      const kid = this.store.listTasks({ parentId: cur.id, limit: 50 }).find((t) => !TERMINAL.has(t.status));
+      if (!kid) break;
+      cur = kid;
+    }
+    const msgs = this.store.getMessages(cur.id);
+    let action = cur.status === "pending" ? "排队等待运行槽位" : "思考中";
+    for (let k = msgs.length - 1; k >= 0 && k >= msgs.length - 4; k--) {
+      const m = msgs[k];
+      if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+      const blocks = m.content as { type: string; name?: string; input?: unknown; text?: string }[];
+      const tool = blocks.filter((b) => b.type === "tool_use").at(-1);
+      if (tool) { action = describeTool(tool.name ?? "", tool.input); break; }
+      const text = blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join(" ").trim();
+      if (text) { action = text.replace(/\s+/g, " ").slice(0, 80); break; }
+    }
+    return { who: cur.agent, action, since: (i.phases.at(-1)?.startedAt) ?? root.createdAt, step: i.phase ? PHASE_LABEL[i.phase] : undefined };
+  }
+  private depMet(d: Issue) {
+    if (d.status === "done" || d.pr?.state === "merged") return true;
+    // 已交付、确实没有代码改动的（只出方案 / 结论）：下游能用了，不必等人工提测
+    return d.status === "in_review" && !!d.lifecycleDone && !d.pr && !this.hasUnregisteredCode(d);
+  }
+  /** 工作目录里有提交但没登记交付（兜底登记之前），这类不能当「没代码」放行 */
+  private hasUnregisteredCode(d: Issue): boolean {
+    const p = this.proj(d.projectId);
+    return !!p?.repo && !!d.assignee && this.workspace.enabledFor(p, this.store.getAgent(d.assignee)) && existsSync(this.workspace.dir(p, this.key(d)));
+  }
   /** 还没满足的依赖（被删掉的依赖忽略） */
   private depsPending(i: Issue): Issue[] {
     return (i.dependsOn ?? []).map((id) => this.getIssue(id)).filter((d): d is Issue => !!d && !this.depMet(d));
@@ -1478,13 +1562,25 @@ export class Work {
         return `需求已由人确认，补充信息：\n${answer}\n\n已进入「计划」阶段。${PHASE_HINT.plan}`;
       }
     }
+    // 需求里没写验收标准：把智能体在需求理解阶段列出的标准写回描述，后面的测试 / 页面验收按它逐条验，
+    // 不然 tester 只能拿三条通用标准去验，等于没对着需求验
+    if (rec.phase === "understand" && assessRequirement(i).aiCriteria) {
+      const picked = pickCriteria(input.note);
+      if (picked.length >= 2) {
+        i.description = `${i.description.trim()}\n\n## 验收标准\n（需求里没有写明，由 ${task.agent} 在需求理解阶段整理，可直接修改）\n${picked.map((c) => `- ${c}`).join("\n")}`.trim();
+        this.addComment(i.id, "system", "system", `需求里没有验收标准，已把 ${task.agent} 整理的 ${picked.length} 条写入描述，测试与验收按这些逐条进行（可在描述里修改）`);
+      }
+    }
     rec.result = input.result;
     rec.endedAt = now();
     rec.note = input.note.slice(0, 500);
 
     if (rec.phase === "do") {
       // 有代码改动：提交并创建 / 更新 PR
-      const out = await this.afterDo(i, task).catch((e) => `（提交代码失败：${e.message}）`);
+      const out = await this.afterDo(i, task).catch((e) => {
+        this.addComment(i.id, "system", "system", `⚠ 提交代码失败：${(e as Error).message}（交付时会再试一次）`);
+        return `（提交代码失败：${(e as Error).message}；交付时 Hub 会再试一次，你照常往下推进即可）`;
+      });
       if (out && typeof out === "object") {
         // 和主干冲突：留在「执行」阶段，让智能体合并主干、解决冲突后再汇报
         rec.result = "active";
@@ -1651,6 +1747,16 @@ export class Work {
 
   /** 交付后：项目负责人审核、护栏检查、按合并策略处理 PR、通知 */
   private async afterDeliver(i: Issue) {
+    // 兜底：执行阶段那次提交可能因为 git 锁等原因失败（错误只回给了智能体），
+    // 导致工作目录里有提交却没登记为交付物 —— 不会合并、依赖它的单也永远等不到。这里再登记一次
+    if (!i.pr) {
+      const out = await this.afterDo(i, { agent: i.assignee ?? "" } as Task).catch((e) => {
+        this.addComment(i.id, "system", "system", `⚠ 登记交付代码失败：${(e as Error).message}`);
+        return null;
+      });
+      if (out && typeof out === "object") this.addComment(i.id, "system", "system", `⚠ 交付代码与本地开发分支冲突：${out.conflict.join("、")}，需要处理后才能合并`);
+      i = this.getIssue(i.id) ?? i;
+    }
     const key = this.key(i);
     const lead = this.leadOf(i);
     const hot = i.labels.includes("hotfix");
@@ -1689,9 +1795,9 @@ export class Work {
     }
     if (gv) {
       i.pr!.guard = gv;
-      lines.push(`🛡 安全护栏：${gv}。未自动合并，需要你确认后合并 PR #${i.pr!.number}。`);
+      lines.push(`🛡 安全护栏：${gv}。未自动合并，需要你确认后合并${i.pr!.local ? `（${i.pr!.local === "local" ? "合并到本地开发分支" : `分支 ${i.pr!.branch}`}）` : ` PR #${i.pr!.number}`}。`);
       this.leadLog(p, `${key} 被安全护栏拦截（${gv}），等待你确认合并`);
-      this.notify.push("guard", `${key} 被安全护栏拦截`, `${i.title}：${gv}。需要你确认后合并 PR #${i.pr!.number}。`, key);
+      this.notify.push("guard", `${key} 被安全护栏拦截`, `${i.title}：${gv}。需要你确认后合并${i.pr!.local ? `（${i.pr!.local === "local" ? "合并到本地开发分支" : `分支 ${i.pr!.branch}`}）` : ` PR #${i.pr!.number}`}。`, key);
     } else if ((L.mergePolicy === "auto" || hot || approved) && i.pr && i.pr.state === "open") {
       if (approved) lines.push(`${approved.by}已于 ${approved.at.slice(0, 16).replace("T", " ")} 批准合并，这次只是解决了与主干的冲突，测试与 CI 通过后直接合并。`);
       try {
@@ -2117,4 +2223,48 @@ function isMergeConflict(e: unknown): boolean { return /→ 405|not mergeable|me
 function globMatch(glob: string, path: string): boolean {
   const re = new RegExp("^" + glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*\/?/g, "§").replace(/\*/g, "[^/]*").replace(/§/g, ".*") + "$");
   return re.test(path);
+}
+
+/** 把一次工具调用翻译成人能看懂的一句话 */
+export function describeTool(name: string, input: unknown): string {
+  const a = (input ?? {}) as Record<string, unknown>;
+  const n = name.replace(/^mcp__[^_]+__/, "").toLowerCase();
+  const str = (v: unknown) => String(v ?? "").replace(/\s+/g, " ").trim();
+  const short = (v: unknown, k = 70) => { const t = str(v); return t.length > k ? t.slice(0, k) + "…" : t; };
+  const file = (v: unknown) => str(v).split("/").slice(-2).join("/");
+  if (n.startsWith("browser ")) return `浏览器：${short(name.slice(8), 60)}`;
+  if (n === "browser") return `浏览器：${short(a.command, 60)}`;
+  if (["bash", "run_command", "shell", "exec"].includes(n)) return `运行 ${short(a.command ?? a.cmd)}`;
+  if (["read", "read_file", "view"].includes(n)) return `读 ${file(a.file_path ?? a.path)}`;
+  if (["edit", "multiedit", "str_replace", "write", "write_file", "create"].includes(n)) return `改 ${file(a.file_path ?? a.path)}`;
+  if (["grep", "search_repo", "glob", "find", "ls", "list_files"].includes(n)) return `查找 ${short(a.pattern ?? a.query ?? a.path, 50)}`;
+  if (n === "report_phase") return `汇报「${str(a.phase)}」阶段${a.result === "fail" ? "（不通过）" : ""}`;
+  if (n === "report_case") return `汇报用例 ${str(a.case_id)}：${a.status === "passed" ? "通过" : "未通过"}`;
+  if (n === "call_agent") return `请 ${str(a.agent)} 协助`;
+  if (["task", "agent", "subagent"].includes(n)) return `派子代理：${short(a.description ?? a.prompt, 50)}`;
+  if (n === "load_skill") return `加载技能 ${str(a.id ?? a.skill)}`;
+  if (["webfetch", "web_fetch", "websearch", "web_search"].includes(n)) return `查资料 ${short(a.url ?? a.query, 50)}`;
+  if (n === "todowrite") return "更新待办清单";
+  return `调用 ${name}`;
+}
+
+/**
+ * 从需求理解阶段的汇报里取出验收标准：优先取「验收标准」小节下的条目，没有小节时取所有列表项。
+ * 只保留像标准的句子（不太短、不是问题），最多 8 条。
+ */
+export function pickCriteria(note: string): string[] {
+  const lines = note.split("\n").map((l) => l.trim());
+  const at = lines.findIndex((l) => /验收(标准|条件)|acceptance/i.test(l));
+  const scope = at >= 0 ? lines.slice(at + 1) : lines;
+  const out: string[] = [];
+  for (const l of scope) {
+    if (at >= 0 && out.length && /^(#|【|\*\*)/.test(l) && !/^[-*•]|^\d+[.)、]/.test(l)) break; // 下一个小节
+    const m = l.match(/^(?:[-*•]|\d+[.)、])\s*(.+)$/);
+    if (!m) continue;
+    const t = m[1].replace(/\*\*/g, "").trim();
+    if (t.length < 6 || /[?？]$/.test(t)) continue;
+    out.push(t.slice(0, 200));
+    if (out.length >= 8) break;
+  }
+  return out;
 }

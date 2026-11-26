@@ -167,7 +167,15 @@ export class CliRunner implements CliExecutor {
     if (agent.runtime === "gemini") restoreFiles.push(placeHubFile(cwd, ".gemini/settings.json", mcp));
     // pi：读项目里的 .pi/mcp.json，需要 -a（信任本次运行的项目文件）才会加载。
     // 注意 pi 的 timeout 单位是秒（默认 60 秒，report_phase 等测试会超时）；按毫秒填会让定时器溢出、连接立刻失败
-    if (agent.runtime === "pi") restoreFiles.push(placeHubFile(cwd, ".pi/mcp.json", { mcpServers: { hub: { ...mcp.mcpServers.hub, timeout: Math.floor(HUB_TOOL_TIMEOUT_MS / 1000) } } }));
+    if (agent.runtime === "pi") {
+      // .pi/ 里的文件含任务令牌、只为这次运行存在：从 git 排除，免得智能体自己 git add -A 时提交进去
+      this.excludeFromGit(cwd, ".pi/");
+      restoreFiles.push(placeHubFile(cwd, ".pi/mcp.json", { mcpServers: { hub: { ...mcp.mcpServers.hub, timeout: Math.floor(HUB_TOOL_TIMEOUT_MS / 1000) } } }));
+      // 模型网关会一阵一阵地连不上（几十秒），pi 默认重试 3 次、约 14 秒内就用完了。
+      // 这次运行把重试放宽到 8 次、退避 3 秒起（最长等约 4 分钟），与工作目录原有的 pi 项目设置合并
+      const own = (() => { try { return JSON.parse(readFileSync(join(cwd, ".pi/settings.json"), "utf8")); } catch { return {}; } })();
+      restoreFiles.push(placeHubFile(cwd, ".pi/settings.json", { ...own, retry: { ...(own.retry ?? {}), enabled: true, maxRetries: 8, baseDelayMs: 3000, provider: { ...(own.retry?.provider ?? {}), maxRetryDelayMs: 60_000 } } }));
+    }
     // Claude Code 原生技能：写进工作目录的 .claude/skills，并从 git 排除，运行结束再清理
     const skillsDir = agent.runtime === "claude-code" ? this.writeSkills(agent, cwd) : null;
 

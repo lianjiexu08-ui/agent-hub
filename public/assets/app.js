@@ -731,19 +731,20 @@ async function renderBoard() {
 }
 function issueCard(i) {
   return h("div", {
-      class: `icard${i.activeRuns ? " running" : ""}${i.status === "done" ? " done" : ""}${ui.openKey === i.key ? " sel" : ""}`,
+      class: `icard${i.live?.tone === "run" ? " running" : ""}${i.status === "done" ? " done" : ""}${ui.openKey === i.key ? " sel" : ""}`,
       draggable: "true",
       ondragstart: (e) => { e.dataTransfer.setData("text/plain", i.key); e.currentTarget.classList.add("dragging"); },
       ondragend: (e) => e.currentTarget.classList.remove("dragging"),
       onclick: () => openIssue(i.key),
     },
     h("div", { class: "icard-top" }, prio(i.priority), h("span", { class: "ikey" }, i.key),
-      i.activeRuns ? (i.queued ? h("span", { class: "warn", style: "color:var(--muted)", title: "并发已满，按优先级排队等待" }, "⏳ 排队中") : h("span", { class: "live" }, "执行中"))
-        : i.status === "todo" && i.waitingDeps ? h("span", { class: "warn", style: "color:var(--muted)", title: `等待 ${i.deps.filter((d) => !d.met).map((d) => d.key).join("、")} 完成后自动开始` }, "⏸ 等依赖")
-        : i.status === "todo" && i.lastRun?.status === "failed" ? h("span", { class: "warn" }, "✕ 上次失败")
-        : i.status === "todo" && !i.assignee ? h("span", { class: "warn", style: "color:var(--muted)" }, "待指派") : null,
+      i.live ? h("span", { class: `lstate ${i.live.tone}`, title: i.live.title || i.live.text }, i.live.text)
+        : i.status === "todo" && !i.assignee ? h("span", { class: "lstate wait" }, "待指派") : null,
       h("span", { style: "margin-left:auto" }, avatar(i.assignee))),
     h("div", { class: "ititle" }, i.title),
+    i.now ? h("div", { class: "inow", title: `${i.now.who}${i.now.step ? ` · ${i.now.step}` : ""}\n${i.now.action}` },
+      h("span", { class: "spin" }), h("b", {}, i.now.who), h("span", { class: "act" }, i.now.action),
+      h("span", { class: "el", "data-since": i.now.since }, elapsed(i.now.since))) : null,
     h("div", { class: "imeta" },
       i.labels.map((l) => h("span", { class: "label" + (l === "hotfix" ? " hot" : "") }, l === "hotfix" ? "⚡ HOTFIX" : l)),
       i.children.total ? h("span", { class: "tag", title: "子工作项完成度" }, `◫ ${i.children.done}/${i.children.total}`) : null,
@@ -798,7 +799,7 @@ async function renderDrawer(force = false) {
   // 指纹只取「会改变界面结构」的字段：相对时间每秒都在变，不能拿来判断
   const sig = JSON.stringify([
     d.id, d.status, d.phase, d.cycle, d.assignee, d.priority, d.labels, d.blocked, d.activeRuns,
-    d.lastRun?.status, d.lastRun?.id, d.pr?.state, d.pr?.checks, d.comments,
+    d.lastRun?.status, d.lastRun?.id, d.pr?.state, d.pr?.checks, d.comments, d.now?.who, d.now?.action, d.now?.step, d.live?.text,
     (d.activity ?? []).length, (d.deps ?? []).map((x) => x.met), d.github?.state, d.linear?.syncedAt,
   ]);
   if (!force && sig === drawerSig) return;
@@ -825,8 +826,10 @@ async function renderDrawer(force = false) {
       h("ol", { style: "margin:0;padding-left:20px;font-size:13px;flex-basis:100%" }, d.blocked.map((q) => h("li", {}, q))),
       ans, h("div", { class: "row", style: "width:100%;justify-content:flex-end" }, h("button", { class: "primary", onclick: go }, "确认需求并继续")));
   } else if (d.activeRuns) {
-    bar = h("div", { class: "actionbar live-bar" }, h("span", { class: "live" }, "执行中"),
-      h("span", { class: "hint" }, `${d.assignee} 正在处理，完成后结果会出现在下方动态里`),
+    bar = h("div", { class: "actionbar live-bar" }, h("span", { class: "live" }, d.live?.text ?? "执行中"),
+      d.now ? h("span", { class: "hint now-line" }, h("span", { class: "spin" }), h("b", {}, d.now.who), d.now.step ? h("span", { class: "muted" }, ` · ${d.now.step}`) : null,
+          h("span", {}, ` · ${d.now.action}`), h("span", { class: "muted", "data-since": d.now.since }, ` · ${elapsed(d.now.since)}`))
+        : h("span", { class: "hint" }, `${d.assignee} 正在处理，完成后结果会出现在下方动态里`),
       h("button", { class: "danger", onclick: () => issuesApi.stop(d.key).catch(fail) }, "■ 停止"));
   } else if (d.status === "in_review") {
     const fb = h("textarea", { class: "feedback", "data-focus-id": "feedback", placeholder: "写下修改意见，智能体会按意见重做…（⌘↵ 提交）", oninput: (e) => (ui.feedbackDraft = e.target.value) }, ui.feedbackDraft);
@@ -1998,6 +2001,17 @@ function importAssigneePicker(p, cfg, save) {
   return h("div", { class: "checks" }, ...pool.map((m) => checkboxP(chosen.has(m.id),
     (on) => save({ importAssignees: on ? [...cur.filter((x) => x.id !== m.id), m] : cur.filter((x) => x.id !== m.id) }), m.name)));
 }
+/** 已用时间：12 秒 / 3 分钟 / 1 小时 5 分 */
+function elapsed(iso) {
+  const sec = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
+  if (sec < 60) return `${sec} 秒`;
+  const m = Math.floor(sec / 60);
+  return m < 60 ? `${m} 分钟` : `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+}
+setInterval(() => document.querySelectorAll("[data-since]").forEach((el) => {
+  const t = elapsed(el.dataset.since);
+  el.textContent = el.classList.contains("el") ? t : ` · ${t}`;
+}), 1000);
 /** PR 的显示名：本地交付 / 只推分支时没有 PR 编号，显示分支 */
 const prName = (pr) => !pr ? "" : pr.local === "local" ? `本地分支 ${pr.branch}` : pr.local === "branch" ? `分支 ${pr.branch}` : `PR #${pr.number}`;
 const linearTag = (l) => l ? h("span", { class: "gh lin" + (l.state === "closed" ? " closed" : ""), title: `Linear ${l.identifier}` }, h("span", { class: "lin-mark", "aria-hidden": "true" }), l.identifier) : null;
@@ -2950,6 +2964,39 @@ function attachChips(list, onRemove) {
 }
 
 let butlerDraft = "";
+/**
+ * 管家输入框只创建一次、每次重绘复用同一个节点：首页会随运行进度频繁重绘，
+ * 每次新建输入框会清掉正在打的字、打断中文输入法组字、丢掉光标。
+ */
+let homeInputNode = null;
+let homeInputWrap = null, homeAttachBtn = null, homeSendBtn = null;
+/**
+ * 按顺序更新子节点，但已经在位的常驻节点原地不动：只删除不再需要的、在常驻节点前后插入新的。
+ * 与 fill 不同，它不会把常驻节点摘下再放回（摘下会失去焦点、打断输入法）。
+ */
+function patchChildren(parent, ...nodes) {
+  const list = nodes.flat(Infinity).filter((c) => c != null && c !== false).map((c) => (c instanceof Node ? c : document.createTextNode(String(c))));
+  const keep = new Set(list);
+  for (const c of [...parent.childNodes]) if (!keep.has(c)) c.remove();
+  let ref = parent.firstChild;
+  for (const n of list) {
+    if (n === ref) { ref = ref.nextSibling; continue; }
+    parent.insertBefore(n, ref);
+  }
+  return parent;
+}
+function homeInputEl() {
+  if (homeInputNode) return homeInputNode;
+  homeInputNode = h("textarea", { id: "homeInput", placeholder: "和管家说说你的想法…（Enter 发送，Shift+Enter 换行；可以直接粘贴截图或文件）",
+    oninput: (e) => (butlerDraft = e.target.value),
+    onpaste: (e) => { const fs = [...(e.clipboardData?.files ?? [])]; if (fs.length) { e.preventDefault(); uploadFiles(fs).catch(fail); } },
+    ondragover: (e) => { e.preventDefault(); e.currentTarget.classList.add("drop"); },
+    ondragleave: (e) => e.currentTarget.classList.remove("drop"),
+    ondrop: (e) => { e.preventDefault(); e.currentTarget.classList.remove("drop"); const fs = [...(e.dataTransfer?.files ?? [])]; if (fs.length) uploadFiles(fs).catch(fail); },
+    onkeydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendButler(e.target.value); } } });
+  homeInputNode.value = butlerDraft;
+  return homeInputNode;
+}
 /** 管家对话默认只渲染最近 20 条，更早的折叠在顶部，滚到顶或点按钮再往前加载 */
 let butlerShown = 20;
 /** 上次渲染时的消息总数：用来判断「有没有新消息」和「对话是否被清空」 */
@@ -3021,7 +3068,7 @@ async function renderHome() {
       ? `我是管家，能看到全部 ${projects.length} 个项目的工作项和执行情况。和我说说需求，我来拆成工作项放进对应项目；也可以让我调整任务、汇总进展，或开关项目负责人的持续迭代。`
       : "我是管家。现在还没有项目——先创建一个项目（工作项、看板和仓库绑定都在项目下面），然后把想法告诉我，我来拆成工作项。",
       projects.length ? null : h("div", { style: "margin-top:12px" }, h("button", { class: "primary", onclick: () => openNewProject() }, "创建第一个项目"))));
-  const fileInput = h("input", { type: "file", multiple: "true", style: "display:none", onchange: (e) => { uploadFiles(e.target.files).catch(fail); e.target.value = ""; } });
+  const fileInput = h("input", { id: "homeFile", type: "file", multiple: "true", style: "display:none", onchange: (e) => { uploadFiles(e.target.files).catch(fail); e.target.value = ""; } });
   const msgs = visible.map((m) => m.role === "me"
     ? h("div", { class: "bubble me" }, m.text, attachChips(m.attachments))
     : h("div", { class: "ai-row" }, h("span", { class: "ai-mark" }, "✦"), h("div", { class: "ai-col" },
@@ -3033,7 +3080,7 @@ async function renderHome() {
         // 标注回复来自哪个通道：规则回复不能让人误以为是 AI
         m.via ? h("div", { class: "muted", style: "font-size:11.5px;margin-top:4px" }, { api: "模型 API", "claude-code": "本机 Claude Code", rules: "规则回复（未连接模型）" }[m.via] ?? "") : null)));
 
-  fill($("#homeChat"),
+  patchChildren($("#homeChat"),
     h("div", { class: "home-chat-head" }, h("span", { class: "ai-mark" }, "✦"), h("b", {}, "管家"), h("span", { class: "muted" }, "讨论需求 · 拆分任务 · 调整计划"),
       h("span", { style: "margin-left:auto" }),
       (() => {
@@ -3064,18 +3111,18 @@ async function renderHome() {
         h("button", { onclick: () => { pend.forEach((c) => (c.dismissed = true)); saveButler(); renderHome(); } }, "全部取消"),
         h("button", { class: "primary", onclick: runAllActions }, `全部执行（${pend.length}）`));
     })(),
-    h("div", { class: "b-input" },
-      fileInput,
-      attachChips(homeAtt.pending, (n) => { homeAtt.pending.splice(n, 1); renderHome(); }),
-      h("textarea", { id: "homeInput", placeholder: "和管家说说你的想法…（Enter 发送，Shift+Enter 换行；可以直接粘贴截图或文件）",
-        oninput: (e) => (butlerDraft = e.target.value),
-        onpaste: (e) => { const fs = [...(e.clipboardData?.files ?? [])]; if (fs.length) { e.preventDefault(); uploadFiles(fs).catch(fail); } },
-        ondragover: (e) => { e.preventDefault(); e.currentTarget.classList.add("drop"); },
-        ondragleave: (e) => e.currentTarget.classList.remove("drop"),
-        ondrop: (e) => { e.preventDefault(); e.currentTarget.classList.remove("drop"); const fs = [...(e.dataTransfer?.files ?? [])]; if (fs.length) uploadFiles(fs).catch(fail); },
-        onkeydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendButler(e.target.value); } } }),
-      h("button", { title: "添加图片或文件（也可以直接粘贴、拖进来）", onclick: () => fileInput.click(), style: "padding:0 12px" }, "📎"),
-      h("button", { class: "primary", onclick: () => sendButler($("#homeInput").value) }, "发送")));
+    (() => {
+      // 输入区是常驻节点：只替换附件条，输入框与按钮原地不动（不会丢焦点、不会打断输入法）
+      homeInputWrap ??= h("div", { class: "b-input" });
+      patchChildren(homeInputWrap, [
+        fileInput,
+        attachChips(homeAtt.pending, (n) => { homeAtt.pending.splice(n, 1); renderHome(); }),
+        homeInputEl(),
+        homeAttachBtn ??= h("button", { title: "添加图片或文件（也可以直接粘贴、拖进来）", onclick: () => $("#homeFile")?.click(), style: "padding:0 12px" }, "📎"),
+        homeSendBtn ??= h("button", { class: "primary", onclick: () => sendButler($("#homeInput").value) }, "发送"),
+      ]);
+      return homeInputWrap;
+    })());
 
   const box = $("#homeMsgs");
   if (butlerRestore) {
