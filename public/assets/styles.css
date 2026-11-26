@@ -762,3 +762,7 @@ select, textarea, input { border-radius: 8px; padding: 7px 10px; }
 .bulk-bar { display: flex; align-items: center; gap: 10px; width: 100%; max-width: 860px; margin: 0 auto 8px; padding: 8px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-2); font-size: 13px; }
 .bulk-bar > span:first-child { color: var(--muted); }
 @media (max-width: 720px) { .bulk-bar { margin-inline: 16px; } }
+
+/* 验证不通过的模型：仍然可选，但要一眼看出来调不通 */
+.chip.bad { border-color: color-mix(in srgb, var(--failed) 45%, var(--border)); color: var(--failed); opacity: .85; }
+.chip.bad.on { background: color-mix(in srgb, var(--failed) 12%, transparent); }

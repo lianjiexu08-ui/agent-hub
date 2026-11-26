@@ -243,6 +243,58 @@ export class Assistant {
     }
     return {};
   }
+  /**
+   * 把用户粘贴的技能说明（或一个地址）整理成技能草稿。
+   * 地址只允许 https，且拒绝内网/环回地址——这条路径会由服务器发出请求，等于一个 SSRF 入口。
+   */
+  async draftSkill(input: { text?: string; url?: string }): Promise<{ id: string; name: string; description: string; instructions: string; source: string }> {
+    const url = String(input.url ?? "").trim();
+    let text = String(input.text ?? "").trim();
+    let source = "粘贴的文本";
+    if (url) { text = await fetchSkillSource(url); source = url; }
+    if (!text) throw new Error("先粘贴技能内容，或给一个可访问的地址");
+    // 太长会挤掉模型的有效输出，截断并由调用方自己决定是否补全
+    if (text.length > 40_000) text = `${text.slice(0, 40_000)}\n（内容过长，已截断）`;
+
+    const fallback = () => {
+      const firstLine = text.split("\n").map((x) => x.replace(/^#+\s*/, "").trim()).find(Boolean) ?? "新技能";
+      const id = (firstLine.match(/[a-zA-Z0-9]+/g) ?? []).join("-").toLowerCase().slice(0, 40) || `skill-${Date.now().toString(36)}`;
+      return { id, name: firstLine.slice(0, 24), description: `在需要「${firstLine.slice(0, 24)}」时使用`, instructions: text };
+    };
+    if (!this.canUseModel()) return { ...fallback(), source };
+
+    try {
+      const res = await this.llm().create({
+        model: this.settings.assistantModelId(),
+        max_tokens: 6000,
+        system: [
+          "你把用户给的技能素材整理成一份可复用的智能体技能。",
+          '只输出 JSON：{"id":"","name":"","description":"","instructions":""}。',
+          "id 是英文短横线标识（如 weekly-report），name 是中文名（不超过 12 字）。",
+          "description 写「什么时候该用这个技能」，要具体到触发场景，不超过 60 字。",
+          "instructions 是智能体加载后读到的完整指令：保留素材里的步骤、模板、检查清单，整理成 Markdown 的小标题与有序列表。不要加客套话，不要复述这段要求。",
+        ].join("\n"),
+        messages: [{ role: "user", content: text }],
+      }, { signal: AbortSignal.timeout(120_000) });
+      const raw = res.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("");
+      const hit = raw.match(/\{[\s\S]*\}/);
+      const o = hit ? JSON.parse(hit[0]) as Record<string, unknown> : null;
+      const fb = fallback();
+      const id = String(o?.id ?? "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || fb.id;
+      const instructions = String(o?.instructions ?? "").trim() || fb.instructions;
+      return {
+        id,
+        name: String(o?.name ?? "").trim().slice(0, 40) || fb.name,
+        description: String(o?.description ?? "").trim().slice(0, 160) || fb.description,
+        instructions,
+        source,
+      };
+    } catch (e) {
+      // 模型不可用不该挡住用户：退回原文，让人自己改
+      return { ...fallback(), source };
+    }
+  }
+
   /** 根据一段项目描述起草项目名、编号前缀和一句话说明；模型不可用时退化为截取 */
   async draftProject(brief: string): Promise<{ name: string; key: string; description: string }> {
     const text = String(brief ?? "").trim();
@@ -428,4 +480,33 @@ export class Assistant {
 function toVirtual(t: BetaToolUnion): VirtualTool {
   const x = t as { name: string; description?: string; input_schema?: Record<string, unknown> };
   return { name: x.name, description: x.description ?? "", input_schema: x.input_schema ?? { type: "object", properties: {} } };
+}
+
+/** 抓取技能素材地址：只允许 https，拒绝内网与环回，限制大小和超时 */
+async function fetchSkillSource(raw: string): Promise<string> {
+  let u: URL;
+  try { u = new URL(raw); } catch { throw new Error("地址格式不对，需要 https:// 开头"); }
+  if (u.protocol !== "https:") throw new Error("只支持 https 地址");
+  const host = u.hostname.toLowerCase();
+  // 服务器替用户发请求，必须挡住内网：否则等于给了一个读取内网服务的入口
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal") ||
+      /^(127\.|10\.|192\.168\.|169\.254\.|0\.|\[?::1\]?$)/.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)) {
+    throw new Error("不能抓取内网或本机地址");
+  }
+  const res = await fetch(u, { signal: AbortSignal.timeout(15_000), redirect: "follow", headers: { accept: "text/plain,text/markdown,text/html;q=0.8" } });
+  if (!res.ok) throw new Error(`抓取失败：HTTP ${res.status}`);
+  const len = Number(res.headers.get("content-length") ?? 0);
+  if (len > 2_000_000) throw new Error("内容过大（超过 2MB）");
+  const raw_body = (await res.text()).slice(0, 2_000_000);
+  // 粗剥 HTML：脚本/样式整块去掉，标签换成空白，实体做最小还原
+  const cleaned = raw_body
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"')
+    .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!cleaned) throw new Error("地址里没有可读的文本内容");
+  return cleaned;
 }

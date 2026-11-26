@@ -83,7 +83,7 @@ export interface Project {
   sync: {
     mode: "two_way" | "import" | "push" | "off"; importScope: "all" | "label"; importLabel: string; pushNew: boolean; postDeliverable: boolean;
     /** 工作项来源：从哪个系统导入。github = 仓库 issue，linear = Linear 团队 issue，both = 两边都导，manual = 只手动创建 */
-    source?: "github" | "linear" | "both" | "manual";
+    source?: "github" | "linear" | "manual";
   };
   linear: LinearBinding | null;
   lastSyncAt: string | null; pendingRemote: number; lead: Lead;
@@ -319,8 +319,9 @@ export class Work {
       p.simGhNext = 6;
     } else throw new WorkError("请先在「设置 → GitHub」配置 Token");
     if (p.sync.mode === "off") p.sync.mode = "two_way";
-    // 绑定仓库本身就是"要用这个来源"，所以从「仅手动」自动提升
-    if (!p.sync.source || p.sync.source === "manual") p.sync.source = p.linear ? "both" : "github";
+    // 绑定仓库本身就是"要用这个来源"，所以从「仅手动」自动提升；
+    // 已经选了 Linear 的不动——绑仓库是为了推代码，不是把 issue 来源改成 GitHub
+    if (!p.sync.source || p.sync.source === "manual") p.sync.source = "github";
     p.pendingRemote = p.simRemote?.length ?? 0;
     this.syncLog(id, "ok", `已绑定仓库 ${fullName}`);
     this.saveProj(p);
@@ -374,21 +375,32 @@ export class Work {
     this.store.docPut("synclog", this.store.nextSeq("synclog"), { id: Date.now(), projectId, at: now(), kind, text });
   }
   syncLogOf(projectId: string) { return this.store.docList("synclog").filter((l) => l.projectId === projectId).reverse().slice(0, 30); }
-  /** 工作项来源是否包含 GitHub（未设置时按绑定情况推断，兼容老数据） */
-  private sourceOf(p?: Project): "github" | "linear" | "both" | "manual" {
-    if (p?.sync.source) return p.sync.source;
-    if (p?.repo && p?.linear) return "both";
-    if (p?.repo) return "github";
+  /**
+   * 工作项的权威来源，三选一，互斥。
+   * GitHub 绑定只负责代码与 PR，不等于「issue 从 GitHub 来」——两边都导入会让同一件活在板上出现两次，
+   * 也说不清哪边改了算数，所以这里不提供 both。老数据里的 both 折算成有 Linear 就用 Linear。
+   */
+  private sourceOf(p?: Project): "github" | "linear" | "manual" {
+    const v = p?.sync.source as string | undefined;
+    if (v === "github" || v === "linear" || v === "manual") return v;
+    if (v === "both") return p?.linear ? "linear" : "github";
     if (p?.linear) return "linear";
+    if (p?.repo) return "github";
     return "manual";
   }
-  private fromGithub = (p?: Project) => ["github", "both"].includes(this.sourceOf(p));
-  private fromLinear = (p?: Project) => ["linear", "both"].includes(this.sourceOf(p));
+  private fromGithub = (p?: Project) => this.sourceOf(p) === "github";
+  private fromLinear = (p?: Project) => this.sourceOf(p) === "linear";
 
   private sourceLabel(p?: Project) {
-    return { github: "GitHub 仓库", linear: "Linear 团队", both: "GitHub 与 Linear", manual: "仅手动创建" }[this.sourceOf(p)];
+    return { github: "GitHub 仓库", linear: "Linear 团队", manual: "仅手动创建" }[this.sourceOf(p)];
   }
-  private canPush = (p?: Project) => !!p?.repo && (p.sync.mode === "two_way" || p.sync.mode === "push") && this.fromGithub(p);
+  /** 定时任务挑选项目用：同步开着就要跑（导入或推送至少有一边有事做） */
+  githubSyncable(p: Project): boolean { return !!p.repo && p.sync.mode !== "off"; }
+  linearSyncable(p: Project): boolean { return !!p.linear && p.linear.mode !== "off"; }
+
+  // 推送与导入解耦：来源决定「issue 从哪来」，推送只看同步方向。
+  // 手工建的工作项在 Linear 项目里也应该能推到 GitHub，否则绑定仓库对这类项目没有意义。
+  private canPush = (p?: Project) => !!p?.repo && (p.sync.mode === "two_way" || p.sync.mode === "push");
   private canImport = (p?: Project) => !!p?.repo && (p.sync.mode === "two_way" || p.sync.mode === "import") && this.fromGithub(p);
 
   /** 同步：导入 GitHub 新 issue、推送标记需要同步的工作项、对齐 open/closed 状态 */
@@ -396,12 +408,14 @@ export class Work {
   async sync(id: string, opts: { incremental?: boolean } = {}): Promise<string> {
     const p = this.proj(id);
     if (!p?.repo) throw new WorkError("项目尚未绑定 GitHub 仓库");
-    if (!this.fromGithub(p)) throw new WorkError(`工作项来源当前是「${this.sourceLabel(p)}」，不会从 GitHub 导入。要导入请在同步设置里把来源改成 GitHub 或两者`);
     if (p.sync.mode === "off") throw new WorkError("同步已关闭，请先在同步设置里开启");
+    // 来源不是 GitHub 时不导入 issue，但只要开了推送，已关联的工作项状态照样写回
+    if (!this.canImport(p) && !this.canPush(p)) throw new WorkError(`工作项来源是「${this.sourceLabel(p)}」，且未开启推送到 GitHub，没有可同步的内容`);
     let imported = 0, skipped = 0, pushed = 0, states = 0, pulled = 0;
     const mine = this.issues().filter((i) => i.projectId === id);
-    // 拉回远端的关闭 / 重新打开（只看上次同步后有更新的 issue）
-    if (this.canImport(p) && this.github.available()) {
+    const hasLinked = mine.some((i) => i.github);
+    // 拉回远端的关闭 / 重新打开（只看上次同步后有更新的 issue；没有关联工作项时不必请求）
+    if (hasLinked && (this.canImport(p) || this.canPush(p)) && this.github.available()) {
       const changed = await this.github.listIssues(p.repo.fullName, { state: "all", since: sinceFor(p.lastSyncAt) });
       for (const r of changed) {
         const i = mine.find((x) => x.github?.number === r.number);
@@ -616,8 +630,8 @@ export class Work {
     if (this.projectsRaw().some((x) => x.id !== id && x.linear?.teamId === teamId))
       throw new WorkError(`${team.name} 已绑定其他项目（一个 Linear 团队只能绑定一个项目）`);
     p.linear = defaultLinear(team);
-    // 同理：绑定团队就从「仅手动」提升来源
-    if (!p.sync.source || p.sync.source === "manual") p.sync.source = p.repo ? "both" : "linear";
+    // 同上：绑定团队就是选定 Linear 作为 issue 来源
+    if (!p.sync.source || p.sync.source === "manual") p.sync.source = "linear";
     this.linearStates.delete(teamId);
     this.saveProj(p);
     this.syncLog(id, "ok", `已绑定 Linear 团队 ${team.name}（${team.key}）`);
@@ -731,8 +745,9 @@ export class Work {
     if (!p) throw new WorkError("项目不存在", 404);
     const cfg = p.linear;
     if (!cfg) throw new WorkError("项目尚未绑定 Linear 团队");
-    if (!this.fromLinear(p)) throw new WorkError(`工作项来源当前是「${this.sourceLabel(p)}」，不会从 Linear 导入。要导入请在同步设置里把来源改成 Linear 或两者`);
     if (cfg.mode === "off") throw new WorkError("Linear 同步已关闭，请先在项目设置里开启");
+    // 来源不是 Linear 时不导入，但只要开了推送，已关联的工作项照样写回
+    if (!this.canImportLinear(p) && !this.canPushLinear(p)) throw new WorkError(`工作项来源是「${this.sourceLabel(p)}」，且未开启推送到 Linear，没有可同步的内容`);
     let imported = 0, skipped = 0, pushed = 0, pulled = 0;
     const mine = this.issues().filter((i) => i.projectId === id);
     const touched = new Set<number>();

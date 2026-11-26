@@ -266,12 +266,22 @@ async function loadRoots() {
   state.roots = await api(`/tasks?roots=1&limit=100${st ? "&status=" + st : ""}`);
   renderRoots();
 }
+/** 这个智能体实际用什么在跑：内置循环报模型名，CLI 底座报底座名与指定的模型 */
+function agentRuntimeLabel(name) {
+  const a = (S.agents ?? []).find((x) => x.name === name);
+  if (!a) return "";
+  const rt = a.runtime ?? "builtin";
+  if (rt === "builtin") return `内置 · ${modelShort(a.model)}`;
+  return `${rtDef(rt).short}${a.cliModel ? ` · ${modelShort(a.cliModel)}` : " · 默认模型"}`;
+}
 function renderRoots() {
   const list = $("#rootList");
   fill(list, 
     ...(state.roots.length ? state.roots.map((t) =>
       h("div", { class: "task-item" + (t.id === state.selRoot ? " sel" : ""), onclick: () => selectRoot(t.id) },
-        h("div", { class: "row" }, badge(t.status), h("b", {}, t.agent), t.source !== "api" ? h("span", { class: "tag" }, t.source) : null,
+        h("div", { class: "row" }, badge(t.status), h("b", {}, t.agent),
+          agentRuntimeLabel(t.agent) ? h("span", { class: "model-chip", title: "执行这次调用使用的模型与底座" }, agentRuntimeLabel(t.agent)) : null,
+          t.source !== "api" ? h("span", { class: "tag" }, t.source) : null,
           h("span", { class: "muted", style: "margin-left:auto;font-size:12px" }, ago(t.createdAt))),
         h("div", { class: "input" }, t.input))) : [h("div", { class: "empty" }, "暂无任务")]),
   );
@@ -745,13 +755,14 @@ function issueCard(i) {
 // ---------- 详情抽屉 ----------
 async function openIssue(k) {
   if (ui.openKey !== k) { ui.feedbackOpen = false; ui.draft = ""; ui.feedbackDraft = ""; }
+  if (ui.openKey !== k) drawerSig = "";
   ui.openKey = k;
   ui.focusReturn = document.activeElement;
   history.replaceState(null, "", "#issue=" + k);
   $("#drawer").classList.add("open");
   $("#drawer").setAttribute("aria-hidden", "false");
   $("#scrim").classList.add("open");
-  await renderDrawer();
+  await renderDrawer(true);
   renderBoard();
   $("#drawer").focus({ preventScroll: true });
 }
@@ -771,10 +782,26 @@ function refreshDrawer() {
   if (a && $("#drawer").contains(a) && a.dataset.keep) { ui.pendingDrawer = true; return; }
   renderDrawer();
 }
-async function renderDrawer() {
+let drawerSig = "";
+let drawerBusy = false;
+let drawerDirty = false;
+async function renderDrawer(force = false) {
   if (!ui.openKey) return;
+  // 进行中的工作项每秒都有状态事件；整体重绘会让抽屉闪烁。串行化，并且只在结构真的变了时重绘
+  if (drawerBusy) { drawerDirty = true; return; }
+  drawerBusy = true;
+  try {
   let d;
   try { d = await issuesApi.detail(ui.openKey); } catch { return closeDrawer(); }
+  if (d.key !== ui.openKey) return; // 请求返回前已经切到别的单
+  // 指纹只取「会改变界面结构」的字段：相对时间每秒都在变，不能拿来判断
+  const sig = JSON.stringify([
+    d.id, d.status, d.phase, d.cycle, d.assignee, d.priority, d.labels, d.blocked, d.activeRuns,
+    d.lastRun?.status, d.lastRun?.id, d.pr?.state, d.pr?.checks, d.comments,
+    (d.activity ?? []).length, (d.deps ?? []).map((x) => x.met), d.github?.state, d.linear?.syncedAt,
+  ]);
+  if (!force && sig === drawerSig) return;
+  drawerSig = sig;
   ui.pendingDrawer = false;
   if (d.projectId !== curProject()?.id) setProject(d.projectId, { keepDrawer: true });
   // 评论框/反馈框：重绘后恢复焦点与光标
@@ -844,6 +871,7 @@ async function renderDrawer() {
   const time = (iso) => h("span", { class: "time", title: new Date(iso).toLocaleString() }, ago(iso));
   const runBadge = (s) => h("span", { class: "badge s-" + (s === "cancelled" ? "cancelled" : s) }, STATUS[s] ?? s);
 
+  const keepScroll = $("#drawer").scrollTop;
   fill($("#drawer"), 
     h("div", { class: "dr-head" },
       h("a", { onclick: () => { closeDrawer(); showView("project"); }, title: "项目设置" }, d.projectName), h("span", {}, "/"),
@@ -919,6 +947,11 @@ async function renderDrawer() {
   if (refocus) {
     const el = $(`#drawer [data-focus-id="${refocus}"]`);
     if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+  }
+  if (keepScroll) $("#drawer").scrollTop = keepScroll;
+  } finally {
+    drawerBusy = false;
+    if (drawerDirty) { drawerDirty = false; void renderDrawer(); }
   }
 }
 
@@ -1134,7 +1167,8 @@ function renderStudioSide() {
       h("div", { class: "meta" }, h("div", { class: "t" }, a.name, h("span", { class: "model-chip" }, (a.runtime ?? "builtin") === "builtin" ? modelShort(a.model) : rtDef(a.runtime).short)),
         h("div", { class: "s" }, a.description || "—")))),
     h("div", { class: "side-head" }, h("span", {}, `技能 ${studio.skills().length}`),
-      h("button", { onclick: () => selectStudio("skill", null) }, "+ 新建")),
+      h("button", { onclick: () => selectStudio("skill", null), title: "从空白开始写" }, "+ 新建"),
+      h("button", { onclick: () => openSkillImporter(), title: "粘贴一段技能说明或给一个地址，由 AI 整理成技能" }, "✦ AI 新建")),
     studio.skills().map((s) => h("div", { class: "side-item" + (sel("skill", s.id) ? " sel" : ""), onclick: () => selectStudio("skill", s.id) },
       h("span", { class: "skill-icon" }, "✦"),
       h("div", { class: "meta" }, h("div", { class: "t" }, s.name), h("div", { class: "s" }, `${studio.usage(s.id).length} 个智能体在用 · ${s.description || "—"}`)))),
@@ -1324,6 +1358,42 @@ function skillEditor() {
         : h("div", { class: "muted", style: "font-size:13px" }, "还没有智能体使用这个技能")) : null,
     savebar(isNew ? "新技能尚未创建" : "有未保存的修改", save, cancel),
   ];
+}
+
+/**
+ * 用一段现成的技能素材建技能：粘贴 prompt 正文，或给一个地址由服务器抓取。
+ * 整理结果先进编辑器，用户确认后再保存——AI 起草的东西不该直接进库。
+ */
+function openSkillImporter() {
+  const text = h("textarea", { class: "prompt-area", style: "min-height:160px", placeholder: "把技能说明粘进来。可以是一段 prompt、一份规范、一个检查清单……" });
+  const url = h("input", { placeholder: "或者填一个 https 地址，如 https://…/skill.md（可选）" });
+  const note = h("span", { class: "muted", style: "font-size:12.5px" });
+  const go = async (btn) => {
+    if (!text.value.trim() && !url.value.trim()) return note.textContent && toast("先粘贴内容或填地址", "err");
+    btn.disabled = true; note.textContent = "正在整理…";
+    try {
+      const d = await rpc("assistant.draftSkill", { text: text.value, url: url.value.trim() });
+      closeModal(true);
+      selectStudio("skill", null);
+      // 已经存在同名标识时加后缀，避免直接覆盖别人的技能
+      let id = d.id;
+      while (studio.skill(id)) id = `${d.id}-${Math.random().toString(36).slice(2, 6)}`;
+      st.draft = { id, name: d.name, description: d.description, instructions: d.instructions, createdBy: ME };
+      renderStudio();
+      toast(`已整理成技能「${d.name}」，确认后保存`, "ok");
+    } catch (e) { note.textContent = ""; fail(e); } finally { btn.disabled = false; }
+  };
+  const submit = h("button", { class: "primary", onclick: (e) => go(e.currentTarget) }, "交给 AI 整理");
+  fill($("#modal"), h("div", { class: "modal", onclick: (e) => e.stopPropagation() },
+    h("div", { class: "dr-head" }, h("span", {}, "用 AI 新建技能")),
+    h("div", { class: "fields" },
+      text,
+      h("div", { class: "row", style: "gap:10px;align-items:center" }, url),
+      h("div", { class: "help" }, "地址只支持 https，由 Hub 服务器抓取后整理；整理结果先进编辑器，不会直接入库。")),
+    h("div", { class: "modal-foot" }, note, h("span", { style: "margin-left:auto" }),
+      h("button", { onclick: () => closeModal() }, "取消"), submit)));
+  $("#modal").classList.add("open"); $("#modal").setAttribute("aria-hidden", "false");
+  setTimeout(() => text.focus());
 }
 
 // ---------- 工具 / MCP（真实数据，只读） ----------
@@ -1887,18 +1957,49 @@ $("#settingsBtn").addEventListener("click", () => showView("settings"));
 function renderProjBar() {
   const p = curProject();
   if (!p) return fill($("#projBar"));
-  const syncBtn = h("button", { onclick: async (e) => {
-    e.target.disabled = true;
-    e.target.textContent = "同步中…";
-    try { toast(await issuesApi.sync(p.id), "ok"); } catch (err) { fail(err); }
-  } }, "立即同步");
-  fill($("#projBar"), p.repo
-    ? [h("span", { class: "gh" }, ghIcon(), p.repo.fullName), h("span", {}, "·"), h("span", {}, SYNC_MODES.find((m) => m[0] === p.sync.mode)?.[1]),
-       p.lastSyncAt ? h("span", {}, `· ${ago(p.lastSyncAt)}同步`) : null,
-       p.pendingRemote && p.sync.mode !== "push" && p.sync.mode !== "off" ? h("span", { class: "tag", title: "GitHub 上有尚未导入的 issue" }, `${p.pendingRemote} 个待导入`) : null,
-       p.linear ? h("span", { class: "gh lin", title: `Linear 团队 ${p.linear.teamName}` }, h("span", { class: "lin-mark", "aria-hidden": "true" }), p.linear.teamKey) : null,
-       p.sync.mode !== "off" ? syncBtn : null]
-    : [h("span", {}, "未绑定 GitHub 仓库"), h("a", { class: "link", onclick: () => showView("project") }, "去绑定 →")]);
+  // 工作项只有一个权威来源，所以同步按钮也只有一个：按来源喊对应的同步
+  const src = p.sync?.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
+  const ghOn = !!p.repo && p.sync.mode !== "off";
+  const lnOn = !!p.linear && p.linear.mode !== "off";
+  const jobs = [];
+  if (src === "linear" && lnOn) jobs.push(["Linear", () => issuesApi.syncLinear(p.id)]);
+  else if (src === "github" && ghOn) jobs.push(["GitHub", () => issuesApi.sync(p.id)]);
+  else if (src === "manual") {
+    // 手动来源没有可导入的，但绑定了系统且开了推送的话，可以把本地改动推出去
+    if (ghOn && ["two_way", "push"].includes(p.sync.mode)) jobs.push(["GitHub", () => issuesApi.sync(p.id)]);
+    if (lnOn && ["two_way", "push"].includes(p.linear.mode)) jobs.push(["Linear", () => issuesApi.syncLinear(p.id)]);
+  }
+  const syncBtn = jobs.length
+    ? h("button", { title: `从${jobs.map((j) => j[0]).join("、")}拉取最新变更并写回本地改动`, onclick: async (e) => {
+        const btn = e.currentTarget;
+        const label = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "同步中…";
+        const out = [];
+        try {
+          for (const [name, fn] of jobs) {
+            try { out.push(await fn()); } catch (err) { out.push(`${name}：${err.message}`); }
+          }
+          toast(out.join("；"), "ok");
+          await refreshState();
+          renderIssuesView();
+        } catch (err) { fail(err); }
+        finally { btn.disabled = false; btn.textContent = label; }
+      } }, `⟳ 同步 ${jobs.map((j) => j[0]).join(" / ")}`)
+    : null;
+  const lastSync = src === "linear" ? p.linear?.lastSyncAt : p.lastSyncAt;
+  const modeLabel = src === "linear"
+    ? LINEAR_MODES.find((m) => m[0] === p.linear?.mode)?.[1]
+    : SYNC_MODES.find((m) => m[0] === p.sync.mode)?.[1];
+  fill($("#projBar"),
+    h("span", { class: "gh" }, ghIcon(), p.repo ? p.repo.fullName : "未绑定仓库"),
+    h("span", {}, "·"),
+    h("span", {}, src === "linear" ? "issue 来自 Linear" : src === "github" ? "issue 来自 GitHub" : "仅手动创建"),
+    modeLabel && (src === "linear" ? lnOn : ghOn) ? h("span", {}, `· ${modeLabel}`) : null,
+    lastSync ? h("span", {}, `· ${ago(lastSync)}同步`) : null,
+    src === "github" && p.pendingRemote && p.sync.mode !== "push" && ghOn ? h("span", { class: "tag", title: "GitHub 上有尚未导入的 issue" }, `${p.pendingRemote} 个待导入`) : null,
+    p.linear ? h("span", { class: "gh lin", title: `Linear 团队 ${p.linear.teamName}` }, h("span", { class: "lin-mark", "aria-hidden": "true" }), p.linear.teamKey) : null,
+    syncBtn);
 }
 
 // ======================= 新建 GitHub 仓库（新建项目弹窗与项目设置页共用） =======================
@@ -2103,34 +2204,32 @@ function renderProjectPage() {
       field("名称", inp(d, "name")),
       field("编号前缀", inp(d, "key", { upper: 1, style: "max-width:180px;text-transform:uppercase" }), "2–6 位大写字母或数字"),
       field("描述", inp(d, "description"))),
-    section("GitHub 仓库", "一个项目对应一个仓库（一个仓库也只能绑定一个项目）。工作项与 issue 同步，智能体在这个仓库里改代码、提 PR。", repoBlock),
-    section("工作项来源", "工作项从哪个系统导入。可以只接一个，也可以两边都接；不导入时也可以纯手动创建。", (() => {
-        const cur = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
+    section("GitHub 仓库", "一个项目对应一个仓库（一个仓库也只能绑定一个项目）。绑定是为了让智能体在这里改代码、推分支、提 PR；issue 是否从 GitHub 导入，由下面的「工作项来源」单独决定。", repoBlock),
+    section("工作项来源", "工作项只能有一个权威来源，二选一：从 Linear 导入，或从 GitHub 的 issue 导入。两者互斥——同一件活在两边各有一份，改哪边算数就说不清了。绑定 GitHub 仓库只影响代码与 PR，不改变这里的选择。", (() => {
+        const cur = d.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
         const opts = [
-          ["github", p.repo ? `GitHub 仓库 · ${p.repo.fullName} 的所有 issue` : "GitHub 仓库（还没绑定）"],
           ["linear", p.linear ? `Linear 团队 · ${p.linear.teamName}` : "Linear 团队（还没绑定）"],
-          ["both", "两边都导入"],
+          ["github", p.repo ? `GitHub 仓库 · ${p.repo.fullName} 的 issue` : "GitHub 仓库（还没绑定）"],
           ["manual", "只手动创建，不导入"],
         ];
         const el = select(opts, cur, (v) => {
-          if (v === "github" && !p.repo) return toast("先在下面绑定 GitHub 仓库", "err");
-          if (v === "linear" && !p.linear) return toast("先在下面绑定 Linear 团队", "err");
-          if (v === "both" && (!p.repo || !p.linear)) return toast("两边都导入需要同时绑定仓库和团队", "err");
+          if (v === "github" && !p.repo) return toast("先绑定 GitHub 仓库", "err");
+          if (v === "linear" && !p.linear) return toast("先绑定 Linear 团队", "err");
+          // 换来源只影响往后的导入；已经导入的工作项不会自动删，提示一下免得以为是 bug
+          const imported = issuesApi.projects().find((x) => x.id === p.id)?.counts?.total ?? 0;
           d.sync.source = v;
-          if (v === "github" || v === "both") d.sync.mode = d.sync.mode === "off" ? "two_way" : d.sync.mode;
-          if (v === "linear" || v === "both") { if (d.linear) d.linear.mode = d.linear.mode === "off" ? "two_way" : d.linear.mode; }
+          if (v === "github") d.sync.mode = d.sync.mode === "off" ? "two_way" : d.sync.mode;
+          if (v === "linear" && d.linear) d.linear.mode = d.linear.mode === "off" ? "two_way" : d.linear.mode;
           touchP(); renderProjectPage();
-        }, { style: "max-width:380px" });
+          if (imported) toast(`来源已切换。已导入的 ${imported} 个工作项不受影响，需要清理请在工作项页批量删除`, "ok");
+        }, { style: "max-width:420px" });
         return h("div", { class: "row" }, el, h("button", {
           onclick: async (e) => {
-            const src = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
+            const src = d.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
             if (src === "manual") return toast("当前来源是「仅手动创建」，没有可导入的", "err");
             e.target.disabled = true; e.target.textContent = "导入中…";
             try {
-              const out = [];
-              if (src === "github" || src === "both") out.push(await issuesApi.sync(p.id));
-              if (src === "linear" || src === "both") out.push(await issuesApi.syncLinear(p.id));
-              toast(out.join("；"), "ok");
+              toast(await (src === "github" ? issuesApi.sync(p.id) : issuesApi.syncLinear(p.id)), "ok");
               renderProjectPage(); renderBoard();
             } catch (err) { fail(err); }
             finally { e.target.disabled = false; e.target.textContent = "立即导入"; }
@@ -2139,17 +2238,19 @@ function renderProjectPage() {
       })()),
     section("GitHub 同步", p.repo ? `工作项与 ${p.repo.fullName} 的 issue 如何互相同步。` : "绑定仓库后才能开启同步。下面的设置只影响 GitHub，Linear 有自己的一组。",
       (() => {
-        const src = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
-        if (src === "github" || src === "both") return null;
-        return h("div", { class: "callout warn" },
-          h("div", {}, h("b", {}, "当前工作项来源不含 GitHub，下面这些设置不会执行。"),
-            h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "要启用，把上面的「工作项来源」改成 GitHub 仓库或两边都导入。")));
+        const src = d.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
+        if (src === "github") return null;
+        return h("div", { class: "callout" },
+          h("div", {}, h("b", {}, "当前来源是「" + (src === "linear" ? "Linear 团队" : "仅手动创建") + "」，不会从 GitHub 导入 issue。"),
+            h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "但下面的推送设置仍然有效：本地新建或改动的、已关联 GitHub 的工作项，照样会把状态写回 GitHub；智能体也在这里改代码、提 PR。要让 issue 也来自 GitHub，把上面的来源改过来（Linear 那边会停止导入）。")));
       })(),
       field("同步方向", select(SYNC_MODES, d.sync.mode, (v) => { d.sync.mode = v; touchP(); renderProjectPage(); }, { style: "max-width:320px", disabled: p.repo ? null : "" }),
         p.repo ? "" : "绑定仓库后可开启"),
-      ["two_way", "import"].includes(d.sync.mode) ? field("导入范围", h("div", { class: "row" },
-        select([["all", "所有 open 的 issue"], ["label", "只导入带指定标签的 issue"]], d.sync.importScope, (v) => { d.sync.importScope = v; touchP(); renderProjectPage(); }, { style: "max-width:260px" }),
-        d.sync.importScope === "label" ? inp(d.sync, "importLabel", { placeholder: "标签，如 agent", style: "max-width:160px" }) : null), "导入后进入「待规划」，指派智能体后才会执行") : null,
+      (d.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual")) === "github" && ["two_way", "import"].includes(d.sync.mode)
+        ? field("导入范围", h("div", { class: "row" },
+            select([["all", "所有 open 的 issue"], ["label", "只导入带指定标签的 issue"]], d.sync.importScope, (v) => { d.sync.importScope = v; touchP(); renderProjectPage(); }, { style: "max-width:260px" }),
+            d.sync.importScope === "label" ? inp(d.sync, "importLabel", { placeholder: "标签，如 agent", style: "max-width:160px" }) : null), "导入后进入「待规划」，指派智能体后才会执行")
+        : null,
       ["two_way", "push"].includes(d.sync.mode) ? h("div", { class: "checks" },
         checkboxP(d.sync.pushNew, (on) => { d.sync.pushNew = on; touchP(); }, "新建工作项时默认同时创建 GitHub issue", "新建时可单独取消勾选"),
         checkboxP(d.sync.postDeliverable, (on) => { d.sync.postDeliverable = on; touchP(); }, "智能体的交付结果回写为 GitHub 评论")) : null,
@@ -2237,16 +2338,18 @@ function linearSection(p) {
       } }, "同步 Linear"),
       h("button", { class: "danger", onclick: async () => { if (confirm(`解绑 Linear 团队 ${cfg.teamName}？已关联的工作项会保留 Linear 编号，但不再同步。`)) { await issuesApi.disconnectLinear(p.id); renderProjectPage(); } } }, "解绑")),
     (() => {
-      const src = p.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
-      if (src === "linear" || src === "both") return null;
-      return h("div", { class: "callout warn" },
-        h("div", {}, h("b", {}, "当前工作项来源不含 Linear，下面这些设置不会执行。"),
-          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "要启用，把上面的「工作项来源」改成 Linear 团队或两边都导入。")));
+      const src = p.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
+      if (src === "linear") return null;
+      return h("div", { class: "callout" },
+        h("div", {}, h("b", {}, "当前来源是「" + (src === "github" ? "GitHub 仓库" : "仅手动创建") + "」，不会从 Linear 导入 issue。"),
+          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "但下面的推送设置仍然有效：本地新建或改动的、已关联 Linear 的工作项，会把状态写回 Linear。要让 issue 来自 Linear，把上面的来源改过来。")));
     })(),
     field("同步方向", select(LINEAR_MODES, cfg.mode, (v) => save({ mode: v }), { style: "max-width:320px" })),
-    ["two_way", "import"].includes(cfg.mode) ? field("导入范围", h("div", { class: "row" },
-      select([["all", "所有未完成的 issue"], ["label", "只导入带指定标签的 issue"]], cfg.importScope, (v) => save({ importScope: v }), { style: "max-width:260px" }),
-      cfg.importScope === "label" ? label : null), "导入后进入「待规划」，保留 Linear 优先级") : null,
+    (p.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual")) === "linear" && ["two_way", "import"].includes(cfg.mode)
+      ? field("导入范围", h("div", { class: "row" },
+          select([["all", "所有未完成的 issue"], ["label", "只导入带指定标签的 issue"]], cfg.importScope, (v) => save({ importScope: v }), { style: "max-width:260px" }),
+          cfg.importScope === "label" ? label : null), "导入后进入「待规划」，保留 Linear 优先级")
+      : null,
     ["two_way", "import"].includes(cfg.mode) ? linearAutoField(p, cfg, save) : null,
     ["two_way", "push"].includes(cfg.mode) ? h("div", { class: "checks" },
       checkboxP(cfg.pushNew, (on) => save({ pushNew: on }), "新建工作项时默认同时创建 Linear issue", "新建时可单独取消勾选"),
@@ -3207,7 +3310,7 @@ qa.onChange(() => {
 const RUNTIME_DEFS = [
   { id: "builtin", name: "内置（Claude API）", short: "内置", desc: "Hub 自己的执行循环，工具由 Hub 提供，适合调研、写作、调度类任务", auth: "使用「模型服务」里的连接", verified: true },
   { id: "claude-code", name: "Claude Code", short: "Claude Code", desc: "成熟的编码智能体，读写代码、运行命令、提交 PR", auth: "使用服务器上 claude 的登录状态，或设置 ANTHROPIC_API_KEY", verified: true,
-    template: 'claude -p "{prompt}" --output-format stream-json --verbose --model {model} --append-system-prompt "{system}" --mcp-config {mcp_config} --permission-mode bypassPermissions',
+    template: 'claude -p "{prompt}" --output-format stream-json --verbose --model {model} --append-system-prompt "{system}" --mcp-config {mcp_config} --strict-mcp-config --permission-mode bypassPermissions',
     modelHint: "opus / sonnet / haiku，或完整模型 ID，如 claude-opus-5-5" },
   { id: "codex", name: "Codex CLI", short: "Codex", desc: "OpenAI 的编码智能体", auth: "使用服务器上 codex 的登录状态，或设置 OPENAI_API_KEY", verified: false,
     template: 'codex exec --json -m {model} "{prompt}"', modelHint: "填写 Codex 支持的模型名，留空用默认" },
@@ -3230,6 +3333,8 @@ async function loadRuntimeModels(id, force = false) {
   return rtModels.cache[id];
 }
 /** 模型芯片：点一下就把该模型设为这个智能体使用的模型 */
+/** 每个底座记住「展开更多」的状态：模型可能几十个，默认只铺一行，其余按需展开 */
+const modelChipsOpen = {};
 function modelChips(d, id, onPick) {
   const data = rtModels.cache[id];
   if (!data) {
@@ -3237,13 +3342,24 @@ function modelChips(d, id, onPick) {
     return h("div", { class: "muted", style: "font-size:12px;margin-top:6px" }, "正在检测该底座可用的模型…");
   }
   const list = data.models ?? [];
+  const verify = data.verify ?? {};
+  // 验证失败的排在后面并标红：它们能列出来但实际调不通，混在一起会让人误选
+  const bad = (m) => verify[m.id]?.ok === false;
+  const sorted = [...list].sort((a, b) => Number(bad(a)) - Number(bad(b)));
+  const open = !!modelChipsOpen[id];
+  const shown = open ? sorted : sorted.slice(0, 14);
+  const rest = sorted.length - shown.length;
+  const chip = (m) => h("button", {
+    class: "chip" + ((d.cliModel ?? "") === m.id ? " on" : "") + (bad(m) ? " bad" : ""),
+    style: "padding:0 8px",
+    title: [m.name, m.note, bad(m) ? `不可用：${verify[m.id].note}` : ""].filter(Boolean).join(" · "),
+    onclick: () => { d.cliModel = m.id; onPick?.(m.id); touch(); renderStudio(); },
+  }, m.name && m.name !== m.id ? m.name : m.id);
   return h("div", {},
-    h("div", { class: "row", style: "gap:6px;margin-top:6px" },
-      h("span", { class: "muted", style: "font-size:12px" }, list.length ? `检测到 ${list.length} 个模型：` : "没有检测到模型"),
-      ...list.slice(0, 14).map((m) => h("button", {
-        class: "chip" + ((d.cliModel ?? "") === m.id ? " on" : ""), style: "padding:0 8px", title: [m.name, m.note].filter(Boolean).join(" · "),
-        onclick: () => { d.cliModel = m.id; onPick?.(m.id); touch(); renderStudio(); },
-      }, m.name && m.name !== m.id ? m.name : m.id)),
+    h("div", { class: "row", style: "gap:6px;margin-top:6px;flex-wrap:wrap" },
+      h("span", { class: "muted", style: "font-size:12px" }, list.length ? `检测到 ${list.length} 个模型${list.filter(bad).length ? `（${list.filter(bad).length} 个不可用）` : ""}：` : "没有检测到模型"),
+      ...shown.map(chip),
+      rest > 0 ? h("a", { class: "link", style: "font-size:12px", onclick: () => { modelChipsOpen[id] = true; renderStudio(); } }, `展开其余 ${rest} 个`) : (open && sorted.length > 14 ? h("a", { class: "link", style: "font-size:12px", onclick: () => { modelChipsOpen[id] = false; renderStudio(); } }, "收起") : null),
       h("a", { class: "link", style: "font-size:12px;margin-left:4px", onclick: async (e) => { e.target.textContent = "检测中…"; await loadRuntimeModels(id, true); renderStudio(); } }, "重新检测")),
     h("div", { class: "help", style: "margin-top:4px" }, data.source ?? ""));
 }

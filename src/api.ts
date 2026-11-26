@@ -119,6 +119,7 @@ export function buildApi(s: Services) {
     "settings.listProviderModels": (id) => settings.listProviderModels(id),
     "settings.setAssistantModel": (m) => settings.patch({ assistantModel: m ?? "" }),
     "assistant.draftProject": (brief) => assistant.draftProject(String(brief ?? "")),
+    "assistant.draftSkill": (input) => assistant.draftSkill((input ?? {}) as { text?: string; url?: string }),
     "settings.removeProvider": (id) => settings.removeProvider(id),
     "settings.saveModel": (m) => settings.saveModel(m),
     "settings.removeModel": (id) => settings.removeModel(id),
