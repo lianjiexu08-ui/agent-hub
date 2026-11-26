@@ -728,6 +728,7 @@ function issueCard(i) {
     },
     h("div", { class: "icard-top" }, prio(i.priority), h("span", { class: "ikey" }, i.key),
       i.activeRuns ? (i.queued ? h("span", { class: "warn", style: "color:var(--muted)", title: "并发已满，按优先级排队等待" }, "⏳ 排队中") : h("span", { class: "live" }, "执行中"))
+        : i.status === "todo" && i.quotaUntil && Date.parse(i.quotaUntil) > Date.now() ? h("span", { class: "warn", style: "color:var(--muted)", title: `模型额度用完，预计 ${new Date(i.quotaUntil).toLocaleString()} 恢复后自动继续` }, `⏸ 等额度 ${new Date(i.quotaUntil).toTimeString().slice(0, 5)}`)
         : i.status === "todo" && i.waitingDeps ? h("span", { class: "warn", style: "color:var(--muted)", title: `等待 ${i.deps.filter((d) => !d.met).map((d) => d.key).join("、")} 完成后自动开始` }, "⏸ 等依赖")
         : i.status === "todo" && i.lastRun?.status === "failed" ? h("span", { class: "warn" }, "✕ 上次失败")
         : i.status === "todo" && !i.assignee ? h("span", { class: "warn", style: "color:var(--muted)" }, "待指派") : null,

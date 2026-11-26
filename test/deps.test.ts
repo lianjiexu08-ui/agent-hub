@@ -205,3 +205,29 @@ test("自动重试按「最近连续失败」计数：服务重启的中断不�
   await failCurrent("又超时了");
   assert.equal(streak(), 2);
 });
+
+test("识别额度用完的报错并算出恢复时间", async () => {
+  const { quotaReset } = await import("../src/work.ts");
+  const t0 = new Date("2026-11-26T07:25:00Z");
+  const glm = quotaReset('429: {"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-26 16:16:42"}', t0)!;
+  assert.equal(+glm, +new Date("2026-11-26T16:16:42"), "无时区的时间按本机时间");
+  assert.equal(quotaReset("Claude AI usage limit reached|1795680000", t0)!.toISOString(), new Date(1795680000 * 1000).toISOString());
+  assert.equal(+quotaReset("Rate limit exceeded, try again in 30 minutes", t0)!, +t0 + 30 * 60_000);
+  assert.equal(+quotaReset("quota exceeded", t0)!, +t0 + 15 * 60_000, "没给时间按 15 分钟");
+  assert.equal(quotaReset("模型调用超时", t0), null);
+  assert.equal(quotaReset("TypeError: x is not a function", t0), null);
+});
+
+test("额度用完的失败不计入连续失败，并标出恢复时间", async () => {
+  const { work, p, runtime } = setup([40, 60]);
+  const a = await work.create({ projectId: p.id, title: "A", description: DESC, assignee: "developer" });
+  await until(() => work.detail(a.key).runList[0]?.status === "running");
+  const reset = new Date(Date.now() + 3600_000);
+  const stamp = `${reset.getFullYear()}-${String(reset.getMonth() + 1).padStart(2, "0")}-${String(reset.getDate()).padStart(2, "0")} ${reset.toTimeString().slice(0, 8)}`;
+  runtime.fail(work.detail(a.key).runList[0].id, `429: Usage limit reached for 5 hour. Your limit will reset at ${stamp}`);
+  await until(() => work.find(a.key).status === "todo");
+  const v = work.list(p.id).find((i) => i.key === a.key)!;
+  assert.equal(v.failStreak, 0);
+  assert.equal(Date.parse(v.quotaUntil!) / 1000, Math.floor(+reset / 1000));
+  assert.match(work.detail(a.key).activity.at(-1)!.body, /额度用完了[\s\S]*恢复，届时哨兵会从「.+」自动继续/);
+});

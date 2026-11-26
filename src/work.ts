@@ -140,6 +140,23 @@ export interface QAPort {
   runsFor(key: string): { id: string; status: string; cases: { status: string | null }[] }[];
 }
 
+/**
+ * 运行失败是不是模型订阅 / 接口的额度用完了（5 小时额度、限流等）。是的话返回预计恢复的时间，否则 null。
+ * 认得的写法：「reset at 2026-11-26 16:16:42」（无时区按本机时间）、ISO 时间、「limit reached|<unix 秒>」（Claude Code）、
+ * 「try again in 30 minutes / 45s」「resets in 2h」；认出是额度问题但没给时间时，按 15 分钟后再试。
+ */
+export function quotaReset(error: string | null | undefined, failedAt: Date = new Date()): Date | null {
+  const e = error ?? "";
+  if (!/usage limit|rate.?limit|quota|limit (?:reached|exceeded)|too many requests|\b429\b|额度|限额|限流/i.test(e)) return null;
+  const at = e.match(/reset(?:s)? (?:at|on)\s*:?\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/i);
+  if (at) { const d = new Date(at[1].replace(" ", "T")); if (!isNaN(+d)) return d; }
+  const epoch = e.match(/limit reached\|(\d{10})/i);
+  if (epoch) return new Date(Number(epoch[1]) * 1000);
+  const rel = e.match(/(?:try again|retry|reset(?:s)?) in (?:about )?(\d+(?:\.\d+)?)\s*(h|hours?|m|min(?:ute)?s?|s|sec(?:ond)?s?)\b/i);
+  if (rel) { const n = Number(rel[1]); const unit = rel[2][0].toLowerCase(); return new Date(+failedAt + n * (unit === "h" ? 3_600_000 : unit === "m" ? 60_000 : 1000)); }
+  return new Date(+failedAt + 15 * 60_000);
+}
+
 export class Work {
   private store: Store;
   private runtime: Runtime;
@@ -259,6 +276,8 @@ export class Work {
       pr: i.pr && p?.repo ? { ...i.pr, url: `https://github.com/${p.repo.fullName}/pull/${i.pr.number}` } : i.pr,
       comments: this.comments(i.id).filter((c) => c.kind !== "system").length,
       runs: runs.length, activeRuns: runs.filter((r) => !TERMINAL.has(r.status)).length, failStreak: this.failStreak(i, runs),
+      /** 上次运行因额度用完失败：预计恢复时间（之后哨兵自动续跑） */
+      quotaUntil: last?.status === "failed" && i.status === "todo" ? quotaReset(last.error, new Date(last.updatedAt))?.toISOString() ?? null : null,
       /** 运行已提交但还在等并发槽位 */
       queued: !!last && last.status === "pending",
       lastRun: last ? { id: last.id, status: last.status === "pending" ? "running" : last.status, error: last.error, agent: last.agent, startedAt: last.createdAt } : null,
@@ -1129,7 +1148,8 @@ export class Work {
     let n = 0;
     for (const r of [...runs].reverse()) {
       if (r.status === "completed") { if (n === 0 && !i.lifecycleDone) n = 1; break; }
-      if (r.status === "failed" && /interrupted by service restart/.test(r.error ?? "")) continue;
+      // 服务重启中断、额度用完都不是工作项本身的问题，不算失败
+      if (r.status === "failed" && (/interrupted by service restart/.test(r.error ?? "") || quotaReset(r.error))) continue;
       if (TERMINAL.has(r.status)) n++;
     }
     return n;
@@ -1442,7 +1462,11 @@ export class Work {
       if (task.status !== "cancelled" && act) i.resumeFrom = resumePoint(act.phase);
       i.phase = null;
       i.blocked = null;
-      const msg = task.status === "cancelled" ? "■ 运行已停止。可修改后重新运行。" : task.status === "completed" ? "✕ 智能体没有走完生命周期就结束了。可重新运行。" : `✕ 运行失败：${task.error}。可修改后重新运行。`;
+      const quota = task.status === "failed" ? quotaReset(task.error) : null;
+      const at = quota ? quota.toLocaleString("zh-CN", { hour12: false, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+      const msg = task.status === "cancelled" ? "■ 运行已停止。可修改后重新运行。" : task.status === "completed" ? "✕ 智能体没有走完生命周期就结束了。可重新运行。"
+        : quota ? `⏸ ${task.agent} 所用模型的额度用完了（${(task.error ?? "").slice(0, 160)}）。预计 ${at} 恢复，届时哨兵会从「${i.resumeFrom ? PHASE_LABEL[i.resumeFrom] ?? i.resumeFrom : "开头"}」自动继续，不消耗轮次；着急的话可以把这个智能体换个模型或底座后点重新运行。`
+        : `✕ 运行失败：${task.error}。可修改后重新运行。`;
       this.addComment(i.id, "system", "system", msg, task.id);
       if (i.status === "in_progress") i.status = "todo";
       this.save(i);

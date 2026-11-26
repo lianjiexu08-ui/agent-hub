@@ -65,3 +65,16 @@ test("自动重试上限按连续失败次数：跑过很多轮的工作项，�
   await auto.sentinel();
   assert.deepEqual(acts.filter((a) => a.startsWith("retry")), ["retry S2T-19"], "连续失败 2 次的不再自动重试");
 });
+
+test("额度用完：恢复时间之前不重试，到点后重试", async () => {
+  const issues = [
+    { key: "S2T-12", status: "todo", priority: 1, runs: 3, failStreak: 0, lastRun: { id: "q1", status: "failed", error: "Usage limit reached" }, resumeFrom: "do", quotaUntil: new Date(Date.now() + 600_000).toISOString() },
+    { key: "S2T-13", status: "todo", priority: 1, runs: 3, failStreak: 0, lastRun: { id: "q2", status: "failed", error: "Usage limit reached" }, resumeFrom: "do", quotaUntil: new Date(Date.now() - 1000).toISOString() },
+  ];
+  const { auto, acts } = setup({ phaseMin: 0, idleMin: 0 }, issues);
+  await auto.sentinel();
+  assert.deepEqual(acts.filter((a) => a.startsWith("retry")), ["retry S2T-13"]);
+  issues[0].quotaUntil = new Date(Date.now() - 1000).toISOString();
+  await auto.sentinel();
+  assert.deepEqual(acts.filter((a) => a.startsWith("retry")), ["retry S2T-13", "retry S2T-12"], "到点后补上");
+});
