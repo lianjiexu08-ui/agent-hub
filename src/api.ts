@@ -55,6 +55,8 @@ export function buildApi(s: Services) {
     providerPresets: PRESETS,
     restartPending: s.restartState?.() ?? null,
     concurrency: { ...s.runtime.concurrency(), cli: (s.runtime.cli as { stats?: () => unknown } | null)?.stats?.() ?? {} },
+    /** 暂时用不了、兜底时会避开的底座 + 模型 */
+    modelsDown: s.runtime.downList(),
   });
 
   const saveAgent = (a: Record<string, unknown>, orig?: string | null) => {

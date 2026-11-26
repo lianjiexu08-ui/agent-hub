@@ -1895,7 +1895,7 @@ const settings = {
   patch(p = {}) {
     Object.assign(S.settings, p);
     const x = S.settings;
-    return act("settings.patch", { defaultModel: x.defaultModel, defaultEffort: x.defaultEffort, models: x.models, runtimes: x.runtimes, budget: x.budget, guard: x.guard, notify: x.notify, qa: x.qa, concurrency: x.concurrency }).catch(fail);
+    return act("settings.patch", { defaultModel: x.defaultModel, defaultEffort: x.defaultEffort, models: x.models, runtimes: x.runtimes, budget: x.budget, guard: x.guard, notify: x.notify, qa: x.qa, concurrency: x.concurrency, fallback: x.fallback }).catch(fail);
   },
   verifyProvider: (id, f) => act("settings.verifyProvider", id ?? null, f),
   removeProvider: (id) => act("settings.removeProvider", id),
@@ -3823,11 +3823,48 @@ function runtimesSection(customService) {
       h("b", { style: "font-size:13px" }, "运行底座"),
       h("span", { class: "muted", style: "font-size:12.5px" }, "已安装的直接可用；智能体选用哪个底座，就用哪个底座的模型")),
     h("div", {}, RUNTIME_DEFS.map(card)),
+    fallbackBlock(),
     h("div", { style: "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:16px 0 6px" },
       h("b", { style: "font-size:13px" }, "自定义模型服务"),
       h("span", { class: "muted", style: "font-size:12.5px" }, "没有可用底座、或想用别的服务商时在这里配置；内置运行底座的智能体使用这里的模型")),
     customService);
 }
+
+/** 兜底换模型 + 按厂商限并发（CLI 底座） */
+function fallbackBlock() {
+  const S = settings.get();
+  S.fallback ??= { on: true, chain: [] };
+  const F = S.fallback;
+  const toLines = () => F.chain.map((c) => `${c.runtime} ${c.model}`.trim()).join("\n");
+  const chain = h("textarea", { rows: 4, style: "max-width:420px;font-family:var(--mono, monospace);font-size:12.5px", placeholder: "每行：底座 模型（模型留空 = 该 CLI 默认）\npi zai/glm-5.4\npi kimi-coding/k3.1-pro\nclaude-code" });
+  chain.value = toLines();
+  chain.onchange = () => {
+    F.chain = chain.value.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => { const [runtime, ...m] = l.split(/\s+/); return { runtime, model: m.join(" ") }; });
+    settings.patch(); toast("兜底顺序已保存", "ok");
+  };
+  const caps = Object.entries(S.runtimes ?? {}).flatMap(([rt, c]) => Object.entries(c.providers ?? {}).map(([p, n]) => `${rt} ${p} ${n}`));
+  const capEl = h("textarea", { rows: 2, style: "max-width:420px;font-family:var(--mono, monospace);font-size:12.5px", placeholder: "每行：底座 厂商 并发数，如\npi kimi-coding 2" });
+  capEl.value = caps.join("\n");
+  capEl.onchange = () => {
+    for (const c of Object.values(S.runtimes ?? {})) delete c.providers;
+    for (const l of capEl.value.split("\n").map((x) => x.trim()).filter(Boolean)) {
+      const [rt, p, n] = l.split(/\s+/);
+      if (!rt || !p || !(Number(n) > 0)) return toast(`格式不对：${l}`, "err");
+      const c = rtCfg(rt); (c.providers ??= {})[p] = Number(n);
+    }
+    settings.patch(); toast("厂商并发上限已保存", "ok");
+  };
+  const down = (S_STATE_DOWN() ?? []).map((d) => `${d.key.replace("|", " ")}（到 ${new Date(d.until).toLocaleTimeString()}）`);
+  return h("div", { style: "margin:16px 0 6px" },
+    h("div", { style: "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:6px" },
+      h("b", { style: "font-size:13px" }, "兜底换模型"),
+      h("span", { class: "muted", style: "font-size:12.5px" }, "智能体的模型用不了（额度用完、并发超限、鉴权失败、厂商故障）时，按下面的顺序换成下一个能用的继续这一步，并在工作项里留言")),
+    h("div", { class: "checks" }, checkboxP(F.on, (on) => { F.on = on; settings.patch(); }, "开启兜底", "关闭后模型用不了就直接失败，等额度恢复后再续跑")),
+    field("兜底顺序", chain, "从上到下依次尝试，跳过智能体自己正在用的那个；用不了的模型会暂时避开（额度按恢复时间，并发超限 2 分钟，鉴权失败 30 分钟）"),
+    field("按厂商限并发", capEl, "同一底座下不同厂商的并发上限可以单独设（模型名「/」前的部分）。例如 Kimi 订阅只允许少量并发请求"),
+    down.length ? h("div", { class: "warn", style: "font-size:12.5px" }, `暂时避开：${down.join("、")}`) : null);
+}
+const S_STATE_DOWN = () => S.modelsDown;
 
 /** 智能体编辑：运行底座选择 + 对应的模型设置 */
 function runtimePicker(d) {
