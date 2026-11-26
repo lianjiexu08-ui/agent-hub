@@ -167,6 +167,12 @@ export class CliRunner implements CliExecutor {
     return n;
   }
 
+  busy(rt: string, model: string) {
+    const s = this.settings.get().runtimes[rt];
+    const provider = model.includes("/") ? model.split("/")[0] : "";
+    const full = (key: string, limit: number) => { const x = this.slots.get(key); return !!x && (x.running >= Math.max(1, limit) || x.waiting > 0); };
+    return full(rt, s?.max || 1) || (!!provider && !!s?.providers?.[provider] && full(`${rt}:${provider}`, s.providers[provider]));
+  }
   /** 兜底顺序：智能体自己的模型之后，依次可换的底座和模型（底座要已配置启动命令） */
   fallbacks(agent: Agent): { runtime: string; model: string }[] {
     const s = this.settings.get();

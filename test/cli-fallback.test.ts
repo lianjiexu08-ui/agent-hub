@@ -80,3 +80,14 @@ test("用不了的模型记下来：重启后仍然避开；同一个模型只�
   await again.waitFor(again.submit("backend-dev", "C").id);
   assert.deepEqual(s.calls.slice(before).map((c) => c.model), ["zai/glm-5.4"], "重启后直接走兜底");
 });
+
+test("兜底时挑有空位的：下一个候选满载就用再下一个；自己的模型满了照常排队", async () => {
+  const s = setup((m) => (m.startsWith("kimi") ? KIMI_BUSY : null));
+  s.cli.busy = (rt, m) => rt === "pi" && m === "zai/glm-5.4";
+  const a = await s.runtime.waitFor(s.runtime.submit("backend-dev", "A").id);
+  assert.equal(a.result, "claude-code:", "GLM 满载，直接用空闲的 Claude Code");
+  const own = setup(() => null);
+  own.cli.busy = () => true;
+  const b = await own.runtime.waitFor(own.runtime.submit("backend-dev", "B").id);
+  assert.equal(b.result, "pi:kimi-coding/k3.1-pro", "自己的模型能用就用，满了排队而不是换");
+});

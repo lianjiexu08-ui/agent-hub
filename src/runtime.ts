@@ -23,6 +23,8 @@ import { backoffMs, downUntil, isTransientError, providerDown, sleep } from "./t
 export interface CliExecutor {
   /** 取得该运行底座的一个进程槽位（超过并发上限时按优先级排队） */
   acquire?(runtime: string, priority: number, signal: AbortSignal, model?: string): Promise<() => void>;
+  /** 这个底座 + 模型现在是否已经满载（再来的任务要排队） */
+  busy?(runtime: string, model: string): boolean;
   /** 兜底：智能体配置的模型用不了时，依次可换的底座和模型 */
   fallbacks?(agent: Agent): { runtime: string; model: string }[];
   run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; /** 运行中的对话记录（增量，给界面实时看） */ progress?: (transcript: BetaMessageParam[]) => void; /** 不续原来的会话（兜底换了底座） */ fresh?: boolean }): Promise<{ result: string; cost?: number; inputTokens?: number; outputTokens?: number; transcript?: BetaMessageParam[] }>;
@@ -198,7 +200,10 @@ export class Runtime {
   /** 这个智能体这次该用哪个底座和模型：自己的不可用时，取兜底链里第一个可用的 */
   private routeCli(agent: Agent, tried: Set<string> = new Set()): Agent | null {
     const cands = [{ runtime: agent.runtime, model: agent.cliModel }, ...(this.cli?.fallbacks?.(agent) ?? [])];
-    const ok = cands.find((c) => !tried.has(`${c.runtime}|${c.model}`) && !this.isDown(c.runtime, c.model));
+    const usable = cands.filter((c) => !tried.has(`${c.runtime}|${c.model}`) && !this.isDown(c.runtime, c.model));
+    // 自己的模型能用就用（满了就排队）；已经在兜底时，优先挑现在有空位的，都满了才排第一个的队
+    const own = usable[0] && usable[0].runtime === agent.runtime && usable[0].model === agent.cliModel ? usable[0] : null;
+    const ok = own ?? usable.find((c) => !this.cli?.busy?.(c.runtime, c.model)) ?? usable[0];
     return ok ? { ...agent, runtime: ok.runtime, cliModel: ok.model } : null;
   }
   /** 查看暂时避开的模型（界面 / 调试用） */
