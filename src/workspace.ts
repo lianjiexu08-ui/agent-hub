@@ -22,9 +22,16 @@ export const WORKSPACE_TOOLS = ["read_file", "write_file", "list_files", "search
 const GENERATED = [/(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|uv\.lock|poetry\.lock|Pipfile\.lock|pdm\.lock|Cargo\.lock|go\.sum|composer\.lock|Gemfile\.lock)$/, /\.min\.(js|css)$/, /\.(js|css)\.map$/];
 export const isGeneratedFile = (path: string) => GENERATED.some((re) => re.test(path));
 
-/** 解析 `git diff --numstat`：分开统计需要评审的改动与生成文件（二进制文件记为 0 行） */
-export function diffStat(numstat: string): { files: number; additions: number; deletions: number; generated: { files: number; lines: number } } {
-  const out = { files: 0, additions: 0, deletions: 0, generated: { files: 0, lines: 0 } };
+/** 测试代码：测试目录（__tests__ / tests / test / spec / e2e）和 *.test.* / *.spec.* / test_*.py / *_test.go 等 */
+const TESTS = [/(^|\/)(__tests__|__mocks__|tests?|specs?|e2e|cypress|playwright)\//, /\.(test|spec|e2e)\.[cm]?[jt]sx?$/, /(^|\/)test_[^/]+\.py$/, /_test\.(py|go)$/, /(^|\/)conftest\.py$/];
+export const isTestFile = (path: string) => TESTS.some((re) => re.test(path));
+
+/**
+ * 解析 `git diff --numstat`：分开统计需要评审的改动与生成文件（二进制文件记为 0 行）。
+ * 测试代码计入 additions / deletions，另在 tests 里单独统计（安全护栏的行数上限不算测试，测试写得充分不该被拦）。
+ */
+export function diffStat(numstat: string): { files: number; additions: number; deletions: number; generated: { files: number; lines: number }; tests: { files: number; lines: number } } {
+  const out = { files: 0, additions: 0, deletions: 0, generated: { files: 0, lines: 0 }, tests: { files: 0, lines: 0 } };
   for (const line of numstat.split("\n")) {
     const m = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(line.trim());
     if (!m) continue;
@@ -34,7 +41,10 @@ export function diffStat(numstat: string): { files: number; additions: number; d
     const path = m[3].replace(/\{[^}]*=> ([^}]*)\}/, "$1").replace(/^.* => /, "");
     out.files++;
     if (isGeneratedFile(path)) { out.generated.files++; out.generated.lines += add + del; }
-    else { out.additions += add; out.deletions += del; }
+    else {
+      out.additions += add; out.deletions += del;
+      if (isTestFile(path)) { out.tests.files++; out.tests.lines += add + del; }
+    }
   }
   return out;
 }

@@ -33,7 +33,7 @@ const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const now = () => new Date().toISOString();
 
 export interface PhaseRec { cycle: number; phase: Phase; result: "active" | "pass" | "fail" | "blocked" | "cancelled"; note: string; startedAt: string; endedAt: string | null; qaRun?: string }
-export interface PR { number: number; branch: string; state: "open" | "merged" | "closed" | "reverted"; checks: "pending" | "passing" | "failing"; tests: string | null; additions: number; deletions: number; /** GitHub 上的真实 CI 结果（PR 最新提交） */ ci?: CiStatus | null; /** 锁文件等生成文件的改动（不计入 additions / deletions） */ generated?: { files: number; lines: number }; files: number; reviewed?: boolean; guard?: string | null; mergedAt?: string; revert?: number; simulated?: boolean }
+export interface PR { number: number; branch: string; state: "open" | "merged" | "closed" | "reverted"; checks: "pending" | "passing" | "failing"; tests: string | null; additions: number; deletions: number; /** GitHub 上的真实 CI 结果（PR 最新提交） */ ci?: CiStatus | null; /** 锁文件等生成文件的改动（不计入 additions / deletions） */ generated?: { files: number; lines: number }; /** 其中测试代码的改动（计入 additions / deletions，但不计入护栏的行数上限） */ testLines?: { files: number; lines: number }; files: number; reviewed?: boolean; guard?: string | null; mergedAt?: string; revert?: number; simulated?: boolean }
 export interface Issue {
   id: number; projectId: string; number: number; title: string; description: string; status: string; priority: number;
   assignee: string | null; labels: string[]; parentId: number | null; createdBy: string; createdAt: string; updatedAt: string;
@@ -1417,9 +1417,9 @@ export class Work {
       if (!res) return null;
       if ("conflict" in res && res.conflict) return { conflict: res.conflict };
       const pr = i.pr?.state === "open" ? i.pr : await this.github.createPR(p.repo!.fullName, { title: `${this.key(i)}: ${i.title}`, head: res.branch, base: p.repo!.defaultBranch ?? "main", body: `${i.description}\n\n${i.github ? `Closes #${i.github.number}` : ""}` }).then((r) => ({ number: r.number, branch: res.branch, state: "open" as const, checks: "pending" as const, tests: null, additions: res.additions, deletions: res.deletions, files: res.files }));
-      i.pr = { ...pr, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated };
+      i.pr = { ...pr, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated, testLines: res.tests };
       this.save(i);
-      this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch}），+${res.additions} −${res.deletions}，${res.files} 个文件${res.generated.lines ? `（其中 ${res.generated.files} 个锁文件 / 生成文件共 ${res.generated.lines} 行，不计入改动行数）` : ""}`);
+      this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch}），+${res.additions} −${res.deletions}，${res.files} 个文件${res.generated.lines ? `（其中 ${res.generated.files} 个锁文件 / 生成文件共 ${res.generated.lines} 行，不计入改动行数）` : ""}${res.tests.lines ? `，其中测试 ${res.tests.lines} 行` : ""}`);
       return `已提交 PR #${i.pr.number}。`;
     }
     if (this.simulate && p.repo && (["developer", "frontend-dev", "backend-dev", "devops"].includes(task.agent) || i.labels.includes("bug")) && !i.pr) {
@@ -1619,8 +1619,10 @@ export class Work {
     if (G.requireTests && i.pr.checks === "failing") return "测试未通过";
     if (G.requireTests && i.pr.ci?.state === "failing") return `CI 未通过（${i.pr.ci.failed.join("、")}）`;
     if (G.requireTests && i.pr.ci?.state === "pending") return `CI 还没跑完（${i.pr.ci.pending.join("、")}），等它结束后再合并`;
-    const n = i.pr.additions + i.pr.deletions;
-    if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行，超过自动合并上限 ${G.maxDiff} 行`;
+    // 行数上限只算要人评审的业务代码：锁文件 / 生成文件本来就不在 additions 里，测试代码在这里扣掉
+    const tests = i.pr.testLines?.lines ?? 0;
+    const n = i.pr.additions + i.pr.deletions - tests;
+    if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行${tests ? `（不含测试 ${tests} 行）` : ""}，超过自动合并上限 ${G.maxDiff} 行`;
     const p = this.proj(i.projectId)!;
     let files: string[] = [];
     if (!i.pr.simulated && this.github.available() && p.repo) files = await this.github.prFiles(p.repo.fullName, i.pr.number).catch(() => []);
