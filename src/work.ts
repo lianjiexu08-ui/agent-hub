@@ -240,6 +240,12 @@ export class Work {
     runtime.setHooks({
       continuation: (task) => this.continuation(task),
       systemExtra: (task, agent) => this.systemExtra(task, agent),
+      modelDown: (key, reason, until) => {
+        // 鉴权失败、余额不足这类不会自己恢复，要人去处理：主动通知
+        if (!/\b(401|403)\b|unauthori[sz]ed|authentication|身份验证|invalid.{0,20}api.?key|api.?key.{0,20}invalid|not logged in|login|credit balance|余额/i.test(reason) || /concurren(?:t|cy)/i.test(reason)) return;
+        const [rt, model] = key.split("|");
+        this.notify.push("budget", `模型 ${model || rt} 无法使用，需要你处理`, `${rt}${model ? ` ${model}` : ""} 报错：${reason.slice(0, 200)}。看起来是密钥失效、未登录或余额不足，请重新配置。在 ${new Date(until).toLocaleTimeString()} 之前，用到它的智能体会自动改用兜底链里的其他模型。`, null);
+      },
       fallback: (task, from, to, reason) => {
         const root = task.parentId ? this.store.getTask(task.rootId) ?? task : task;
         const i = root.issueId != null ? this.getIssue(root.issueId) : null;

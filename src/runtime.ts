@@ -33,6 +33,8 @@ export interface RuntimeHooks {
   continuation?(task: Task, finalText: string): string | null;
   /** 追加到系统提示词的内容（技能目录等） */
   systemExtra?(task: Task, agent: Agent): string;
+  /** 某个底座 + 模型被判为暂时用不了（until 之前避开）；鉴权类问题要人处理 */
+  modelDown?(key: string, reason: string, until: number): void;
   /** CLI 底座兜底换了模型（from → to），reason 是原来那个的报错 */
   fallback?(task: Task, from: string, to: string, reason: string): void;
 }
@@ -85,6 +87,7 @@ export class Runtime {
     this.mcp = mcp;
     this.modelLimit = opts.maxConcurrency;
     this.sem = new PrioritySlots(() => this.modelLimit);
+    for (const [k, t] of store.docGet<{ list: [string, number][] }>("meta", "modelsDown")?.list ?? []) if (t > Date.now()) this.down.set(k, t);
     this.events.setMaxListeners(0);
   }
 
@@ -184,6 +187,14 @@ export class Runtime {
   /** 暂时用不了的底座 + 模型（runtime|model）→ 到什么时候之前不再派活 */
   private down = new Map<string, number>();
   private isDown(runtime: string, model: string) { const t = this.down.get(`${runtime}|${model}`); return !!t && t > Date.now(); }
+  /** 记下暂时用不了的模型并持久化（重启后仍然避开，不必每个任务再先失败一次） */
+  private markDown(key: string, reason: string) {
+    const until = downUntil(reason);
+    const known = this.down.get(key) ?? 0;
+    this.down.set(key, until);
+    this.store.docPut("meta", "modelsDown", { id: "modelsDown", list: [...this.down].filter(([, t]) => t > Date.now()) });
+    if (known <= Date.now()) this.hooks.modelDown?.(key, reason, until); // 只在新判定时通知一次
+  }
   /** 这个智能体这次该用哪个底座和模型：自己的不可用时，取兜底链里第一个可用的 */
   private routeCli(agent: Agent, tried: Set<string> = new Set()): Agent | null {
     const cands = [{ runtime: agent.runtime, model: agent.cliModel }, ...(this.cli?.fallbacks?.(agent) ?? [])];
@@ -362,7 +373,7 @@ export class Runtime {
           } catch (err) {
             const msg = describeError(err);
             if (controller.signal.aborted || !providerDown(msg)) throw err;
-            this.down.set(`${eff.runtime}|${eff.cliModel}`, downUntil(msg));
+            this.markDown(`${eff.runtime}|${eff.cliModel}`, msg);
             const next = this.routeCli(agent, tried);
             if (!next) throw err;
             // 换模型：放掉原来的槽位，按新底座 / 厂商重新排队

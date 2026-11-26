@@ -28,7 +28,7 @@ function setup(fail: (model: string, input: string) => string | null) {
   runtime.cli = cli;
   const notes: string[] = [];
   runtime.setHooks({ fallback: (_t, from, to) => notes.push(`${from} → ${to}`) });
-  return { runtime, calls, notes };
+  return { runtime, calls, notes, store, cli };
 }
 
 test("Kimi 并发超限：自动改用 GLM 跑完；随后的任务直接走 GLM", async () => {
@@ -65,4 +65,18 @@ test("任务本身的错误不换模型；全部不可用时照常失败", async
 test("providerDown 识别", () => {
   for (const e of [KIMI_BUSY, "429 Too Many Requests", "401 Unauthorized", "Invalid API key · Please run /login", "fetch failed"]) assert.ok(providerDown(e), e);
   for (const e of ["已进行 3 轮仍未通过", "需求不清楚", "agent backend-dev was deleted"]) assert.ok(!providerDown(e), e);
+});
+
+test("用不了的模型记下来：重启后仍然避开；同一个模型只通知一次", async () => {
+  const s = setup((m) => (m.startsWith("kimi") ? "401 Unauthorized: invalid api key" : null));
+  const downs: string[] = [];
+  s.runtime.setHooks({ modelDown: (k) => downs.push(k) });
+  await s.runtime.waitFor(s.runtime.submit("backend-dev", "A").id);
+  await s.runtime.waitFor(s.runtime.submit("backend-dev", "B").id);
+  assert.deepEqual(downs, ["pi|kimi-coding/k3.1-pro"], "冷却期内不重复通知");
+  const again = new Runtime(s.store, { create: async () => { throw new Error("x"); } }, { maxConcurrency: 4, maxDepth: 2, maxHops: 2 });
+  again.cli = s.cli;
+  const before = s.calls.length;
+  await again.waitFor(again.submit("backend-dev", "C").id);
+  assert.deepEqual(s.calls.slice(before).map((c) => c.model), ["zai/glm-5.4"], "重启后直接走兜底");
 });
