@@ -48,6 +48,8 @@ export interface Issue {
   dependsOn?: number[];
   /** 因基础设施原因（重启、运行失败、提前收工）中断时所在的阶段：下次运行从这里继续，不新开一轮 */
   resumeFrom?: Phase | null;
+  /** 因 CI 未通过被自动交回开发智能体的次数（上限 2） */
+  ciFixes?: number;
   /** 因与主干冲突被自动交回开发智能体的次数（上限 2） */
   mergeFixes?: number;
   /** 人已经批准合并（点了合并，只是因为冲突没合进去）：解决冲突后测试与 CI 通过就直接合并，不再要人二次审核 */
@@ -1479,6 +1481,14 @@ export class Work {
     // 人已批准过合并、这次只是解决了冲突：改动大小 / 受保护路径人已看过，不再拦；测试或 CI 失败仍然拦
     const approved = i.mergeApproved && gv && !/测试未通过|CI /.test(gv) ? i.mergeApproved : null;
     if (approved) gv = null;
+    // CI 没过多半是代码问题：交回开发智能体看日志修复（最多 2 次），而不是停在人这里
+    if (i.pr?.ci?.state === "failing" && await this.fixCiFailure(i, L.agent)) {
+      lines.push(`❌ CI 未通过（${i.pr.ci.failed.join("、")}），已交回 ${i.assignee} 查看日志并修复（第 ${i.ciFixes} 次），修好后重新走测试和评审。`);
+      this.addComment(i.id, L.agent, "lead", lines.join("\n"));
+      this.save(i);
+      this.emit("lead");
+      return;
+    }
     if (gv) {
       i.pr!.guard = gv;
       lines.push(`🛡 安全护栏：${gv}。未自动合并，需要你确认后合并 PR #${i.pr!.number}。`);
@@ -1560,6 +1570,23 @@ export class Work {
         await new Promise((r) => setTimeout(r, everyMs));
       }
     } finally { this.waitingCi.delete(i.id); }
+  }
+
+  /** CI 未通过：交回开发智能体修复（从执行阶段继续），最多 2 次，再失败交给人。返回是否已安排 */
+  private async fixCiFailure(i: Issue, by: string): Promise<boolean> {
+    if (!i.assignee || !i.pr?.ci || (i.ciFixes ?? 0) >= 2) return false;
+    const ci = i.pr.ci;
+    i.ciFixes = (i.ciFixes ?? 0) + 1;
+    i.status = "todo";
+    i.lifecycleDone = false;
+    i.resumeFrom = "do";
+    this.save(i);
+    const links = (ci.failedUrls ?? []).map((u) => `- ${u}`).join("\n");
+    this.addComment(i.id, by, "lead", `PR #${i.pr.number} 的 CI 没有通过：${ci.failed.join("、")}（提交 ${ci.sha.slice(0, 7)}）。\n${links ? `${links}\n` : ""}请先查看失败日志（例如 \`gh run view --log-failed\` 或打开上面的链接），在工作目录里复现并修复，确认相关测试通过后照常提交；其余工作已完成，不必重做。`);
+    await this.syncStatusRemote(i).catch(() => []);
+    this.emit("issue");
+    void this.startRun(this.getIssue(i.id)!, by);
+    return true;
   }
 
   private async guardCheck(i: Issue): Promise<string | null> {

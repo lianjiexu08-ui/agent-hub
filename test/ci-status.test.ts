@@ -147,3 +147,50 @@ test("等 CI 期间：进度实时写进 PR，工作项不出现在「需要你�
     assert.equal(work.attention().length, 1, "等完恢复");
   } finally { srv.close(); }
 });
+
+test("CI 未通过：交回开发智能体修复（附失败 job 链接），最多 2 次，之后交给人", async () => {
+  const srv = createServer((req, res) => {
+    const send = (d: unknown) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(d)); };
+    const url = req.url ?? "";
+    if (url === "/repos/x/y") return send({ full_name: "x/y", default_branch: "main" });
+    if (url === "/repos/x/y/pulls/35") return send({ merge_commit_sha: null, base: { ref: "main" }, head: { sha: "bad5eed" } });
+    if (url.includes("/check-runs")) return send({ check_runs: [{ name: "compose smoke", status: "completed", conclusion: "failure", html_url: "https://github.com/x/y/actions/runs/1/job/2" }] });
+    if (url.endsWith("/files")) return send([]);
+    res.statusCode = 404; send({});
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    const store = new Store(":memory:");
+    store.upsertAgent((await import("../src/types.ts")).AgentSchema.parse({ name: "backend-dev", description: "d" }));
+    const settings = new Settings(store);
+    const runtime = new Runtime(store, simulatedLLM({ delayMs: [300, 400] }), { maxConcurrency: 2, maxDepth: 1, maxHops: 1 });
+    const github = new GitHub(() => "tok", `http://127.0.0.1:${(srv.address() as { port: number }).port}`);
+    const work = new Work(store, runtime, { notify: new Notifier(store, () => settings.get().notify), settings, github, linear: new Linear(() => null), workspace: new Workspace("/tmp/agent-hub-test-ws", () => null), simulate: false });
+    const p = work.saveProject({ name: "演示", key: "CF" });
+    await work.connectRepo(p.id, "x/y");
+    work.setLead(p.id, { mode: "on_demand", mergePolicy: "auto" });
+    const v = await work.create({ projectId: p.id, title: "并发上限", status: "backlog" });
+    const deliver = async () => {
+      for (const t of store.listTasks({ status: "running" })) runtime.cancel(t.id);
+      const i = work.find(v.key);
+      Object.assign(i, { status: "in_review", assignee: "backend-dev", lifecycleDone: true, pr: { number: 35, branch: "agent/cf-1", state: "open", checks: "passing", tests: "3/3", additions: 10, deletions: 0, files: 1, ci: { state: "failing", sha: "bad5eed", failed: ["compose smoke"], pending: [], checkedAt: new Date().toISOString(), failedUrls: ["https://github.com/x/y/actions/runs/1/job/2"] } } });
+      store.docPut("issues", i.id, i);
+      await work["afterDeliver"](work.find(v.key));
+    };
+    await deliver();
+    const after1 = work.find(v.key);
+    assert.equal(after1.ciFixes, 1);
+    assert.equal(after1.pr!.guard ?? null, null, "交回修复，不挂护栏等人");
+    const bodies = () => work.detail(v.key).activity.map((c) => c.body).join("\n");
+    assert.match(bodies(), /CI 没有通过：compose smoke（提交 bad5eed）[\s\S]*actions\/runs\/1\/job\/2[\s\S]*gh run view --log-failed/);
+    assert.match(bodies(), /已交回 backend-dev 查看日志并修复（第 1 次）/);
+    await deliver();
+    assert.equal(work.find(v.key).ciFixes, 2);
+    await deliver();
+    const after3 = work.find(v.key);
+    assert.equal(after3.ciFixes, 2, "超过 2 次不再自动交回");
+    assert.match(after3.pr!.guard ?? "", /CI 未通过（compose smoke）/, "交给人");
+    assert.equal(after3.pr!.state, "open", "始终没有合并");
+    for (const t of store.listTasks({ status: "running" })) runtime.cancel(t.id);
+  } finally { srv.close(); }
+});

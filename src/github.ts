@@ -1,14 +1,16 @@
 /** GitHub REST 客户端（Personal Access Token）。Token 只保存在服务端。 */
 export interface GhIssue { number: number; title: string; body: string | null; state: string; state_reason?: string | null; labels: (string | { name: string })[]; pull_request?: unknown }
 
-export interface CiStatus { state: "passing" | "failing" | "pending" | "none" | "unknown"; sha: string; failed: string[]; pending: string[]; checkedAt: string; /** state = unknown 时读不到的原因 */ error?: string; /** 结果来自哪个接口 */ source?: "checks" | "actions" }
+export interface CiStatus { state: "passing" | "failing" | "pending" | "none" | "unknown"; sha: string; failed: string[]; pending: string[]; checkedAt: string; /** 失败 job 的页面链接（交回开发修复时附上） */ failedUrls?: string[]; /** state = unknown 时读不到的原因 */ error?: string; /** 结果来自哪个接口 */ source?: "checks" | "actions" }
 /** 汇总 check runs：cancelled / timed_out / action_required 也算失败（需要人看） */
-export function summarizeChecks(sha: string, runs: { name: string; status: string; conclusion: string | null }[]): CiStatus {
+export function summarizeChecks(sha: string, runs: { name: string; status: string; conclusion: string | null; html_url?: string }[]): CiStatus {
   const ok = new Set(["success", "neutral", "skipped"]);
-  const failed = runs.filter((r) => r.status === "completed" && !ok.has(r.conclusion ?? "")).map((r) => r.name);
+  const bad = runs.filter((r) => r.status === "completed" && !ok.has(r.conclusion ?? ""));
+  const failed = bad.map((r) => r.name);
+  const failedUrls = bad.map((r) => r.html_url).filter((u): u is string => !!u);
   const pending = runs.filter((r) => r.status !== "completed").map((r) => r.name);
   const state = !runs.length ? "none" : failed.length ? "failing" : pending.length ? "pending" : "passing";
-  return { state, sha, failed, pending, checkedAt: new Date().toISOString() };
+  return { state, sha, failed, pending, checkedAt: new Date().toISOString(), ...(failedUrls.length ? { failedUrls } : {}) };
 }
 
 export class GitHub {
@@ -107,7 +109,7 @@ export class GitHub {
   async ciStatus(full: string, n: number): Promise<CiStatus> {
     const { head } = await this.pr(full, n);
     try {
-      const d = await this.req<{ check_runs: { name: string; status: string; conclusion: string | null }[] }>("GET", `/repos/${full}/commits/${head.sha}/check-runs?per_page=100`);
+      const d = await this.req<{ check_runs: { name: string; status: string; conclusion: string | null; html_url?: string }[] }>("GET", `/repos/${full}/commits/${head.sha}/check-runs?per_page=100`);
       return { ...summarizeChecks(head.sha, d.check_runs), source: "checks" };
     } catch (e) {
       // 细粒度令牌读不了 check runs（403 Resource not accessible）：改读 GitHub Actions 的运行与 job（需要 Actions: Read）
@@ -117,9 +119,9 @@ export class GitHub {
     // 同一个工作流可能被重跑：每个工作流只看最新的一次
     const latest = new Map<string, { id: number; created_at: string }>();
     for (const r of runs.workflow_runs) { const cur = latest.get(r.name); if (!cur || r.created_at > cur.created_at) latest.set(r.name, r); }
-    const jobs: { name: string; status: string; conclusion: string | null }[] = [];
+    const jobs: { name: string; status: string; conclusion: string | null; html_url?: string }[] = [];
     for (const r of latest.values()) {
-      const d = await this.req<{ jobs: { name: string; status: string; conclusion: string | null }[] }>("GET", `/repos/${full}/actions/runs/${r.id}/jobs?per_page=100`);
+      const d = await this.req<{ jobs: { name: string; status: string; conclusion: string | null; html_url?: string }[] }>("GET", `/repos/${full}/actions/runs/${r.id}/jobs?per_page=100`);
       jobs.push(...d.jobs);
     }
     return { ...summarizeChecks(head.sha, jobs), source: "actions" };
