@@ -66,3 +66,14 @@ test("同步主干后 CI 不过：不合并，交回开发修复并保留批准"
     assert.ok(i.mergeApproved, "修好后直接合并");
   } finally { s.close(); }
 });
+
+test("交付收尾被重启打断（PR 开着、没审核完）：启动时重新收尾并合并", async () => {
+  const s = await scenario("success");
+  try {
+    const w = s.work as unknown as { find: (k: string) => { id: number; pr: { reviewed?: boolean } }; setLead: (p: string, l: object) => void; reconcile: () => void; list: () => { projectId: string }[] };
+    w.setLead(w.list()[0].projectId, { mode: "on_demand", mergePolicy: "auto" });
+    w.reconcile();
+    for (let t = 0; t < 100 && !s.calls.some((c) => c.startsWith("merge")); t++) await new Promise((r) => setTimeout(r, 50));
+    assert.ok(s.calls.some((c) => c.startsWith("merge")), s.calls.join(","));
+  } finally { s.close(); }
+});

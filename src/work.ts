@@ -1452,6 +1452,7 @@ export class Work {
     if (i.status === "todo" && last?.status === "failed" && (/interrupted by service restart|服务重启/.test(last.error ?? "") || isTransientError(last.error)))
       return { text: "等待续跑", tone: "wait", title: `${(last.error ?? "").slice(0, 200)}。不是需求或代码的问题，哨兵会自动从中断的阶段继续` };
     if (i.status === "todo" && last?.status === "failed") return { text: "上次失败", tone: "fail", title: last.error ?? "" };
+    if (i.status === "in_review" && this.waitingCi.has(i.id)) return { text: "等 CI", tone: "wait", title: `等 GitHub 上的 CI 跑完${i.pr?.ci?.pending?.length ? `（${i.pr.ci.pending.join("、")}）` : ""}，之后自动审核、合并` };
     if (i.status === "in_review" && i.pr?.guard && i.pr.state === "open") return { text: "等你确认合并", tone: "need", title: i.pr.guard };
     if (i.status === "in_review" && i.pr?.local === "local" && i.pr.state === "merged") return { text: "待提测", tone: "wait", title: "已合并本地开发分支，等人工提测" };
     if (i.status === "todo" && i.assignee && !last) return { text: "待开始", tone: "wait" };
@@ -2434,6 +2435,11 @@ export class Work {
   private reconcile() {
     for (const i of this.issues().filter((x) => x.status === "in_review" && x.lifecycleDone && !x.pr && !this.activeRun(x.id)))
       setImmediate(() => void this.missingPr(this.getIssue(i.id)!).catch(() => {}));
+    // 交付收尾（等 CI、审核、合并）做到一半被重启打断：PR 还开着、没被拦、也没审核完，重新做一遍收尾
+    for (const i of this.issues().filter((x) => x.status === "in_review" && x.lifecycleDone && x.pr?.state === "open" && !x.pr.guard && !x.pr.reviewed && (this.leadOf(x) || x.mergeApproved || x.labels.includes("hotfix")) && !this.activeRun(x.id))) {
+      this.addComment(i.id, "system", "system", "服务重启时交付收尾（等 CI、审核、合并）还没做完，重新进行");
+      setImmediate(() => void this.afterDeliver(this.getIssue(i.id)!).catch(() => {}));
+    }
     // 开启「资深评审代替人放行」之前就被护栏拦下的：按新规则再判断一次（测试 / CI 不过的不管）
     if (this.settings.guard().reviewer?.agent)
       for (const i of this.issues().filter((x) => x.status === "in_review" && x.pr?.state === "open" && x.pr.guard && !/测试未通过|CI /.test(x.pr.guard) && !x.seniorReviews && !this.activeRun(x.id)))
