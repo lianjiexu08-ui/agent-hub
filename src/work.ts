@@ -1637,6 +1637,20 @@ export class Work {
       ...(i.phase === "do" ? (() => { const f = this.testFailures(i).filter((x) => x.cycle === i.cycle).at(-1); return f ? ["", "这次返工要解决的测试失败（完整记录）：", f.report] : []; })() : []),
     ].join("\n");
   }
+  /** 每个运行已经转交到哪条留言（时间） */
+  private notesSeen = new Map<string, string>();
+  /**
+   * 运行期间新来的人工 / 负责人留言：智能体每次调用 Hub 工具时附在结果后面。
+   * 否则留言只在下次运行开始时才看得到——正在跑的智能体会按过时的指示一路做完。
+   */
+  private newNotes(task: Task): string {
+    if (task.issueId == null || task.parentId !== null) return "";
+    const since = this.notesSeen.get(task.id) ?? task.createdAt;
+    const fresh = this.comments(task.issueId).filter((c) => (c.kind === "user" || c.kind === "lead") && c.author !== task.agent && c.createdAt > since);
+    if (!fresh.length) return "";
+    this.notesSeen.set(task.id, fresh.at(-1)!.createdAt);
+    return `\n\n---\n📨 你运行期间工作项里有新留言，请据此调整接下来的做法（与之前的指示冲突时以这里为准）：\n${fresh.map((c) => `[${c.author}] ${c.body.slice(0, 2000)}`).join("\n\n")}`;
+  }
   /** CLI 底座询问这次运行用哪个会话 */
   sessionFor(task: Task): { id: string; resume: boolean } | null {
     if (task.issueId == null || task.parentId !== null || task.source !== "issue") return null;
@@ -2462,8 +2476,8 @@ export class Work {
       async (raw: unknown, ctx: { task: Task; agent: { name: string }; signal: AbortSignal }) => {
         const parsed = schema.safeParse(raw);
         if (!parsed.success) return { content: `参数不合法：${parsed.error.message}`, isError: true };
-        try { return { content: await fn(parsed.data, ctx.task, ctx.agent.name, ctx.signal) }; }
-        catch (err) { return { content: err instanceof Error ? err.message : String(err), isError: true }; }
+        try { return { content: (await fn(parsed.data, ctx.task, ctx.agent.name, ctx.signal)) + this.newNotes(ctx.task) }; }
+        catch (err) { return { content: (err instanceof Error ? err.message : String(err)) + this.newNotes(ctx.task), isError: true }; }
       };
     const isIssueRoot = (task: Task) => task.issueId != null && task.parentId === null && !!this.getIssue(task.issueId);
 
