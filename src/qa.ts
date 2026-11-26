@@ -171,6 +171,28 @@ export class QA implements QAPort {
       signal?.addEventListener("abort", () => { this.cancel(id); reject(new Error("已取消")); }, { once: true });
     });
   }
+  /**
+   * 一次验收的完整失败报告，交给开发智能体返工用：每条用例的结论、tester 的说明与复现、失败步骤的命令与报错、截图文件。
+   * 只给一句「x/y 通过」的话，智能体只能猜，常常修错地方。
+   */
+  failureReport(id: string, shotDir?: string): string {
+    const r = this.run(id);
+    if (!r) return "";
+    const ok = r.cases.filter((c) => c.status === "passed").length;
+    const lines = [`### 验收 ${r.id}（${r.trigger === "post-merge" ? "合并后的页面验收" : "交付后的验收"}）：${ok}/${r.cases.length} 通过`,
+      `环境：${r.env}${r.browser ? `，浏览器 ${r.browser}` : ""}${r.account ? `，测试账号 ${r.account}` : ""}${r.previewError ? `\n预览环境问题：${r.previewError.slice(0, 500)}` : ""}`];
+    for (const c of r.cases) {
+      if (c.status === "passed") { lines.push(`- ✓ ${c.id} ${c.title}`); continue; }
+      lines.push("", `#### ✕ ${c.id} ${c.title}（${c.status ?? "未执行"}）`);
+      if (c.note) lines.push(`tester 的结论与复现：\n${c.note.slice(0, 2500)}`);
+      const bad = c.steps.filter((st) => st.status === "failed");
+      if (bad.length) lines.push("失败的步骤：", ...bad.slice(0, 6).map((st) => `- \`${st.cmd.slice(0, 200)}\`${st.error ? `\n  报错：${st.error.slice(0, 600)}` : ""}`));
+      const shots = c.steps.filter((st) => st.shot).map((st) => st.shot!);
+      if (shots.length) lines.push(`截图：${shots.map((f) => (shotDir ? `${shotDir}/${f}` : f)).join("、")}`);
+    }
+    return lines.join("\n");
+  }
+
   private result(r: QARun) {
     const ok = r.cases.filter((c) => c.status === "passed").length;
     const bad = r.cases.find((c) => c.status === "failed");

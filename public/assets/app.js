@@ -642,6 +642,42 @@ function toast(msg, kind = "", opts = {}) {
 }
 const fail = (err) => toast(err.message || String(err), "err");
 
+/**
+ * 同一轮里的每次交付：执行 → 测试，测试不通过就再执行、再测试。按交付次数分块展示，
+ * 每块写清这次改了什么、测试结果、哪条没过；点测试结果打开那次验收的完整记录和截图。
+ * 重启、网络中断造成的中断记录不单列，折成一句。
+ */
+/** 去掉 Markdown 标记，用于一行摘要 */
+const plainMd = (t) => String(t ?? "").replace(/\*\*|__|`/g, "").replace(/^#+\s*/gm, "");
+function attemptsOf(d, cy) {
+  const recs = d.phases.filter((r) => r.cycle === cy && (r.phase === "do" || r.phase === "test"));
+  if (!recs.some((r) => r.phase === "test")) return null;
+  const blocks = [];
+  let cur = null;
+  for (const r of recs) {
+    if (r.phase === "do") {
+      if (r.result === "cancelled") { if (cur) cur.interrupts++; else (blocks.pre ??= 0, blocks.pre++); continue; }
+      if (!cur || cur.test) { cur = { dos: [], test: null, interrupts: 0 }; blocks.push(cur); }
+      cur.dos.push(r);
+    } else if (cur) cur.test = r;
+  }
+  if (!blocks.length) return null;
+  return h("div", { class: "attempts" }, blocks.map((b, n) => {
+    const done = b.dos.findLast((x) => x.result !== "active") ?? b.dos.at(-1);
+    const t = b.test;
+    const run = t?.qaRun ? qa.run(t.qaRun) : null;
+    const bad = run ? run.cases.filter((c) => c.status === "failed") : [];
+    return h("div", { class: "attempt " + (t ? t.result : "active") },
+      h("div", { class: "a-hd" }, h("b", {}, `第 ${n + 1} 次交付`),
+        t ? h("span", { class: t.result === "pass" ? "s-completed" : "warn", style: "font-size:12px" }, t.result === "pass" ? "测试通过" : "测试未通过")
+          : h("span", { class: "live" }, b.dos.some((x) => x.result === "active") ? "执行中" : "等测试"),
+        b.interrupts ? h("span", { class: "muted", style: "font-size:11.5px" }, `中途中断 ${b.interrupts} 次（重启 / 网络），已接着跑`) : null,
+        run ? h("a", { class: "link", style: "margin-left:auto;font-size:12px", onclick: () => openRun(run.id) }, `看验收记录与截图（${caseCount(run)}）→`) : null),
+      done?.note && done.result !== "active" ? h("div", { class: "a-note" }, h("span", { class: "muted" }, "执行："), short(done.note, 220)) : null,
+      bad.length ? h("ul", { class: "a-fails" }, bad.map((c) => h("li", {}, h("b", {}, `${c.id} `), short(plainMd(c.title), 90), c.note ? h("div", { class: "muted" }, short(plainMd(c.note), 260)) : null)))
+        : t && t.result === "fail" ? h("div", { class: "a-note warn" }, short(t.note, 260)) : null);
+  }));
+}
 /** 某一轮各阶段的状态：pass / fail / active / cancelled / pending */
 function cycleCells(i, cycle) {
   return PHASES.map((p) => {
@@ -948,11 +984,13 @@ async function renderDrawer(force = false) {
         return h("div", { class: "lc-cycle" },
           h("div", { class: "hd" }, h("b", { style: "color:var(--text)" }, `第 ${cy} 轮`),
             cy === d.cycle && d.phase ? h("span", { class: "live" }, "进行中") : failed ? h("span", { class: "warn" }, `${failed.phase.label}未通过`) : cells.every((c) => c.state === "pass") ? h("span", { class: "s-completed", style: "font-size:12px" }, "全部通过") : null),
-          h("div", { class: "grid5" }, cells.map((c) => h("div", {}, h("div", { class: "muted", style: "font-size:11.5px;margin-bottom:2px" }, c.phase.label), phaseCell(c)))));
+          h("div", { class: "grid5" }, cells.map((c) => h("div", {}, h("div", { class: "muted", style: "font-size:11.5px;margin-bottom:2px" }, c.phase.label), phaseCell(c)))),
+          attemptsOf(d, cy));
       }))] : null,
     prSection(d),
     (() => { const runs = qa.runsFor(d.key); return runs.length ? [h("div", { class: "section-title" }, `测试 ${runs.length}`),
-      runs.slice(0, 5).map((r) => h("div", { class: "run-row", onclick: () => openRun(r.id) }, runBadge2(r.status), h("span", {}, `用例 ${caseCount(r)}`),
+      runs.map((r) => h("div", { class: "run-row", onclick: () => openRun(r.id) }, runBadge2(r.status), h("span", {}, `用例 ${caseCount(r)}`),
+        h("span", { class: "tag" }, r.trigger === "post-merge" ? "合并后页面验收" : r.trigger === "manual" ? "手动重跑" : "交付验收"),
         h("span", { class: "muted", style: "font-size:12px" }, r.browser === "local" ? "远程 Chrome" : r.browser ? `浏览器 ${r.browser}` : r.env === "CI" ? "CI" : "排队中"),
         r.wait && r.status === "queued" ? h("span", { class: "muted", style: "font-size:12px" }, r.wait) : null, h("span", { class: "time" }, ago(r.endedAt ?? r.queuedAt))))] : null; })(),
     (() => { const q = assessRequirement(d); return h("div", { class: "section-title" }, "描述 · ", h("span", { class: "score " + (q.score >= 80 ? "hi" : q.score >= 60 ? "mid" : "lo"), title: q.dims.map((x) => `${x.ok ? "✓" : "✕"} ${x.name}`).join("\n") }, `需求评分 ${q.score}`),

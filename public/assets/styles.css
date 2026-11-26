@@ -800,3 +800,14 @@ select, textarea, input { border-radius: 8px; padding: 7px 10px; }
 .toast.link:hover { filter: brightness(1.04); box-shadow: var(--shadow-lg); }
 .toast .toast-go { margin-left: auto; font-size: 12px; opacity: .8; white-space: nowrap; text-decoration: underline; text-underline-offset: 2px; }
 .toasts .toast { pointer-events: auto; }
+
+/* 同一轮里的每次交付（执行 → 测试） */
+.attempts { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.attempt { border: 1px solid var(--border); border-left: 3px solid var(--border-strong, var(--border)); border-radius: 8px; padding: 8px 12px; font-size: 12.5px; background: var(--panel); }
+.attempt.fail { border-left-color: var(--failed); }
+.attempt.pass { border-left-color: var(--completed, #16a34a); }
+.attempt.active { border-left-color: var(--accent); }
+.attempt .a-hd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.attempt .a-note { color: var(--text); line-height: 1.6; margin-top: 2px; word-break: break-word; }
+.attempt .a-fails { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.attempt .a-fails .muted { font-size: 12px; line-height: 1.55; }

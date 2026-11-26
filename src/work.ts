@@ -193,6 +193,8 @@ export interface QAPort {
   enqueue(issue: ReturnType<Work["view"]>, trigger: string, opts?: { web?: boolean }): string;
   wait(runId: string, signal?: AbortSignal): Promise<{ passed: boolean; note: string; cases: number }>;
   runsFor(key: string): { id: string; status: string; cases: { status: string | null }[] }[];
+  /** 一次验收的完整失败报告（返工上下文） */
+  failureReport?(id: string, shotDir?: string): string;
 }
 
 export class Work {
@@ -1593,12 +1595,22 @@ export class Work {
     return task;
   }
 
+  /** 截图目录（由 index 注入），失败报告里给出可直接打开的路径 */
+  shotDir: string | undefined;
+  /** 这张单历次测试不通过的完整记录（按时间顺序） */
+  private testFailures(i: Issue): { cycle: number; run: string; report: string }[] {
+    return i.phases.filter((r) => r.phase === "test" && r.result === "fail" && r.qaRun)
+      .map((r) => ({ cycle: r.cycle, run: r.qaRun!, report: this.qa?.failureReport?.(r.qaRun!, this.shotDir) || r.note }));
+  }
+
   /** 带着原对话续跑时发的那一句：不重复整份需求，提醒它接着做、别重来 */
   private continueInput(i: Issue): string {
     return [
       `（运行被中断了——网络异常或服务重启，不是你的问题。上面是你之前的完整过程，工作目录里的改动都还在。）`,
       `请接着做 ${this.key(i)} 的「${PHASE_LABEL[i.phase ?? "understand"]}」阶段：先看一眼工作目录现状确认做到哪了，然后从中断的地方继续，不要重做已经完成的步骤。`,
       "阶段完成后照常调用 report_phase 汇报。",
+      // 正在返工：把最近一次测试失败的完整记录再给一遍（之前可能只拿到了一句总结）
+      ...(i.phase === "do" ? (() => { const f = this.testFailures(i).filter((x) => x.cycle === i.cycle).at(-1); return f ? ["", "这次返工要解决的测试失败（完整记录）：", f.report] : []; })() : []),
     ].join("\n");
   }
   /** CLI 底座询问这次运行用哪个会话 */
@@ -1643,6 +1655,8 @@ export class Work {
     const comments = this.comments(i.id).filter((c) => c.kind === "user" || c.kind === "lead").slice(-10);
     if (comments.length) parts.push(`## 讨论记录（较早 → 较新）\n${comments.map((c) => `[${c.author}] ${c.body.slice(0, 1500)}`).join("\n\n")}`);
     if (resume && i.phase) parts.push(`## 进度\n这是第 ${i.cycle} 轮，此前阶段的结论：\n${i.phases.filter((r) => r.cycle === i.cycle && r.result === "pass").map((r) => `- ${PHASE_LABEL[r.phase]}：${r.note}`).join("\n") || "（无）"}\n请从「${PHASE_LABEL[i.phase]}」阶段继续（工作目录里保留着之前的改动，先查看现状再接着做，不要从头重来）。`);
+    const fails = this.testFailures(i);
+    if (fails.length) parts.push(`## 之前测试未通过的记录（返工时务必逐条对照，不要重复之前的改法）\n${fails.map((x) => `第 ${x.cycle} 轮：\n${x.report}`).join("\n\n").slice(0, 12000)}`);
     parts.push(LIFECYCLE_GUIDE);
     return parts.join("\n\n");
   }
@@ -1741,11 +1755,18 @@ export class Work {
       if (res.passed) { this.enterPhase(cur, "review"); this.save(cur); this.emit("issue"); return `${prMsg ?? ""}测试通过：${res.note}。\n已进入「评审」阶段。${PHASE_HINT.review}`; }
       const fixes = cur.phases.filter((r) => r.cycle === cur.cycle && r.phase === "test" && r.result === "fail").length;
       if (fixes < MAX_FIXES) {
-        this.addComment(cur.id, "system", "system", `✕ 测试未通过：${res.note}。回到「执行」修复（本轮第 ${fixes} 次）`, task.id);
+        const report = this.qa.failureReport?.(t.qaRun!, this.shotDir) ?? res.note;
+        const earlier = this.testFailures(cur).filter((x) => x.run !== t.qaRun);
+        this.addComment(cur.id, "system", "system", `✕ 测试未通过，回到「执行」修复（本轮第 ${fixes} 次返工）\n\n${report}`, task.id);
         this.enterPhase(cur, "do");
         this.save(cur);
         this.emit("phase", { key, result: "fail", phase: "test" });
-        return `测试未通过：${res.note}\n请回到「执行」阶段修复这些问题，完成后再调用 report_phase(phase="do")。`;
+        return [
+          `测试未通过（本轮第 ${fixes} 次返工）。下面是这次验收的完整记录，先对照每条失败用例的复现步骤和报错找到原因，再改。截图是本地文件，可以直接打开看。`,
+          report,
+          earlier.length ? `\n## 之前几次也没通过（说明之前的修复没有解决这些，不要重复同样的改法）\n${earlier.map((x) => x.report).join("\n\n").slice(0, 8000)}` : "",
+          `\n修好后在本地把失败用例对应的场景自己跑一遍确认，再调用 report_phase(phase="do")。`,
+        ].filter(Boolean).join("\n\n");
       }
       return this.newRound(cur, task, `测试连续 ${fixes} 次未通过`);
     }
