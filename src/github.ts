@@ -101,6 +101,11 @@ export class GitHub {
   removeLabel(full: string, n: number, label: string) { return this.req("DELETE", `/repos/${full}/issues/${n}/labels/${encodeURIComponent(label)}`); }
   createPR(full: string, o: { title: string; head: string; base: string; body: string }) { return this.req<{ number: number }>("POST", `/repos/${full}/pulls`, o); }
   mergePR(full: string, n: number) { return this.req("PUT", `/repos/${full}/pulls/${n}/merge`, { merge_method: "squash" }); }
+  /** 仓库是否配置了 GitHub Actions 工作流 */
+  async hasWorkflows(full: string): Promise<boolean> {
+    const d = await this.req<{ total_count: number }>("GET", `/repos/${full}/actions/workflows?per_page=1`);
+    return (d.total_count ?? 0) > 0;
+  }
   /** base 比 head 多出几个提交（head 落后主干多少） */
   async behindBy(full: string, base: string, head: string): Promise<number> {
     const d = await this.req<{ behind_by: number }>("GET", `/repos/${full}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`);

@@ -16,8 +16,9 @@ import { Work } from "../src/work.ts";
 import { simulatedLLM } from "../src/simulate.ts";
 import { AgentSchema } from "../src/types.ts";
 
-async function scenario(afterSync: "success" | "failure") {
+async function scenario(afterSync: "success" | "failure", checksDelay = 0) {
   let head = "old0001";
+  let newChecks = 0;
   const calls: string[] = [];
   const srv = createServer((req, res) => {
     const send = (d: unknown, code = 200) => { res.statusCode = code; res.setHeader("content-type", "application/json"); res.end(JSON.stringify(d)); };
@@ -26,7 +27,12 @@ async function scenario(afterSync: "success" | "failure") {
     if (url === "/repos/x/y/pulls/40" && req.method === "GET") return send({ merge_commit_sha: null, base: { ref: "main" }, head: { sha: head } });
     if (url.startsWith("/repos/x/y/compare/")) return send({ behind_by: head === "old0001" ? 2 : 0 });
     if (url === "/repos/x/y/pulls/40/update-branch") { calls.push("update"); setTimeout(() => { head = "new0002"; }, 30); return send({ message: "Updating" }, 202); }
-    if (url.includes("/check-runs")) return send({ check_runs: [{ name: "backend", status: "completed", conclusion: url.includes("new0002") ? afterSync : "success" }] });
+    if (url.startsWith("/repos/x/y/actions/workflows")) return send({ total_count: 1 });
+    if (url.includes("/check-runs")) {
+      // GitHub 过一会儿才在新提交上建出检查
+      if (url.includes("new0002") && newChecks++ < checksDelay) return send({ check_runs: [] });
+      return send({ check_runs: [{ name: "backend", status: "completed", conclusion: url.includes("new0002") ? afterSync : "success" }] });
+    }
     if (url === "/repos/x/y/pulls/40/merge") { calls.push(`merge ${head}`); return send({ merged: true }); }
     send({}, 404);
   });
@@ -75,5 +81,13 @@ test("交付收尾被重启打断（PR 开着、没审核完）：启动时重�
     w.reconcile();
     for (let t = 0; t < 100 && !s.calls.some((c) => c.startsWith("merge")); t++) await new Promise((r) => setTimeout(r, 50));
     assert.ok(s.calls.some((c) => c.startsWith("merge")), s.calls.join(","));
+  } finally { s.close(); }
+});
+
+test("同步主干后检查还没建出来：不当成没有 CI，等它出来；失败就不合并", async () => {
+  const s = await scenario("failure", 3);
+  try {
+    await assert.rejects(s.work.mergePR(s.key), /合进 PR 后 CI 未通过（backend）/);
+    assert.deepEqual(s.calls, ["update"], "没有在检查出来之前合并");
   } finally { s.close(); }
 });

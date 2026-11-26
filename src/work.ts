@@ -126,6 +126,8 @@ export function flowOf(p: Pick<Project, "flow" | "linear">): Flow {
 }
 export interface Delivery { baseBranch: string; mode: "pr" | "branch" | "local"; localPath: string; afterMerge: string }
 export interface Project {
+  /** 这个仓库出现过 CI 检查（之后新提交上暂时没有检查时，当成还没开始而不是没有 CI） */
+  ciSeen?: boolean;
   id: string; name: string; key: string; description: string; createdAt: string; nextNumber: number;
   repo: { fullName: string; defaultBranch?: string } | null;
   sync: {
@@ -2110,6 +2112,9 @@ export class Work {
     if (!i.pr || i.pr.local || !p?.repo || !this.github.available()) return null;
     const t0 = Date.now();
     let last: CiStatus | null = null;
+    // 刚推送 / 刚同步主干时，GitHub 要过几秒到几十秒才在新提交上建出检查。这段时间查到的「没有任何检查」不等于仓库没有 CI：
+    // 仓库以前出现过 CI、或者配了 GitHub Actions 工作流，就把「没有检查」当成还没开始，继续等（最多 noneWaitMs）
+    let expectCi: boolean | null = null;
     // 等待期间：不进「需要你处理」（Hub 会自己处理），每次查到的进度写进 PR 给界面看
     this.waitingCi.add(i.id);
     try {
@@ -2119,6 +2124,13 @@ export class Work {
         const cur = this.getIssue(i.id);
         if (cur?.pr) { cur.pr.ci = last; this.save(cur); this.emit("issue"); }
         if (i.pr) i.pr.ci = last;
+        if (["passing", "failing", "pending"].includes(last.state) && !p.ciSeen) { const fresh = this.proj(p.id); if (fresh) { fresh.ciSeen = true; this.saveProj(fresh); } p.ciSeen = true; }
+        if (last.state === "none") {
+          expectCi ??= !!p.ciSeen || (await this.github.hasWorkflows(p.repo.fullName).catch(() => false));
+          if (expectCi && Date.now() - t0 < this.noneWaitMs) { await new Promise((r) => setTimeout(r, Math.min(everyMs, 10_000))); continue; }
+          if (expectCi) last = { ...last, state: "unknown", error: `仓库配置了 CI，但 ${Math.round(this.noneWaitMs / 60_000)} 分钟内这次提交上没有出现任何检查` };
+          return last;
+        }
         if (last.state !== "pending" || Date.now() - t0 >= timeoutMs) return last;
         await new Promise((r) => setTimeout(r, everyMs));
       }
@@ -2147,6 +2159,7 @@ export class Work {
     if (!i.pr) return null;
     if (G.requireTests && i.pr.checks === "failing") return "测试未通过";
     if (G.requireTests && i.pr.ci?.state === "failing") return `CI 未通过（${i.pr.ci.failed.join("、")}）`;
+    if (G.requireTests && i.pr.ci?.state === "unknown" && /没有出现任何检查/.test(i.pr.ci.error ?? "")) return `CI 没有运行（${i.pr.ci.error}）`;
     if (G.requireTests && i.pr.ci?.state === "pending") return `CI 还没跑完（${i.pr.ci.pending.join("、")}），等它结束后再合并`;
     // 行数上限只算要人评审的业务代码：锁文件 / 生成文件本来就不在 additions 里，测试代码在这里扣掉
     const tests = i.pr.testLines?.lines ?? 0;
@@ -2235,10 +2248,13 @@ export class Work {
     const ci = await this.waitCi(i, 20 * 60_000, this.syncPollMs * 15);
     if (i.pr) { i.pr.ci = ci; this.save(i); }
     if (ci?.state === "failing") throw new CiAfterSync(ci.failed);
+    if (ci?.state === "unknown" && /没有出现任何检查/.test(ci.error ?? "")) throw new Error(`同步主干后 ${ci.error}，没有合并，请到 GitHub 确认`);
     if (ci?.state === "pending") throw new Error(`同步主干后 CI 超过 20 分钟还没跑完（${ci.pending.join("、")}），稍后再合并`);
   }
   /** 测试里调小 */
   syncPollMs = 2000;
+  /** 仓库有 CI 时，新提交上迟迟没有检查最多等多久 */
+  noneWaitMs = 5 * 60_000;
   private async merge(i: Issue, by: string) {
     if (!i.pr || i.pr.state !== "open") return;
     const p = this.proj(i.projectId)!;
