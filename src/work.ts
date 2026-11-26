@@ -48,6 +48,8 @@ export interface Issue {
   dependsOn?: number[];
   /** 因基础设施原因（重启、运行失败、提前收工）中断时所在的阶段：下次运行从这里继续，不新开一轮 */
   resumeFrom?: Phase | null;
+  /** 生命周期走完却没有 PR、被自动退回执行阶段的次数（上限 1） */
+  missingPrFixes?: number;
   /** 因 CI 未通过被自动交回开发智能体的次数（上限 2） */
   ciFixes?: number;
   /** 因与主干冲突被自动交回开发智能体的次数（上限 2） */
@@ -1487,6 +1489,7 @@ export class Work {
 
   /** 交付后：项目负责人审核、护栏检查、按合并策略处理 PR、通知 */
   private async afterDeliver(i: Issue) {
+    if (await this.missingPr(i)) return;
     const key = this.key(i);
     const lead = this.leadOf(i);
     const hot = i.labels.includes("hotfix");
@@ -1559,6 +1562,26 @@ export class Work {
     this.addComment(i.id, L.agent, "lead", lines.join("\n"));
     this.save(i);
     this.emit("lead");
+  }
+
+  /**
+   * 兜底：项目关联了仓库、开发智能体在工作目录里干活，生命周期却走完了还没有 PR（比如提交失败被吞掉）。
+   * 退回「执行」阶段续跑一次，重新提交并创建 PR，再走测试和评审。只自动处理 1 次，再缺就交给人。返回是否已安排。
+   */
+  private async missingPr(i: Issue): Promise<boolean> {
+    if (i.pr || this.simulate || !i.assignee || (i.missingPrFixes ?? 0) >= 1) return false;
+    const p = this.proj(i.projectId);
+    if (!p?.repo || !this.workspace.enabledFor(p, this.store.getAgent(i.assignee))) return false;
+    i.missingPrFixes = (i.missingPrFixes ?? 0) + 1;
+    i.status = "todo";
+    i.lifecycleDone = false;
+    i.resumeFrom = "do";
+    this.save(i);
+    this.addComment(i.id, "system", "system", `⚠ 生命周期已走完，但代码还没有提交成 PR（可能是之前提交失败了）。退回「执行」阶段，由 ${i.assignee} 检查工作目录的 git 状态后重新提交，提交成功后会重新测试和评审。`);
+    await this.syncStatusRemote(i).catch(() => []);
+    this.emit("issue");
+    void this.startRun(this.getIssue(i.id)!, "system");
+    return true;
   }
 
   /**
@@ -1776,8 +1799,10 @@ export class Work {
     });
   }
 
-  /** 启动时：进行中但已无活跃运行的工作项（因重启中断）退回 todo */
+  /** 启动时：进行中但已无活跃运行的工作项（因重启中断）退回 todo；待验收却没有 PR 的补救一次 */
   private reconcile() {
+    for (const i of this.issues().filter((x) => x.status === "in_review" && x.lifecycleDone && !x.pr && !this.activeRun(x.id)))
+      setImmediate(() => void this.missingPr(this.getIssue(i.id)!).catch(() => {}));
     for (const i of this.issues().filter((x) => x.status === "in_progress")) {
       if (this.activeRun(i.id)) continue;
       // 生命周期已经走完，只是交付收尾（审核、合并）被重启打断：补做收尾，而不是打回待办
