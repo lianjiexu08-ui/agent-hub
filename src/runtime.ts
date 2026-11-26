@@ -22,7 +22,7 @@ import { builtinReceipt, recordReceipt } from "./receipt.ts";
 export interface CliExecutor {
   /** 取得该运行底座的一个进程槽位（超过并发上限时按优先级排队） */
   acquire?(runtime: string, priority: number, signal: AbortSignal): Promise<() => void>;
-  run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void }): Promise<{ result: string; cost?: number; inputTokens?: number; outputTokens?: number; transcript?: BetaMessageParam[] }>;
+  run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; /** 运行中的对话记录（增量，给界面实时看） */ progress?: (transcript: BetaMessageParam[]) => void }): Promise<{ result: string; cost?: number; inputTokens?: number; outputTokens?: number; transcript?: BetaMessageParam[] }>;
 }
 
 export interface RuntimeHooks {
@@ -172,6 +172,22 @@ export class Runtime {
    * 与智能体之间的 call_agent 不同：这里没有父任务，也不受 delegation 限制，
    * 调用方拿到的是最终回复文本。
    */
+  /** CLI 任务持有的进程槽位（可在阻塞等待时让出） */
+  private slotHandles = new Map<string, { release: () => void; reacquire: () => Promise<void> }>();
+  /**
+   * 阻塞等待别的工作（等测试、等委派的子任务、等人确认需求）期间让出 CLI 槽位，结束后再拿回。
+   * 否则「占着槽位等待」的任务会和「等槽位才能开始」的任务互相卡死：
+   * 例如 Claude Code 并发上限 2、两个开发任务都在等测试，tester 永远拿不到槽位。
+   * 非 CLI 任务（内置底座按模型请求限流）直接执行 fn。
+   */
+  async waiting<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+    const h = this.slotHandles.get(taskId);
+    if (!h) return fn();
+    h.release();
+    try { return await fn(); }
+    finally { await h.reacquire().catch(() => {}); } // 拿回时被取消：任务本身也已取消，交给原有流程收尾
+  }
+
   async callAgent(agentName: string, input: string, opts: { timeoutMs?: number; priority?: number } = {}): Promise<{ taskId: string; status: string; result: string | null; error: string | null; timedOut: boolean }> {
     if (!this.store.getAgent(agentName)) throw new Error(`智能体 ${agentName} 不存在`);
     const task = this.submit(agentName, input, { source: "api", hops: 0, priority: opts.priority ?? 2 });
@@ -264,6 +280,13 @@ export class Runtime {
       try { releaseCli = await this.cli.acquire(agent.runtime, task.priority, controller.signal); }
       catch { this.controllers.delete(id); return; } // 排队时被取消，cancel() 已写入状态
       if (controller.signal.aborted || this.store.getTask(id)?.status !== "pending") { releaseCli(); this.controllers.delete(id); return; }
+      // 阻塞等待其它任务时可以让出槽位（见 waiting()）
+      const cli = this.cli;
+      this.slotHandles.set(id, {
+        release: () => { const r = releaseCli; releaseCli = null; r?.(); },
+        // 拿回槽位用最高优先级：手上的活做了一半，应先于新任务收尾
+        reacquire: async () => { if (!releaseCli) releaseCli = await cli.acquire!(agent.runtime, 1, controller.signal); },
+      });
     }
     this.emitTask(this.store.updateTask(id, { status: "running" }));
 
@@ -275,7 +298,25 @@ export class Runtime {
     if (viaCli) {
       try {
         if (!this.cli) throw new Error(`运行底座 ${agent.runtime} 不可用`);
-        const out = await this.cli.run(task, agent, { system, signal: controller.signal, heartbeat: () => this.touch(id) });
+        // 对话记录边跑边存（最多每 2 秒一次）：CLI 运行动辄几十分钟，不能等结束才让人看到它在做什么
+        let lastSave = 0;
+        let pending: BetaMessageParam[] | null = null;
+        let timer: NodeJS.Timeout | null = null;
+        const flush = () => {
+          timer = null;
+          if (!pending || controller.signal.aborted) return;
+          this.store.saveMessages(id, pending);
+          pending = null;
+          lastSave = Date.now();
+          const t = this.store.getTask(id);
+          if (t) this.emitTask(t);
+        };
+        const progress = (transcript: BetaMessageParam[]) => {
+          pending = transcript.slice();
+          if (timer) return;
+          timer = setTimeout(flush, Math.max(0, 2000 - (Date.now() - lastSave)));
+        };
+        const out = await this.cli.run(task, agent, { system, signal: controller.signal, heartbeat: () => this.touch(id), progress }).finally(() => { if (timer) clearTimeout(timer); });
         if (controller.signal.aborted) return;
         if (out.transcript) this.store.saveMessages(id, out.transcript);
         this.store.updateTask(id, { inputTokens: out.inputTokens ?? 0, outputTokens: out.outputTokens ?? 0, cost: out.cost ?? 0, turns: 1 });
@@ -285,6 +326,7 @@ export class Runtime {
         return this.finish(id, { status: "failed", error: describeError(err) });
       } finally {
         releaseCli?.();
+        this.slotHandles.delete(id);
         this.controllers.delete(id);
       }
     }
@@ -511,7 +553,7 @@ export class Runtime {
         if (task.depth + 1 > this.opts.maxDepth)
           throw new ToolError(`委派深度已达上限 ${this.opts.maxDepth}，请自己完成这部分工作`);
         const child = this.submit(input.agent, input.task, { parent: task, source: "delegate", hops: task.hops });
-        const done = await this.waitFor(child.id);
+        const done = await this.waiting(task.id, () => this.waitFor(child.id));
         if (done.status !== "completed") throw new ToolError(`${input.agent} 执行失败（${done.status}）：${done.error}`);
         return done.result ?? "";
       }

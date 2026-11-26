@@ -39,7 +39,7 @@ export interface Provider {
 export interface ModelEntry { id: string; label: string; modelId: string; providerId: string; enabled: boolean; builtin?: boolean; desc?: string; price?: string; tag?: string; /** 每百万 tokens 的输入价格（美元） */ inputPrice?: number; /** 每百万 tokens 的输出价格（美元） */ outputPrice?: number }
 export interface GuardConfig { isolation: "worktree" | "container"; network: "allowlist" | "open"; protectedBranches: string[]; protectedPaths: string[]; maxDiff: number; requireTests: boolean; access: "token" | "password" | "sso"; secrets: { name: string; scope: string }[] }
 export interface BudgetConfig { daily: number; perIssue: number; perProject: Record<string, number> }
-export interface QASettings { schedule: "auto" | "serial"; maxParallel: number; browser: "pool" | "local"; headless: boolean }
+export interface QASettings { schedule: "auto" | "serial"; maxParallel: number; browser: "pool" | "local"; headless: boolean; /** DevEye Chrome 扩展的 dist 目录：配置后 Hub 托管 DevEye 服务端、为每次验收创建无头浏览器 */ deveyeExtension?: string }
 export interface LinearConfig {
   connected: boolean;
   viewer?: string;
@@ -1069,6 +1069,13 @@ export class Settings {
     if (!t) return;
     const s = this.get();
     s.github.repos = await new GitHub(() => t).repos();
+    this.put(s);
+  }
+  /** 新建仓库后加进可选列表，不必等手动刷新 */
+  addGithubRepo(full: string) {
+    const s = this.get();
+    if (!s.github?.connected) return;
+    s.github.repos = [full, ...(s.github.repos ?? []).filter((r: string) => r !== full)];
     this.put(s);
   }
   disconnectGithub() {

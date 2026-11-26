@@ -12,6 +12,7 @@ import type { HubEvent, Task } from "./types.ts";
 import type { Project, QAPort } from "./work.ts";
 import { z } from "zod";
 import { priorityRank } from "./priority.ts";
+import type { Previews } from "./preview.ts";
 
 interface Step { desc: string; cmd: string; status: "passed" | "failed" | "skipped" | null; ms?: number; error?: string | null; found?: string; at?: string; locate?: boolean; assert?: boolean }
 interface Case { id: string; criterion: number | null; kind: "browser" | "unit" | "check" | "health"; title: string; mutates: string[]; status: "passed" | "failed" | "running" | "skipped" | null; steps: Step[]; note?: string }
@@ -20,6 +21,8 @@ export interface QARun {
   status: "queued" | "running" | "passed" | "failed" | "cancelled"; trigger: string; browser: string | null; env: string; account: string | null;
   mutates: string[]; cases: Case[]; queuedAt: string; startedAt?: string; endedAt?: string; wait: string | null; cursor: { c: number; s: number } | null;
   simulated: boolean; taskId?: string; failAt?: number; boosted?: boolean;
+  /** 本次验收的预览环境（工作项分支）与无头浏览器 */
+  previewUrl?: string | null; previewError?: string | null; browserId?: string | null;
 }
 type IssueLike = { key: string; title: string; description: string; labels: string[]; projectId: string; pr: { number: number } | null; priority: number; quality: { criteria: string[] } };
 
@@ -37,7 +40,14 @@ export class QA implements QAPort {
   private settings: Settings;
   private proj: (id: string) => Project | undefined;
   private simulate: boolean;
-  deveye = false;
+  /** 本机装了 deveye 命令（真实模式下还要配置扩展目录，Hub 才能为验收建浏览器） */
+  private deveyeInstalled = false;
+  get deveye() { return this.deveyeInstalled && (!this.previews || this.previews.hasExtension()); }
+  set deveye(v: boolean) { this.deveyeInstalled = v; }
+  /** 预览环境与浏览器（由 index 注入）；没有时不做本地预览 */
+  previews: Previews | null = null;
+  /** 工作项的 worktree 目录（由 index 注入） */
+  worktreeFor: ((issueKey: string) => string | null) | null = null;
   private waiters = new Map<string, ((r: { passed: boolean; note: string; cases: number }) => void)[]>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private browsers: { id: string; status: "idle" | "busy"; runId: string | null }[] = [];
@@ -55,8 +65,19 @@ export class QA implements QAPort {
     this.settings = settings;
     this.proj = proj;
     this.simulate = simulate;
-    // 重启后，执行中的验收重新排队
-    for (const r of this.runs().filter((r) => r.status === "running")) { r.status = "queued"; r.cases.forEach((c) => { c.status = null; c.steps.forEach((s) => (s.status = null)); }); this.save(r); }
+    // 重启后：生命周期里的验收（开发运行在等它的结果）随重启一起中断了，没人等结果，直接取消，
+    // 工作项重新运行时会重新排队；人手动发起的验收重新排队执行
+    for (const r of this.runs().filter((r) => r.status === "running" || r.status === "queued")) {
+      if (r.trigger === "manual") {
+        if (r.status === "running") { r.status = "queued"; r.cases.forEach((c) => { c.status = null; c.steps.forEach((s) => (s.status = null)); }); }
+      } else {
+        r.status = "cancelled";
+        r.endedAt = now();
+        r.cursor = null;
+        r.cases.forEach((c) => { if (c.status === "running" || c.status === null) { c.status = "skipped"; c.note ||= "服务重启，验收已取消（工作项重新运行时会重新排队）"; } });
+      }
+      this.save(r);
+    }
     runtime.events.on("event", (e: HubEvent) => {
       if (e.type === "task" && ["completed", "failed", "cancelled"].includes(e.task.status)) {
         const r = this.runs().find((x) => x.taskId === e.task.id && x.status === "running");
@@ -70,11 +91,16 @@ export class QA implements QAPort {
   runs(): QARun[] { return this.store.docList<QARun>("qa_runs"); }
   run(id: string) { return this.store.docGet<QARun>("qa_runs", id); }
   private save(r: QARun) { this.store.docPut("qa_runs", r.id, r); }
+  /** 测试任务属于哪张工作项（CLI 底座据此在该工作项的 worktree 里跑验收） */
+  issueKeyOfTask(taskId: string): string | null { return this.runs().find((r) => r.taskId === taskId)?.issueKey ?? null; }
   runsFor(key: string) { return this.runs().filter((r) => r.issueKey === key).reverse(); }
   state() { return { runs: this.runs().slice(-200), settings: this.settings.get().qa, browsers: this.browsers, deveye: this.deveye }; }
 
   private buildCases(i: IssueLike): Case[] {
-    const web = WEB.test(`${i.title}${i.description}`) || !!this.proj(i.projectId)?.env.baseUrl;
+    // 浏览器用例要有地方可打开、有工具可用：真实模式下必须配置了测试地址且装有 DevEye。
+    // 只凭描述里出现「页面」「前端」就生成浏览器用例，会让项目骨架这类任务全是跑不了的浏览器验收。
+    const env = this.proj(i.projectId)?.env;
+    const web = this.simulate ? WEB.test(`${i.title}${i.description}`) || !!env?.baseUrl : this.deveye && !!(env?.baseUrl || env?.preview || (env?.previewCmd && this.previews));
     const mut = (t: string) => (/提交|创建|删除|支付|订单|登录|注册/.test(t) ? [/支付|订单/.test(t) ? "orders" : /登录|注册/.test(t) ? "session" : "content"] : []);
     const cases: Case[] = i.quality.criteria.map((c, n) => web ? {
       id: `c${n + 1}`, criterion: n, kind: "browser", title: c, mutates: mut(c), status: null,
@@ -87,7 +113,10 @@ export class QA implements QAPort {
       ],
     } : {
       id: `c${n + 1}`, criterion: n, kind: i.labels.includes("bug") ? "unit" : "check", title: c, mutates: [], status: null,
-      steps: [{ desc: "准备", cmd: "pnpm test:setup", status: null }, { desc: `验证：${c}`, cmd: `pnpm vitest run -t "${c.slice(0, 16)}"`, status: null, assert: true }],
+      // 演示模式沿用示意命令；真实模式由 tester 在 worktree 里自己决定读哪些代码、跑哪些命令
+      steps: this.simulate
+        ? [{ desc: "准备", cmd: "pnpm test:setup", status: null }, { desc: `验证：${c}`, cmd: `pnpm vitest run -t "${c.slice(0, 16)}"`, status: null, assert: true }]
+        : [{ desc: "阅读相关代码与测试", cmd: "（tester 在工作项的 worktree 中查看）", status: null }, { desc: `验证：${c}`, cmd: "（运行相关测试 / 构建 / 命令并核对结果）", status: null, assert: true }],
     });
     if (web) cases.push({ id: "health", criterion: null, kind: "health", title: "页面健康检查（控制台 / 网络 / 无障碍）", mutates: [], status: null, steps: [
       { desc: "控制台无报错", cmd: "deveye console --level error --compact", status: null, assert: true },
@@ -96,7 +125,13 @@ export class QA implements QAPort {
     ] });
     return cases;
   }
-  private envFor(r: QARun) { const e = this.proj(r.projectId)?.env; return r.pr && e?.preview ? e.preview.replace("{pr}", String(r.pr)) : e?.baseUrl || "CI"; }
+  /** 本地预览（每个工作项单独起一份）：开始验收时才有地址，先记为 preview */
+  private localPreview(r: QARun) { return !this.simulate && !!this.previews && !!this.proj(r.projectId)?.env.previewCmd; }
+  private envFor(r: QARun) {
+    if (this.localPreview(r)) return "preview";
+    const e = this.proj(r.projectId)?.env;
+    return r.pr && e?.preview ? e.preview.replace("{pr}", String(r.pr)) : e?.baseUrl || "CI";
+  }
 
   enqueue(i: IssueLike, trigger: string): string {
     const cases = this.buildCases(i);
@@ -133,11 +168,18 @@ export class QA implements QAPort {
 
   // ---------- 调度 ----------
   /** 浏览器验收的并发：远程 Chrome / 串行 / 真实 DevEye（单浏览器会话）时为 1 */
-  private capacity() { const s = this.settings.get().qa; return s.browser === "local" || s.schedule === "serial" || (!this.simulate && this.deveye) ? 1 : s.maxParallel; }
+  private capacity() {
+    const s = this.settings.get().qa;
+    if (s.browser === "local" || s.schedule === "serial") return 1;
+    // 真实 DevEye：Hub 为每次验收各建一个浏览器时可以并行；否则共用一个浏览器会话，只能串行
+    if (!this.simulate && this.deveye) return this.previews ? s.maxParallel : 1;
+    return s.maxParallel;
+  }
   /** 不需要浏览器的验收（CI：单元测试 / 检查）不占浏览器，只受最大并行数限制 */
   private ciCapacity() { const s = this.settings.get().qa; return s.schedule === "serial" ? 1 : Math.max(1, s.maxParallel); }
   private conflict(a: QARun, b: QARun): string | null {
-    if (a.env !== b.env || a.env === "CI") return null;
+    // 本地预览每个工作项独立（端口、数据库都隔离），互不冲突
+    if (a.env !== b.env || a.env === "CI" || a.env === "preview") return null;
     const m = a.mutates.find((x) => b.mutates.includes(x));
     if (m) return `都会修改${MUT_LABEL[m] ?? m}数据`;
     if (a.account && a.account === b.account) return `测试账号 ${a.account} 正在被使用`;
@@ -195,14 +237,51 @@ export class QA implements QAPort {
     } else {
       const agent = this.store.getAgent("tester") ? "tester" : this.store.listAgents()[0]?.name;
       if (!agent) return this.finish(r, "failed");
+      if (r.env === "preview") { this.save(r); void this.startWithPreview(r.id, agent); this.emit(); return; }
       const t = this.runtime.submit(agent, this.taskInput(r), { source: "qa" as Task["source"], priority: r.priority });
       r.taskId = t.id;
       this.save(r);
     }
     this.emit();
   }
+  /** 先在工作项的 worktree 里起预览、建浏览器，再交给 tester；预览起不来时照样交给 tester，并说明原因 */
+  private async startWithPreview(id: string, agent: string) {
+    let r = this.run(id)!;
+    const cwd = this.worktreeFor?.(r.issueKey) ?? null;
+    const cmd = this.proj(r.projectId)?.env.previewCmd ?? "";
+    r.wait = "正在启动本分支的预览环境…";
+    this.save(r);
+    this.emit();
+    if (cwd && cmd && this.previews) {
+      const slug = r.issueKey.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+      const h = await this.previews.start(r.id, cwd, cmd, { HUB_ISSUE_KEY: r.issueKey, HUB_ISSUE_SLUG: slug });
+      r = this.run(id)!;
+      if (h.ready) {
+        r.previewUrl = h.url;
+        r.env = h.url;
+        if (this.deveye) r.browserId = await this.previews.browser(r.id);
+      } else r.previewError = `${h.error}。日志末尾：\n${h.log}`;
+    } else r.previewError = !cwd ? "找不到这个工作项的工作目录" : "项目没有配置预览命令";
+    r = { ...this.run(id)!, previewUrl: r.previewUrl, env: r.env, browserId: r.browserId, previewError: r.previewError, wait: null };
+    // 准备期间被取消了：收拾掉预览
+    if (r.status !== "running") { this.previews?.stop(r.id); this.save(r); return; }
+    const t = this.runtime.submit(agent, this.taskInput(r), { source: "qa" as Task["source"], priority: r.priority });
+    r.taskId = t.id;
+    this.save(r);
+    this.emit();
+  }
   private taskInput(r: QARun) {
-    return `请对工作项 ${r.issueKey}「${r.title}」做验收测试。\n\n测试环境：${r.env}${r.account ? `\n测试账号：${r.account}（密码通过 DevEye vault 引用，不要明文输出）` : ""}\n\n用例（逐条执行，每条完成后调用 report_case 汇报）：\n${r.cases.map((c) => `- ${c.id}：${c.title}`).join("\n")}\n\n${this.deveye && r.env !== "CI" ? "可以用 browser 工具执行 DevEye 命令操作浏览器（如 navigate goto <url>、snapshot --interactive-only、click --uid、type --uid、wait --text、console --level error）。" : "当前没有可用的浏览器，请根据交付内容和代码做检查型验收。"}\n全部用例汇报完后，用一句话给出总体结论。`;
+    const parts = [`请对工作项 ${r.issueKey}「${r.title}」做验收测试。`];
+    if (r.previewUrl) parts.push(`测试环境：${r.previewUrl}（这个工作项分支的本地预览，Hub 刚刚启动，后端为假模型，数据库独立）`);
+    else if (r.env && r.env !== "CI" && r.env !== "preview") parts.push(`测试环境：${r.env}`);
+    if (r.account) parts.push(`测试账号：${r.account}`);
+    if (r.previewError) parts.push(`⚠ 本分支的预览环境没有启动成功：${r.previewError}\n请先判断原因：如果是这个分支的代码问题（构建失败、启动报错），把相关浏览器用例判为失败并写清原因；如果是环境问题，在结论里说明，并尽量用检查型方式（读代码、跑测试）验证。`);
+    parts.push(`用例（逐条执行，每条完成后调用 report_case 汇报）：\n${r.cases.map((c) => `- ${c.id}：${c.title}`).join("\n")}`);
+    if (this.deveye && (r.browserId || (r.env !== "CI" && r.env !== "preview")))
+      parts.push(`用 browser 工具执行 DevEye 命令操作浏览器（已为你准备好一个无头浏览器）：先 navigate goto <测试环境地址>，再 snapshot --interactive-only --compact 拿到元素 uid，用 click --uid / type --uid "文本" --enter / wait --text "文字" 操作与断言，console --level error 检查控制台报错。每条浏览器用例都要真的在页面上操作，并把看到的结果写进汇报。`);
+    else parts.push("当前没有可用的浏览器，请根据交付内容和代码做检查型验收。");
+    parts.push("当前工作目录就是这个工作项的代码（开发分支）。可以阅读代码、安装依赖、运行测试和构建命令来验证；**不要修改、新增或提交任何文件**，发现问题如实汇报即可，修复由开发智能体负责。\n全部用例汇报完后，用一句话给出总体结论。");
+    return parts.join("\n\n");
   }
   private stepLater(id: string) { this.timers.set(id, setTimeout(() => this.step(id), this.stepMs + Math.random() * this.stepMs)); }
   private step(id: string) {
@@ -235,6 +314,7 @@ export class QA implements QAPort {
   private finish(r: QARun, status?: QARun["status"]) {
     clearTimeout(this.timers.get(r.id));
     this.timers.delete(r.id);
+    this.previews?.stop(r.id);
     r.status = status ?? (r.cases.some((c) => c.status === "failed") ? "failed" : "passed");
     r.endedAt = now();
     r.cursor = null;
@@ -284,10 +364,13 @@ export class QA implements QAPort {
       if (!ALLOW.has(args[0] ?? "")) return { content: `不支持的命令：${args[0]}`, isError: true };
       const r = runOf(task);
       const started = Date.now();
-      const out = await new Promise<{ ok: boolean; text: string }>((resolve) => {
-        const child = execFile("deveye", args, { timeout: 60_000, maxBuffer: 4 * 1024 * 1024 }, (e, stdout, stderr) => resolve({ ok: !e, text: `${stdout}${stderr}`.slice(0, 8000) }));
-        signal.addEventListener("abort", () => child.kill(), { once: true });
-      });
+      // Hub 为这次验收建了浏览器：命令发到托管的 DevEye 服务端、指定这个浏览器
+      const out = r?.browserId && this.previews
+        ? await this.previews.deveye(args, { DEVEYE_BROWSER_ID: r.browserId }, 60_000, signal)
+        : await new Promise<{ ok: boolean; text: string }>((resolve) => {
+          const child = execFile("deveye", args, { timeout: 60_000, maxBuffer: 4 * 1024 * 1024 }, (e, stdout, stderr) => resolve({ ok: !e, text: `${stdout}${stderr}`.slice(0, 8000) }));
+          signal.addEventListener("abort", () => child.kill(), { once: true });
+        });
       if (r?.cursor) {
         const c = r.cases[r.cursor.c];
         if (c.steps.every((s) => s.cmd !== "report_case")) {

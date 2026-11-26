@@ -36,6 +36,8 @@ export interface SessionToolOpts {
 interface Ctx {
   agent: { name: string };
   signal?: AbortSignal;
+  /** 发起调用的任务（运行时传入）：等对方发言时据此让出 CLI 槽位 */
+  task?: { id: string };
 }
 
 export function registerSessionTools(runtime: Runtime, sessions: Sessions, driver: SessionDriver, opts: SessionToolOpts = {}) {
@@ -114,10 +116,12 @@ export function registerSessionTools(runtime: Runtime, sessions: Sessions, drive
    * 落库用 say 而不是 advance：闸在调模型前已经判过一次，而调用期间可能刚好超时或涨过预算，
    * advance 会再判一次并抛错。可对方的话已经花掉 token 说出口了，丢掉等于既花了钱又丢了上下文。
    */
-  const drive = async (s: Session, agent: string, other: string): Promise<Session> => {
+  const drive = async (s: Session, agent: string, other: string, caller?: string): Promise<Session> => {
     const gate = sessions.canContinue(s.id);
     if (!gate.ok) throw new Error(`会话 ${s.id} 已经不能继续（${REASON[gate.reason] ?? gate.reason}）`);
-    const r = await driver(agent, promptFor(s, agent, other), { timeoutMs: turnTimeout });
+    // 等对方发言期间让出发起方的 CLI 槽位，否则并发上限小时双方互等
+    const call = () => driver(agent, promptFor(s, agent, other), { timeoutMs: turnTimeout });
+    const r = caller ? await runtime.waiting(caller, call) : await call();
     const text = String(r?.text ?? "").trim();
     if (!text) throw new Error(`智能体 ${agent} 没有给出回复（可能超时或运行失败），本轮中止`);
     if (r?.tokens) sessions.addUsage(s.id, r.tokens);
@@ -191,7 +195,7 @@ export function registerSessionTools(runtime: Runtime, sessions: Sessions, drive
         });
         if (!sessions.lock(s.id)) throw new Error(`会话 ${s.id} 正在被占用`);
         try {
-          const after = await drive(s, input.agent, me);
+          const after = await drive(s, input.agent, me, ctx.task?.id);
           const reply = sessions.messages(s.id).at(-1)?.text ?? "";
           return JSON.stringify({ session: view(after), turn: after.turn, reply: clip(reply) });
         } catch (e) {
@@ -253,7 +257,7 @@ export function registerSessionTools(runtime: Runtime, sessions: Sessions, drive
         }
         if (!sessions.lock(s.id)) throw new Error(`会话 ${s.id} 正在被占用`);
         try {
-          const r = await drive(after, next, me);
+          const r = await drive(after, next, me, ctx.task?.id);
           const reply = sessions.messages(s.id).at(-1)?.text ?? "";
           return JSON.stringify({ session: view(r), turn: r.turn, reply: clip(reply) });
         } catch (e) {

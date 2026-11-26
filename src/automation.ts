@@ -159,12 +159,20 @@ export class Automation {
       const overSla = R.phaseTimeout.on && x.phaseMin >= sla;
       const noBeat = R.heartbeat.on && x.idleMin >= R.heartbeat.minutes;
       if (!overSla && !noBeat) { if (st.level) this.state.set(x.key, { level: 0 }); continue; }
-      const chain = noBeat && st.level === 0 ? ["restart", ...R.phaseTimeout.chain.filter((a) => a !== "restart" && a !== "nudge")] : R.phaseTimeout.chain;
+      // 只超时、心跳正常 = 还在干活，只是慢：只提醒和上报，不重启 / 改派（会打断正在写的代码）；
+      // 两步之间至少隔半个时限，走完一遍就不再重复。没有心跳才是真卡住，走完整的处理链
+      const alive = !noBeat;
+      let chain = noBeat && st.level === 0 ? ["restart", ...R.phaseTimeout.chain.filter((a) => a !== "restart" && a !== "nudge")] : R.phaseTimeout.chain;
+      if (alive) {
+        chain = chain.filter((a) => a === "nudge" || a === "escalate");
+        if (!chain.length || st.level >= chain.length) continue;
+        if (st.lastAt && (Date.now() - new Date(st.lastAt).getTime()) / 60000 < Math.max(5, sla / 2)) continue;
+      }
       const action = chain[Math.min(st.level, chain.length - 1)];
       const reason = noBeat ? `${Math.round(x.idleMin)} 分钟无心跳` : `「${x.phase}」已 ${Math.round(x.phaseMin)} 分钟（时限 ${sla} 分钟）`;
       const issue = this.work.list().find((i) => i.key === x.key);
       const to = pickReassignTarget(this.store, x.agent, issue);
-      await this.work.sentinelAct(x.key, action, { minutes: Math.round(Math.max(x.phaseMin, x.idleMin)), to });
+      await this.work.sentinelAct(x.key, action, { minutes: Math.round(Math.max(x.phaseMin, x.idleMin)), to, alive });
       this.addLog(action, `${x.key} ${reason} → ${{ nudge: "提醒", restart: "重启当前阶段", reassign: `改派给 ${to}`, escalate: "上报项目负责人" }[action]}`, x.key);
       st.level++;
       st.lastAt = new Date().toISOString();
@@ -174,12 +182,21 @@ export class Automation {
       const m = (Date.now() - new Date(r.queuedAt).getTime()) / 60000;
       if (m >= R.queueWait.minutes) { r.boosted = true; r.hotfix = true; this.store.docPut("qa_runs", r.id, r); this.addLog("boost", `${r.issueKey} 验收排队 ${Math.round(m)} 分钟，已提升优先级`, r.issueKey); acted++; }
     }
-    if (R.retryFailed.on) for (const i of this.work.list().filter((i) => i.status === "todo" && i.lastRun?.status === "failed" && !this.retried.has(i.lastRun.id)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))) {
+    // 失败的运行，以及「正常结束但没走完生命周期」的运行（智能体提前收工，比如工具调用出错后自己结束了）都自动重试
+    // 记了续跑点（resumeFrom）的也重试：那是基础设施原因中断的（重启、哨兵重启时撞上服务重启……），即使最后一次运行显示「已取消」；
+    // 人主动停止的不会留续跑点，不会被自动拉起
+    const unfinished = (i: { status: string; lastRun?: { status: string } | null; lifecycleDone?: boolean; resumeFrom?: string | null }) =>
+      i.lastRun?.status === "failed" || (i.lastRun?.status === "completed" && !i.lifecycleDone) || (!!i.resumeFrom && i.lastRun?.status === "cancelled");
+    if (R.retryFailed.on) for (const i of this.work.list().filter((i) => i.status === "todo" && unfinished(i) && !this.retried.has(i.lastRun!.id)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))) {
       this.retried.add(i.lastRun!.id);
       const tries = i.runs;
-      if (/需求|预算|轮仍未通过/.test(i.lastRun!.error ?? "") || tries > R.retryFailed.times + 1) continue;
+      // 按最近连续失败次数限流（见 Work.failStreak）；以前用总运行次数，跑过几轮的工作项就再也不会被重试
+      if (/需求|预算|轮仍未通过/.test(i.lastRun!.error ?? "") || (i.failStreak ?? tries) > R.retryFailed.times) continue;
       if (await this.work.retryFailed(i.key)) { this.addLog("retry", `${i.key} 运行失败（${(i.lastRun!.error ?? "").slice(0, 40)}），自动重试`, i.key); acted++; }
     }
+    // 因预算熔断暂停的工作项：跨天额度重置、或预算被调高后自动继续
+    const resumed = await this.work.resumeBudgetHeld().catch(() => 0);
+    if (resumed) { this.addLog("retry", `${resumed} 个因预算暂停的工作项已恢复执行`); acted++; }
     // 每小时清扫一次已结束工作项残留的 worktree
     if (Date.now() - this.lastSweep > 3600_000) {
       this.lastSweep = Date.now();

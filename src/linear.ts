@@ -147,6 +147,16 @@ export class Linear {
     return d.team.states.nodes;
   }
 
+  /** 团队成员（供「只做指定人的 issue」选择） */
+  async members(teamId: string): Promise<LinearUser[]> {
+    const d = await this.gql<{ team: { members: { nodes: LinearUser[] } } | null }>(
+      `query TeamMembers($id: String!) { team(id: $id) { members(first: 250) { nodes { id name } } } }`,
+      { id: teamId },
+    );
+    if (!d.team) throw new Error("Linear 团队不存在或无权访问");
+    return d.team.members.nodes.map((m) => ({ id: m.id, name: m.name }));
+  }
+
   /** 团队的 issue，分页读取（是否导入由调用方按状态/标签过滤）；maxPages × 100 为上限 */
   async issues(teamId: string, opts: { updatedAfter?: string | null; maxPages?: number } = {}): Promise<LinearIssue[]> {
     const maxPages = opts.maxPages ?? 20;

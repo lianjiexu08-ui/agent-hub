@@ -9,8 +9,35 @@ import type { GitHub } from "./github.ts";
 
 interface Proj { id: string; repo: { fullName: string; defaultBranch?: string } | null }
 
+/** Hub 运行时写进工作目录的配置文件（含任务令牌）：提交时排除 */
+export const HUB_FILES = [".gemini/settings.json", ".pi/mcp.json"];
+
 /** 需要工作目录的扩展工具：读写文件、检索代码、执行命令 */
 export const WORKSPACE_TOOLS = ["read_file", "write_file", "list_files", "search_repo", "run_command"];
+
+/**
+ * 依赖锁文件、压缩产物这类生成文件：不计入改动行数（安全护栏的「改动行数上限」针对的是人要评审的代码）。
+ * 动辄几千行的 package-lock.json 不该让一个项目骨架被拦下。
+ */
+const GENERATED = [/(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|uv\.lock|poetry\.lock|Pipfile\.lock|pdm\.lock|Cargo\.lock|go\.sum|composer\.lock|Gemfile\.lock)$/, /\.min\.(js|css)$/, /\.(js|css)\.map$/];
+export const isGeneratedFile = (path: string) => GENERATED.some((re) => re.test(path));
+
+/** 解析 `git diff --numstat`：分开统计需要评审的改动与生成文件（二进制文件记为 0 行） */
+export function diffStat(numstat: string): { files: number; additions: number; deletions: number; generated: { files: number; lines: number } } {
+  const out = { files: 0, additions: 0, deletions: 0, generated: { files: 0, lines: 0 } };
+  for (const line of numstat.split("\n")) {
+    const m = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(line.trim());
+    if (!m) continue;
+    const add = m[1] === "-" ? 0 : Number(m[1]);
+    const del = m[2] === "-" ? 0 : Number(m[2]);
+    // 重命名形如 a/{x => y}/b 或 x => y：取新路径判断
+    const path = m[3].replace(/\{[^}]*=> ([^}]*)\}/, "$1").replace(/^.* => /, "");
+    out.files++;
+    if (isGeneratedFile(path)) { out.generated.files++; out.generated.lines += add + del; }
+    else { out.additions += add; out.deletions += del; }
+  }
+  return out;
+}
 
 function git(args: string[], cwd: string): Promise<string> {
   return new Promise((res, rej) => {
@@ -34,6 +61,8 @@ export class Workspace {
     void next.finally(() => { if (this.locks.get(key) === next) this.locks.delete(key); }).catch(() => {});
     return next;
   }
+  /** 测试用：把远端换成本地仓库（默认是带令牌的 GitHub 地址） */
+  remoteUrl: ((p: Proj) => string) | null = null;
   constructor(root: string, token: () => string | null) {
     this.root = resolve(root);
     this.token = token;
@@ -50,7 +79,7 @@ export class Workspace {
   }
   private repoDir(p: Proj) { return join(this.root, "repos", p.repo!.fullName.replace("/", "__")); }
   dir(p: Proj, key: string) { return join(this.root, "worktrees", p.repo!.fullName.replace("/", "__"), key); }
-  private url(p: Proj) { return `https://x-access-token:${this.token()}@github.com/${p.repo!.fullName}.git`; }
+  private url(p: Proj) { return this.remoteUrl ? this.remoteUrl(p) : `https://x-access-token:${this.token()}@github.com/${p.repo!.fullName}.git`; }
 
   prepare(p: Proj, key: string): Promise<string> { return this.withRepo(p, () => this.prepareUnlocked(p, key)); }
   private async prepareUnlocked(p: Proj, key: string): Promise<string> {
@@ -75,18 +104,31 @@ export class Workspace {
     if (!existsSync(dir)) return null;
     const branch = `agent/${key.toLowerCase()}`;
     await git(["add", "-A"], dir);
-    // Hub 为 Gemini CLI 写在工作目录里的 MCP 配置含访问令牌，绝不能提交
-    const hubFile = join(dir, ".gemini", "settings.json");
-    if (existsSync(hubFile) && readFileSync(hubFile, "utf8").includes("HUB_TASK_ID")) await git(["restore", "--staged", "--", ".gemini/settings.json"], dir).catch(() => {});
+    // Hub 为 Gemini / pi 写在工作目录里的 MCP 配置含任务令牌，绝不能提交
+    for (const rel of HUB_FILES) {
+      const f = join(dir, rel);
+      if (existsSync(f) && readFileSync(f, "utf8").includes("HUB_TASK_ID")) await git(["restore", "--staged", "--", rel], dir).catch(() => {});
+    }
     const staged = await git(["status", "--porcelain"], dir);
     if (staged) await git(["-c", "user.name=agent-hub", "-c", "user.email=agent-hub@users.noreply.github.com", "commit", "-m", message], dir);
     const base = p.repo!.defaultBranch ?? "main";
+    // 先把最新的主干合进来：并行开发时主干可能已经前进了。测试与评审要基于合并后的代码，PR 也不会带着冲突提上去
+    await git(["fetch", this.url(p), `+refs/heads/${base}:refs/remotes/origin/${base}`], dir);
+    const upToDate = await git(["merge-base", "--is-ancestor", `origin/${base}`, "HEAD"], dir).then(() => true, () => false);
+    if (!upToDate) {
+      try {
+        await git(["-c", "user.name=agent-hub", "-c", "user.email=agent-hub@users.noreply.github.com", "merge", "--no-edit", `origin/${base}`], dir);
+      } catch {
+        // 有冲突：撤销这次合并，把冲突文件交给智能体自己解决（它最了解自己的改动）
+        const files = (await git(["diff", "--name-only", "--diff-filter=U"], dir).catch(() => "")).split("\n").filter(Boolean);
+        await git(["merge", "--abort"], dir).catch(() => {});
+        return { branch, conflict: files.length ? files : ["（未能列出冲突文件）"] };
+      }
+    }
     const ahead = await git(["rev-list", "--count", `origin/${base}..HEAD`], dir);
     if (ahead === "0") return null;
     await git(["push", "--force-with-lease", this.url(p), `HEAD:refs/heads/${branch}`], dir);
-    const stat = await git(["diff", "--shortstat", `origin/${base}...HEAD`], dir);
-    const num = (re: RegExp) => Number(re.exec(stat)?.[1] ?? 0);
-    return { branch, files: num(/(\d+) files? changed/), additions: num(/(\d+) insertions?/), deletions: num(/(\d+) deletions?/) };
+    return { branch, ...diffStat(await git(["diff", "--numstat", `origin/${base}...HEAD`], dir)) };
   }
 
   /** 回滚已合并的 PR：基于合并提交创建 revert PR 并合并，返回新 PR 编号 */
