@@ -2401,6 +2401,10 @@ export class Work {
   private reconcile() {
     for (const i of this.issues().filter((x) => x.status === "in_review" && x.lifecycleDone && !x.pr && !this.activeRun(x.id)))
       setImmediate(() => void this.missingPr(this.getIssue(i.id)!).catch(() => {}));
+    // 开启「资深评审代替人放行」之前就被护栏拦下的：按新规则再判断一次（测试 / CI 不过的不管）
+    if (this.settings.guard().reviewer?.agent)
+      for (const i of this.issues().filter((x) => x.status === "in_review" && x.pr?.state === "open" && x.pr.guard && !/测试未通过|CI /.test(x.pr.guard) && !x.seniorReviews && !this.activeRun(x.id)))
+        setImmediate(() => void this.afterDeliver(this.getIssue(i.id)!).catch(() => {}));
     let resumed = 0;
     for (const i of this.issues().filter((x) => x.status === "in_progress")) {
       if (this.activeRun(i.id)) continue;
