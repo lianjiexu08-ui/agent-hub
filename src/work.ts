@@ -1871,7 +1871,7 @@ export class Work {
           : `↗ 已推送分支 ${res.branch}（未开 PR），+${res.additions} −${res.deletions}，${res.files} 个文件${gen}`);
         return dv.mode === "local" ? `改动已提交到本地分支 ${res.branch}。` : `已推送分支 ${res.branch}。`;
       }
-      const pr = i.pr?.state === "open" && !i.pr.local ? i.pr : await this.github.createPR(p.repo!.fullName, { title: `${this.key(i)}: ${i.title}`, head: res.branch, base: baseOf(p), body: `${i.description}\n\n${i.github ? `Closes #${i.github.number}` : ""}` }).then((r) => ({ number: r.number, branch: res.branch, state: "open" as const, checks: "pending" as const, tests: null, additions: res.additions, deletions: res.deletions, files: res.files }));
+      const pr = i.pr?.state === "open" && !i.pr.local ? i.pr : await this.github.createPR(p.repo!.fullName, { title: `${this.key(i)}: ${i.title}`, head: res.branch, base: baseOf(p), body: `${i.description}\n\n${i.github ? `Refs #${i.github.number}（由 Agent Hub 在最终验收后关闭，不随 PR 合并自动关闭）` : ""}` }).then((r) => ({ number: r.number, branch: res.branch, state: "open" as const, checks: "pending" as const, tests: null, additions: res.additions, deletions: res.deletions, files: res.files }));
       i.pr = { ...pr, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated, testLines: res.tests };
       this.save(i);
       this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch} → ${baseOf(p)}），+${res.additions} −${res.deletions}，${res.files} 个文件${gen}${res.tests.lines ? `，其中测试 ${res.tests.lines} 行` : ""}`);
