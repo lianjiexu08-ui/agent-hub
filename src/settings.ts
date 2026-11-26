@@ -39,7 +39,13 @@ export interface Provider {
 export interface ModelEntry { id: string; label: string; modelId: string; providerId: string; enabled: boolean; builtin?: boolean; desc?: string; price?: string; tag?: string; /** 每百万 tokens 的输入价格（美元） */ inputPrice?: number; /** 每百万 tokens 的输出价格（美元） */ outputPrice?: number }
 export interface GuardConfig { isolation: "worktree" | "container"; network: "allowlist" | "open"; protectedBranches: string[]; protectedPaths: string[]; maxDiff: number; requireTests: boolean; access: "token" | "password" | "sso"; secrets: { name: string; scope: string }[] }
 export interface BudgetConfig { daily: number; perIssue: number; perProject: Record<string, number> }
-export interface QASettings { schedule: "auto" | "serial"; maxParallel: number; browser: "pool" | "local"; headless: boolean }
+export interface QASettings { schedule: "auto" | "serial"; maxParallel: number; browser: "pool" | "local"; headless: boolean;
+  /** 浏览器验收用哪个驱动：builtin = Hub 内置（playwright-core + 本机 Chrome，默认）；deveye = 外部 DevEye（需单独安装） */
+  engine?: "builtin" | "deveye";
+  /** 内置驱动用的 Chrome / Chromium 路径；不填则自动查找常见安装位置 */
+  chromePath?: string;
+  /** DevEye Chrome 扩展的 dist 目录（engine = deveye 时需要） */
+  deveyeExtension?: string }
 export interface LinearConfig {
   connected: boolean;
   viewer?: string;
@@ -79,7 +85,7 @@ const defaults = (): GlobalSettings => ({
   budget: { daily: 50, perIssue: 10, perProject: {} },
   guard: { isolation: "worktree", network: "allowlist", protectedBranches: ["main", "release/*"], protectedPaths: [".github/**", "**/migrations/**", "infra/**", "**/auth/**", "**/payment/**"], maxDiff: 800, requireTests: true, access: "token", secrets: [] },
   notify: DEFAULT_NOTIFY,
-  qa: { schedule: "auto", maxParallel: 3, browser: "pool", headless: true },
+  qa: { schedule: "auto", maxParallel: 3, browser: "pool", headless: true, engine: "builtin" },
   github: { connected: false, reviewLabel: "in-review" },
   linear: { connected: false },
 });
@@ -1069,6 +1075,13 @@ export class Settings {
     if (!t) return;
     const s = this.get();
     s.github.repos = await new GitHub(() => t).repos();
+    this.put(s);
+  }
+  /** 新建仓库后加进可选列表，不必等手动刷新 */
+  addGithubRepo(full: string) {
+    const s = this.get();
+    if (!s.github?.connected) return;
+    s.github.repos = [full, ...(s.github.repos ?? []).filter((r: string) => r !== full)];
     this.put(s);
   }
   disconnectGithub() {

@@ -3,13 +3,16 @@ import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { Store } from "./db.ts";
 import type { Uploads } from "./uploads.ts";
-import { checkPassword, clearedCookie, cookieOf, issueSession, LoginThrottle, loginEnabled, loginUser, sessionCookie, sessionSecret, verifySession, type Security } from "./auth.ts";
+import { authRequired, checkPassword, clearedCookie, cookieOf, isCrossSite, issueSession, LoginThrottle, loginEnabled, loginUser, sessionCookie, sessionSecret, TASK_TOKEN_HEADER, verifySession, verifyTaskToken, type Security } from "./auth.ts";
 import type { Runtime } from "./runtime.ts";
 import { readFileSync } from "node:fs";
+import { virtualSessions } from "./assistant-cli.ts";
 import { detectRuntimeModels, detectRuntimes, verifyRuntimeModels } from "./runtimes.ts";
 import { AgentSchema, McpServerSchema, ToolSchema, type HubEvent } from "./types.ts";
 
 const PANEL_PATH = new URL("../public/index.html", import.meta.url);
+/** 本进程的启动时间：前端据此判断「重启是否已完成」（旧进程退出前 /health 也会返回 200） */
+const BOOT = new Date().toISOString();
 const ASSET_DIR = new URL("../public/assets/", import.meta.url);
 const ASSET_TYPES: Record<string, string> = { ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8" };
 
@@ -34,6 +37,20 @@ export function createApp(store: Store, runtime: Runtime, security?: Security, e
     return c.json({ error: err.message }, (status === 404 || status === 409 ? status : 400) as 400);
   });
 
+  // ---------- 跨站请求防护（先于一切路由） ----------
+  // 免密码模式下没有任何凭证可校验，任意网页都能向 127.0.0.1 发 POST；所以对所有写操作校验来源。
+  app.use("*", async (c, next) => {
+    const m = c.req.method;
+    if (m === "GET" || m === "HEAD" || m === "OPTIONS") return next();
+    if (isCrossSite({ origin: c.req.header("origin"), host: c.req.header("host"), secFetchSite: c.req.header("sec-fetch-site") }))
+      return c.json({ error: "拒绝跨站请求" }, 403);
+    // RPC 与账号接口只接受 JSON：表单 / text/plain 这类「简单请求」无需预检，是跨站伪造的常见载体
+    const p = c.req.path;
+    if ((p === "/api/rpc" || p === "/api/login" || p === "/api/setup") && !/^application\/json\b/i.test(c.req.header("content-type") ?? ""))
+      return c.json({ error: "Content-Type 必须是 application/json" }, 415);
+    return next();
+  });
+
   // ---------- 登录（账号密码） ----------
   const throttle = new LoginThrottle();
   /** 首次登录后是否还需要用户自己设置账号密码 */
@@ -50,25 +67,31 @@ export function createApp(store: Store, runtime: Runtime, security?: Security, e
     return c.json({ ok: true });
   });
 
-  // 鉴权：账号会话（Cookie）或 API 令牌（Bearer / ?token=）二选一
-  // 注意：不要写成 loginEnabled(security)，类型守卫在已收窄的类型上会把分支推成 never
-  const hasLogin = !!security?.password || !!security?.credentials?.initialized;
-  const needsAuth = !!security && (hasLogin || !!security.token);
-  if (needsAuth && security) {
+  // 鉴权：账号会话（Cookie）、API 令牌（Bearer / ?token=）、任务级令牌（仅 /internal）三选一。
+  // 是否需要鉴权每次请求重新判断：免密码模式下设置了账号密码，立即上锁，不必重启。
+  if (security) {
     const cfg = security;
     app.use("*", async (c, next) => {
       const p = c.req.path;
       // 页面、静态资源、健康检查与登录接口本身不需要鉴权
       if (p === "/" || p === "/health" || p.startsWith("/assets/") || p === "/api/session" || p === "/api/login") return next();
+      // CLI 任务桥：只认属于该任务的令牌（无论是否开启登录，都允许它回调）
+      const internal = /^\/internal\/tasks\/([^/]+)\//.exec(p);
+      if (internal && verifyTaskToken(decodeURIComponent(internal[1]), c.req.header(TASK_TOKEN_HEADER), cfg.internalSecret)) return next();
+      if (!authRequired(cfg)) return next();
       const bearer = c.req.header("authorization");
       const byToken = !!cfg.token && (bearer === `Bearer ${cfg.token}` || c.req.query("token") === cfg.token);
-      const session = hasLogin ? verifySession(cookieOf(c.req.header("cookie")), sessionSecret(cfg)) : null;
+      const session = loginEnabled(cfg) ? verifySession(cookieOf(c.req.header("cookie")), sessionSecret(cfg)) : null;
       if (!byToken && !session) return c.json({ error: "unauthorized" }, 401);
       return next();
     });
   }
 
-  /** 首次登录后设置自己的账号与密码；已登录才能调用，设置完成后会话按新密钥重新签发 */
+  /**
+   * 设置自己的账号与密码（首次初始化或修改）。
+   * 已开启登录时必须带有效会话（由上面的鉴权中间件保证）；免密码模式下与其它接口一样只对本机同源开放。
+   * 设置完成后会话按新密钥重新签发。
+   */
   app.post("/api/setup", async (c) => {
     if (!security?.credentials) return c.json({ error: "未启用账号登录" }, 400);
     const body = (await c.req.json().catch(() => ({}))) as { user?: string; password?: string };
@@ -98,7 +121,7 @@ export function createApp(store: Store, runtime: Runtime, security?: Security, e
     return c.json({ ok: true, user, needsSetup: needsSetup(security) });
   });
 
-  app.get("/health", (c) => c.json({ ok: true }));
+  app.get("/health", (c) => c.json({ ok: true, boot: BOOT }));
   /** 上传附件（截图 / 文件）。一次最多 10 个，单个 20 MB */
   app.post("/api/upload", async (c) => {
     if (!extras) return c.json({ error: "附件功能未启用" }, 500);
@@ -149,9 +172,18 @@ export function createApp(store: Store, runtime: Runtime, security?: Security, e
   }
 
   // ---------- CLI 底座的任务级 MCP 桥 ----------
-  app.get("/internal/tasks/:id/tools", (c) => c.json(runtime.toolDefsFor(c.req.param("id")).map((t) => ({ name: (t as { name: string }).name, description: (t as { description?: string }).description, input_schema: (t as { input_schema?: unknown }).input_schema ?? {} }))));
+  // 管家走 Claude Code 时登记的虚拟会话：同一个桥、同样的任务级令牌，处理函数在管家那边
+  app.get("/internal/tasks/:id/tools", (c) => {
+    const v = virtualSessions.get(c.req.param("id"));
+    return v ? c.json(v.tools) : c.json(runtime.toolDefsFor(c.req.param("id")).map((t) => ({ name: (t as { name: string }).name, description: (t as { description?: string }).description, input_schema: (t as { input_schema?: unknown }).input_schema ?? {} })));
+  });
   app.post("/internal/tasks/:id/tool", async (c) => {
     const { name, input } = (await c.req.json()) as { name: string; input: unknown };
+    const v = virtualSessions.get(c.req.param("id"));
+    if (v) {
+      try { return c.json({ content: await v.invoke(name, input) }); }
+      catch (e) { return c.json({ error: (e as Error).message, isError: true }); }
+    }
     try { return c.json(await runtime.invokeTool(c.req.param("id"), name, input)); }
     catch (e) { return c.json({ error: (e as Error).message, isError: true }); }
   });

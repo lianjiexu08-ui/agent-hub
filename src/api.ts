@@ -18,7 +18,7 @@ import { PRESETS } from "./providers.ts";
 import type { Uploads } from "./uploads.ts";
 export interface Services {
   uploads?: Uploads;
-  store: Store; runtime: Runtime; settings: Settings; notifier: Notifier; work: Work; qa: QA; automation: Automation; assistant: Assistant; simulate: boolean; /** 热重载：重新读配置并重新检测运行底座 */ reload?: () => Promise<unknown>; /** 进程级重启：拉起新进程后退出 */ restart?: () => unknown }
+  store: Store; runtime: Runtime; settings: Settings; notifier: Notifier; work: Work; qa: QA; automation: Automation; assistant: Assistant; simulate: boolean; /** 热重载：重新读配置并重新检测运行底座 */ reload?: () => Promise<unknown>; /** 进程级重启：拉起新进程后退出；idle = 等运行中的工作项结束再重启 */ restart?: (mode?: "now" | "idle") => unknown; cancelRestart?: () => unknown; restartState?: () => unknown }
 
 /** 掩码占位：保存时遇到它表示"沿用原值" */
 const MASK = "••••";
@@ -41,6 +41,7 @@ export function buildApi(s: Services) {
     attention: work.attention(),
     health: work.health(),
     butler: assistant.conversation(),
+    butlerProgress: assistant.progress,
     tools: store.listTools(),
     // MCP 的 env / headers 里常有令牌：只回传键名，值一律掩码
     mcpServers: store.listMcpServers().map((m) => ({
@@ -51,6 +52,7 @@ export function buildApi(s: Services) {
     runtimes: await detectRuntimes(),
     builtinTools: BUILTIN_TOOL_META,
     providerPresets: PRESETS,
+    restartPending: s.restartState?.() ?? null,
     concurrency: { ...s.runtime.concurrency(), cli: (s.runtime.cli as { stats?: () => unknown } | null)?.stats?.() ?? {} },
   });
 
@@ -77,17 +79,20 @@ export function buildApi(s: Services) {
     "work.stop": (ref) => work.stop(ref),
     "work.remove": (ref) => work.remove(ref),
     "work.confirmRequirement": (ref, answer) => work.confirmRequirement(ref, answer),
-    "work.mergePR": (ref) => work.mergePR(ref),
+    "work.mergePR": (ref, force) => work.mergePR(ref, !!force),
     "work.rollback": (ref) => work.rollback(ref),
     "work.pushToGithub": (ref) => work.pushToGithub(ref),
     "work.saveProject": (input, orig) => work.saveProject(input, orig),
     "work.deleteProject": (id) => work.deleteProject(id),
     "work.connectRepo": (id, full) => work.connectRepo(id, full),
     "work.disconnectRepo": (id) => work.disconnectRepo(id),
+    "work.githubOwners": () => work.githubOwners(),
+    "work.createRepo": (id, input) => work.createRepo(id, input),
     "work.sync": (id) => work.sync(id),
     "work.connectLinear": (id, teamId) => work.connectLinear(id, teamId),
     "work.disconnectLinear": (id) => work.disconnectLinear(id),
     "work.syncLinear": (id) => work.syncLinear(id),
+    "work.linearMembers": (id) => work.linearMembers(id),
     "work.diskUsage": () => work.diskUsage(),
     "work.cleanWorkspaces": () => work.cleanWorkspaces(),
     "work.receipt": (id) => store.docGet("receipts", id),
@@ -103,7 +108,13 @@ export function buildApi(s: Services) {
     "auto.toggle": (id, on) => automation.toggle(id, on),
     "auto.remove": (id) => automation.remove(id),
     "auto.setRule": (k, p) => automation.setRule(k, p),
-    "settings.patch": (p) => { settings.patch(p); s.runtime.setConcurrency(settings.get().concurrency.model); (s.runtime.cli as { pump?: () => void } | null)?.pump?.(); },
+    "settings.patch": (p) => {
+      settings.patch(p);
+      s.runtime.setConcurrency(settings.get().concurrency.model);
+      (s.runtime.cli as { pump?: () => void } | null)?.pump?.();
+      // 调了预算：因熔断暂停的工作项立即重试（仍超限会继续等）
+      if (p?.budget) void work.resumeBudgetHeld().catch(() => {});
+    },
     "settings.verifyProvider": (id, f) => settings.verifyProvider(id, f),
     "settings.listProviderModels": (id) => settings.listProviderModels(id),
     "settings.setAssistantModel": (m) => settings.patch({ assistantModel: m ?? "" }),
@@ -122,9 +133,17 @@ export function buildApi(s: Services) {
     "settings.testChannel": async (id) => { const c = settings.get().notify.channels.find((x) => x.id === id); if (!c?.url) throw new Error("先填写地址"); await notifier.send(c, "【Agent Hub】测试消息：通知渠道配置成功"); },
     "runtimes.detect": () => detectRuntimes(true),
     "system.reload": () => s.reload?.(),
-    "system.restart": () => s.restart?.(),
+    "system.restart": (mode) => s.restart?.(mode === "idle" ? "idle" : "now"),
+    "system.cancelRestart": () => s.cancelRestart?.(),
     "studio.saveAgent": (a, orig) => saveAgent(a, orig),
     "studio.deleteAgent": (n) => store.deleteAgent(n),
+    /** 批量改运行底座：把用 from 的智能体都改成 to（CLI 模型留空，用该 CLI 的默认模型）。返回改了几个 */
+    "studio.switchRuntime": (from, to) => {
+      if (!["builtin", "claude-code", "codex", "gemini", "pi"].includes(String(to))) throw new Error(`未知的运行底座 ${to}`);
+      const list = store.listAgents().filter((a) => (a.runtime ?? "builtin") === from);
+      for (const a of list) store.upsertAgent(AgentSchema.parse({ ...a, runtime: to, cliModel: "" }));
+      return list.length;
+    },
     "studio.saveTool": (t) => store.upsertTool(ToolSchema.parse(t)),
     "studio.saveMcp": (raw) => {
       const parsed = McpServerSchema.parse(raw);
@@ -159,6 +178,7 @@ export function buildApi(s: Services) {
     "assistant.append": (m) => assistant.append(m),
     "assistant.updateCard": (i, p) => assistant.updateCard(i, p),
     "assistant.clear": () => assistant.clear(),
+    "assistant.warm": () => assistant.warm(),
     "assistant.builder": (input) => assistant.builder(input),
   };
   const rpc = async (method: string, args: unknown[] = []) => {

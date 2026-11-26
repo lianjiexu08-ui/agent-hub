@@ -495,7 +495,7 @@ const prioOrder = (p) => (p >= 1 && p <= 4 ? p : 5);
  */
 // ======================= 数据层：后端状态缓存 + RPC =======================
 /** S 是 GET /api/state 的快照；修改通过 RPC，完成后重新拉取并通知各视图刷新 */
-let S = { projects: [], syncLogs: {}, issues: [], agents: [], skills: [], settings: null, qa: { runs: [], settings: {}, browsers: [], deveye: false }, auto: { rules: {}, jobs: [], log: [], state: {} }, notifications: [], knowledge: [], costs: [], attention: [], health: [], butler: [], tools: [], mcpServers: [], runtimes: null, simulate: false };
+let S = { projects: [], syncLogs: {}, issues: [], agents: [], skills: [], settings: null, qa: { runs: [], settings: {}, browsers: [], browserReady: false, engine: null, deveyeInstalled: false }, auto: { rules: {}, jobs: [], log: [], state: {} }, notifications: [], knowledge: [], costs: [], attention: [], health: [], butler: [], tools: [], mcpServers: [], runtimes: null, simulate: false };
 const simulateMode = () => S?.simulate === true;
 const dataListeners = new Set();
 async function rpc(method, ...args) {
@@ -539,18 +539,28 @@ const issuesApi = {
   stop: (ref) => act("work.stop", ref),
   remove: (ref) => act("work.remove", ref),
   confirmRequirement: (ref, answer) => act("work.confirmRequirement", ref, answer),
-  mergePR: (ref) => act("work.mergePR", ref),
+  /** 合并 PR：CI 未通过时服务端会拒绝并说明，人确认是 CI 自身的问题后可以「仍然合并」 */
+  mergePR: async (ref) => {
+    try { return await act("work.mergePR", ref); }
+    catch (e) {
+      if (!/CI 未通过/.test(e.message) || !confirm(`${e.message}\n\n确定仍然合并吗？`)) throw e;
+      return act("work.mergePR", ref, true);
+    }
+  },
   rollback: (ref) => act("work.rollback", ref),
   pushToGithub: (ref) => act("work.pushToGithub", ref),
   saveProject: (input, orig) => act("work.saveProject", input, orig),
   deleteProject: (id) => act("work.deleteProject", id),
   connectRepo: (id, full) => act("work.connectRepo", id, full),
   disconnectRepo: (id) => act("work.disconnectRepo", id),
+  githubOwners: () => act("work.githubOwners"),
+  createRepo: (id, input) => act("work.createRepo", id, input),
   sync: (id) => act("work.sync", id),
   setLead: (id, patch) => act("work.setLead", id, patch),
   connectLinear: (id, teamId) => act("work.connectLinear", id, teamId),
   disconnectLinear: (id) => act("work.disconnectLinear", id),
   syncLinear: (id) => act("work.syncLinear", id),
+  linearMembers: (id) => act("work.linearMembers", id),
   pushToLinear: (ref) => act("work.pushToLinear", ref),
 };
 
@@ -718,6 +728,7 @@ function issueCard(i) {
     },
     h("div", { class: "icard-top" }, prio(i.priority), h("span", { class: "ikey" }, i.key),
       i.activeRuns ? (i.queued ? h("span", { class: "warn", style: "color:var(--muted)", title: "并发已满，按优先级排队等待" }, "⏳ 排队中") : h("span", { class: "live" }, "执行中"))
+        : i.status === "todo" && i.waitingDeps ? h("span", { class: "warn", style: "color:var(--muted)", title: `等待 ${i.deps.filter((d) => !d.met).map((d) => d.key).join("、")} 完成后自动开始` }, "⏸ 等依赖")
         : i.status === "todo" && i.lastRun?.status === "failed" ? h("span", { class: "warn" }, "✕ 上次失败")
         : i.status === "todo" && !i.assignee ? h("span", { class: "warn", style: "color:var(--muted)" }, "待指派") : null,
       h("span", { style: "margin-left:auto" }, avatar(i.assignee))),
@@ -849,6 +860,12 @@ async function renderDrawer() {
       h("label", {}, "优先级"), select(prioOptions(), d.priority, (v) => set({ priority: Number(v) })),
       h("label", {}, "标签"), h("input", { "data-keep": "1", value: d.labels.join(", "), placeholder: "用逗号分隔", onchange: (e) => set({ labels: e.target.value.split(/[,，]/).map((x) => x.trim()).filter(Boolean) }) }),
       h("label", {}, "父工作项"), select([["", "无"], ...all.filter((x) => !isDesc(x)).map((x) => [x.key, `${x.key} ${short(x.title, 30)}`])], d.parent?.key ?? "", (v) => set({ parent: v || null })),
+      h("label", {}, "依赖"), h("div", {},
+        d.deps?.length ? h("div", { class: "row", style: "gap:8px;flex-wrap:wrap;margin-bottom:4px" }, d.deps.map((x) =>
+          h("a", { class: "link", style: "font-size:12.5px", title: x.title, onclick: () => openIssue(x.key) }, `${x.met ? "✅" : "⏳"} ${x.key} ${short(x.title, 16)}`))) : null,
+        h("input", { "data-keep": "1", value: (d.deps ?? []).map((x) => x.key).join(", "), placeholder: "依赖的工作项编号，用逗号分隔，如 S2T-1, S2T-2",
+          onchange: (e) => set({ dependsOn: e.target.value.split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean) }) }),
+        h("div", { class: "help" }, "依赖全部完成（或 PR 合并）后才会开始执行")),
       h("label", {}, "GitHub"), d.github
         ? h("div", { class: "row" }, ghTag(d.github), h("span", { class: "muted", style: "font-size:12.5px" }, `${d.github.state === "closed" ? "已关闭" : "open"} · ${ago(d.github.syncedAt)}同步`),
             h("a", { class: "link", style: "font-size:12.5px", href: d.github.url, target: "_blank", rel: "noopener" }, "在 GitHub 打开"))
@@ -1884,12 +1901,39 @@ function renderProjBar() {
     : [h("span", {}, "未绑定 GitHub 仓库"), h("a", { class: "link", onclick: () => showView("project") }, "去绑定 →")]);
 }
 
+// ======================= 新建 GitHub 仓库（新建项目弹窗与项目设置页共用） =======================
+const ghOwners = { list: null, loading: false, error: "" };
+/** 仓库名建议：项目名里的英文单词，否则用前缀 */
+const suggestRepoName = (name, key) => ((name || "").match(/[A-Za-z0-9]+/g) ?? []).join("-").toLowerCase() || (key || "").toLowerCase();
+/**
+ * 归属 / 仓库名 / 公开私有 三个字段。nr = { owner, name, private }，就地修改。
+ * 归属列表首次用到时才去读（需要访问 GitHub），读完调用 rerender 重绘。
+ */
+function newRepoFields(nr, rerender) {
+  if (!ghOwners.list && !ghOwners.loading && !ghOwners.error) {
+    ghOwners.loading = true;
+    issuesApi.githubOwners().then((l) => { ghOwners.list = l ?? []; }).catch((e) => { ghOwners.error = e.message; }).finally(() => { ghOwners.loading = false; rerender(); });
+  }
+  const owners = ghOwners.list ?? [];
+  if (!nr.owner && owners.length) nr.owner = owners[0].login;
+  const owner = owners.length
+    ? select(owners.map((o) => [o.login, o.org ? `${o.login}（组织）` : o.login]), nr.owner, (v) => (nr.owner = v), { style: "max-width:200px" })
+    : h("span", { class: "muted", style: "font-size:12.5px" }, ghOwners.error ? `读取账号失败：${ghOwners.error}` : "读取账号…");
+  const name = h("input", { placeholder: "仓库名，如 my-app", style: "max-width:220px", oninput: (e) => (nr.name = e.target.value.trim()) });
+  name.value = nr.name ?? "";
+  const vis = select([["private", "私有"], ["public", "公开"]], nr.private === false ? "public" : "private", (v) => (nr.private = v !== "public"), { style: "max-width:100px" });
+  return h("div", {},
+    h("div", { class: "row", style: "gap:6px;align-items:center" }, owner, h("span", { class: "muted" }, "/"), name, vis),
+    h("div", { class: "muted", style: "font-size:12.5px;margin-top:6px" }, "会带 README 初始化（空仓库没有默认分支，智能体开不了工作分支），建好后自动绑定到本项目"));
+}
+const ownerIsOrg = (login) => !!ghOwners.list?.find((o) => o.login === login)?.org;
+
 // ======================= 新建项目 =======================
 function openNewProject() {
   const gh = settings.get().github;
   const used = new Set(issuesApi.projects().filter((x) => x.repo).map((x) => x.repo.fullName));
   // 表单状态独立存着：切换运行方式会重绘，不能把用户已经填的内容弄丢
-  const st = { brief: "", name: "", key: "", description: "", mode: "local", repo: "" };
+  const st = { brief: "", name: "", key: "", description: "", mode: "local", repo: "", repoMode: gh.connected && !gh.repos?.length ? "new" : "existing", newRepo: { owner: "", name: "", private: true } };
 
   const body = () => {
     const brief = h("textarea", { rows: 3, placeholder: "说说这个项目要做什么，比如：给官网加一个博客模块，支持 Markdown 和标签，第一期先能发布文章",
@@ -1925,9 +1969,12 @@ function openNewProject() {
           h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" },
             "可以先建项目，之后在「项目设置 → GitHub 仓库」里补令牌和仓库；不影响现在开始干。"))
       : (() => {
+          const tab = (m, label) => h("button", { class: st.repoMode === m ? "primary" : "", onclick: () => { st.repoMode = m; if (m === "new" && !st.newRepo.name) st.newRepo.name = suggestRepoName(st.name, st.key); redraw(); } }, label);
+          const tabs = h("div", { class: "row", style: "gap:6px;margin-top:10px" }, tab("existing", "选择已有仓库"), tab("new", "新建仓库"));
+          if (st.repoMode === "new") return h("div", {}, tabs, h("div", { style: "margin-top:10px" }, newRepoFields(st.newRepo, redraw)));
           const pick = select([["", "选择仓库…"], ...gh.repos.map((r) => [r, used.has(r) ? `${r}（已绑定其他项目）` : r])], st.repo, (v) => (st.repo = v), { style: "max-width:360px;margin-top:10px" });
           [...pick.options].forEach((o) => { if (used.has(o.value)) o.disabled = true; });
-          return h("div", {}, pick, h("div", { class: "muted", style: "font-size:12.5px;margin-top:6px" }, `以 ${gh.login} 的身份访问`));
+          return h("div", {}, tabs, pick, h("div", { class: "muted", style: "font-size:12.5px;margin-top:6px" }, `以 ${gh.login} 的身份访问`));
         })();
 
     const wrap = h("div", { class: "modal", onclick: (e) => e.stopPropagation() },
@@ -1951,14 +1998,23 @@ function openNewProject() {
 
   const submit = async () => {
     if (!st.name.trim() || !st.key.trim()) return toast("名称和编号前缀都要填", "err");
+    const creating = st.mode === "github" && gh.connected && st.repoMode === "new";
+    if (creating && !st.newRepo.name) return toast("填一下新仓库的名字", "err");
+    let p;
     try {
-      const p = await issuesApi.saveProject({ name: st.name.trim(), key: st.key.trim().toUpperCase(), description: st.description.trim() });
-      if (st.mode === "github" && st.repo) await issuesApi.connectRepo(p.id, st.repo);
-      closeModal(true);
-      setProject(p.id);
-      showView("project");
-      toast(st.mode === "github" && st.repo ? `已创建 ${p.name} 并绑定 ${st.repo}` : `已创建 ${p.name}（本地）`, "ok");
-    } catch (e) { fail(e); }
+      p = await issuesApi.saveProject({ name: st.name.trim(), key: st.key.trim().toUpperCase(), description: st.description.trim() });
+    } catch (e) { return fail(e); }
+    // 项目已经建好；仓库这一步失败时不回滚项目，去项目设置页重试即可
+    let bound = null, repoErr = null;
+    try {
+      if (creating) bound = (await issuesApi.createRepo(p.id, { owner: st.newRepo.owner, org: ownerIsOrg(st.newRepo.owner), name: st.newRepo.name, private: st.newRepo.private }))?.fullName;
+      else if (st.mode === "github" && st.repo) { await issuesApi.connectRepo(p.id, st.repo); bound = st.repo; }
+    } catch (e) { repoErr = e; }
+    closeModal(true);
+    setProject(p.id);
+    showView("project");
+    if (repoErr) toast(`已创建 ${p.name}，但仓库没建好：${repoErr.message}。可以在项目设置里重试`, "err");
+    else toast(bound ? `已创建 ${p.name} 并${creating ? "新建、" : ""}绑定 ${bound}` : `已创建 ${p.name}（本地）`, "ok");
   };
 
   redraw();
@@ -1966,10 +2022,11 @@ function openNewProject() {
 }
 
 // ======================= 项目设置页 =======================
-const pg = { draft: null, orig: null, pid: null, repoPick: "" };
+const pg = { draft: null, orig: null, pid: null, repoPick: "", newRepo: null };
 function renderProjectPage() {
   const p = curProject();
   if (!p) return fill($("#projectPage"), h("div", { class: "empty" }, "还没有项目"), h("div", { style: "text-align:center" }, h("button", { class: "primary", onclick: openNewProject }, "新建项目")));
+  if (pg.pid !== p.id) pg.newRepo = null;
   if (pg.pid !== p.id || !pg.draft) { pg.pid = p.id; pg.draft = { name: p.name, key: p.key, description: p.description, sync: { ...p.sync } }; pg.orig = JSON.stringify(pg.draft); }
   const d = pg.draft;
   const dirty = () => JSON.stringify(d) !== pg.orig;
@@ -2014,12 +2071,28 @@ function renderProjectPage() {
     const used = new Set(issuesApi.projects().filter((x) => x.repo).map((x) => x.repo.fullName));
     const pick = select([["", "选择仓库…"], ...gh.repos.map((r) => [r, used.has(r) ? `${r}（已绑定其他项目）` : r])], pg.repoPick, (v) => (pg.repoPick = v), { style: "max-width:320px" });
     [...pick.options].forEach((o) => { if (used.has(o.value)) o.disabled = true; });
-    repoBlock = h("div", { class: "row" }, pick,
+    const bindRow = h("div", { class: "row" }, pick,
       h("button", { class: "primary", onclick: async () => {
         if (!pg.repoPick) return toast("先选择一个仓库", "err");
         try { await issuesApi.connectRepo(p.id, pg.repoPick); pg.repoPick = ""; pg.draft = null; renderProjectPage(); renderProjectSwitch(); toast("已绑定仓库，点「立即同步」导入 issue", "ok"); } catch (e) { fail(e); }
       } }, "绑定"),
+      pg.newRepo ? null : h("button", { onclick: () => { pg.newRepo = { owner: "", name: suggestRepoName(p.name, p.key), private: true }; renderProjectPage(); } }, "新建仓库"),
       h("span", { class: "muted", style: "font-size:12.5px" }, `以 ${gh.login} 的身份访问`));
+    const nr = pg.newRepo;
+    repoBlock = !nr ? bindRow : h("div", { class: "fields" }, bindRow,
+      h("div", { class: "callout" },
+        h("div", { style: "flex:1" }, h("b", {}, "新建仓库"), h("div", { style: "margin-top:8px" }, newRepoFields(nr, renderProjectPage)),
+          h("div", { class: "row", style: "gap:8px;margin-top:10px" },
+            h("button", { class: "primary", onclick: async (e) => {
+              if (!nr.name) return toast("填一下仓库名", "err");
+              e.target.disabled = true; e.target.textContent = "创建中…";
+              try {
+                const r = await issuesApi.createRepo(p.id, { owner: nr.owner, org: ownerIsOrg(nr.owner), name: nr.name, private: nr.private });
+                pg.newRepo = null; pg.draft = null; renderProjectPage(); renderProjectSwitch();
+                toast(`已新建并绑定 ${r?.fullName ?? nr.name}`, "ok");
+              } catch (err) { e.target.disabled = false; e.target.textContent = "创建并绑定"; fail(err); }
+            } }, "创建并绑定"),
+            h("button", { onclick: () => { pg.newRepo = null; renderProjectPage(); } }, "取消")))));
   }
 
   fill($("#projectPage"), h("div", { class: "studio-inner" },
@@ -2105,7 +2178,36 @@ function renderProjectPage() {
     bar));
 }
 const LINEAR_MODES = [["two_way", "双向同步"], ["import", "仅从 Linear 导入"], ["push", "仅推送到 Linear"], ["off", "关闭同步"]];
-const lg = { teamPick: "" };
+const lg = { teamPick: "", members: {}, loading: {} };
+const AUTO_SCOPES = [["off", "不自动：在 Hub 里指派智能体后才执行"], ["all", "全部自动：团队里的 issue 都交给智能体"], ["assignees", "只做指定成员的 issue"]];
+const AUTO_STATES = [["backlog", "Backlog（待规划）"], ["todo", "Todo（待办）"], ["in_progress", "In Progress（进行中）"]];
+/** Linear 自动执行范围：谁的 issue、处于什么状态时，不用人指派就交给智能体 */
+function linearAutoField(p, cfg, save) {
+  const A = { scope: "off", assignees: [], states: ["todo"], ...(cfg.autoRun ?? {}) };
+  const put = (patch) => save({ autoRun: { ...A, ...patch } });
+  const parts = [select(AUTO_SCOPES, A.scope, (v) => put({ scope: v }), { style: "max-width:360px" })];
+  if (A.scope === "assignees") {
+    const list = lg.members[p.id];
+    if (!list && !lg.loading[p.id]) {
+      lg.loading[p.id] = true;
+      issuesApi.linearMembers(p.id).then((m) => { lg.members[p.id] = m ?? []; }).catch(() => { lg.members[p.id] = []; }).finally(() => { lg.loading[p.id] = false; renderProjectPage(); });
+    }
+    const chosen = new Set(A.assignees.map((x) => x.id));
+    const pool = list ?? A.assignees;
+    parts.push(pool.length
+      ? h("div", { class: "checks" }, ...pool.map((m) => checkboxP(chosen.has(m.id), (on) => put({ assignees: on ? [...A.assignees.filter((x) => x.id !== m.id), m] : A.assignees.filter((x) => x.id !== m.id) }), m.name)))
+      : h("div", { class: "muted", style: "font-size:12.5px" }, list ? "没有读到团队成员，先同步一次 Linear 再来选" : "正在读取团队成员…"));
+    if (!A.assignees.length) parts.push(h("div", { class: "callout warn" }, "还没有选择成员，目前不会自动执行任何 issue。"));
+  }
+  if (A.scope !== "off") {
+    const states = new Set(A.states);
+    parts.push(h("div", { class: "muted", style: "font-size:12.5px;margin-top:6px" }, "处于以下状态时接手："),
+      h("div", { class: "checks" }, ...AUTO_STATES.map(([v, t]) => checkboxP(states.has(v), (on) => put({ states: on ? [...A.states.filter((x) => x !== v), v] : A.states.filter((x) => x !== v) }), t))));
+    if (!A.states.length) parts.push(h("div", { class: "callout warn" }, "没有勾选任何状态，目前不会自动执行任何 issue。"));
+  }
+  return field("自动执行", h("div", {}, ...parts),
+    "命中范围的 issue 会按内容选研发角色并开始执行，bug 自动分诊也遵守这个范围。改派给范围外的人或拖出所选状态：还没开跑的取消自动指派，正在跑的不打断。你在 Hub 里手动指派、手动运行不受限制");
+}
 function linearSection(p) {
   const L = settings.get().linear ?? { connected: false };
   if (!L.connected) return section("Linear", "项目绑定一个 Linear 团队后，工作项与 Linear issue 双向同步。",
@@ -2145,6 +2247,7 @@ function linearSection(p) {
     ["two_way", "import"].includes(cfg.mode) ? field("导入范围", h("div", { class: "row" },
       select([["all", "所有未完成的 issue"], ["label", "只导入带指定标签的 issue"]], cfg.importScope, (v) => save({ importScope: v }), { style: "max-width:260px" }),
       cfg.importScope === "label" ? label : null), "导入后进入「待规划」，保留 Linear 优先级") : null,
+    ["two_way", "import"].includes(cfg.mode) ? linearAutoField(p, cfg, save) : null,
     ["two_way", "push"].includes(cfg.mode) ? h("div", { class: "checks" },
       checkboxP(cfg.pushNew, (on) => save({ pushNew: on }), "新建工作项时默认同时创建 Linear issue", "新建时可单独取消勾选"),
       checkboxP(cfg.postDeliverable, (on) => save({ postDeliverable: on }), "智能体的交付结果回写为 Linear 评论")) : null,
@@ -2506,9 +2609,14 @@ async function butlerReply(text) {
 
 async function createPlan(card) {
   const keys = [];
-  for (const x of card.items.filter((x) => x.on && x.title.trim())) {
-    const i = await issuesApi.create({ projectId: card.projectId, title: x.title.trim(), description: x.description, priority: Number(x.priority), assignee: x.assignee || null, labels: x.labels, status: card.startNow ? undefined : "backlog", github: !!issuesApi.project(card.projectId)?.repo && issuesApi.project(card.projectId).sync.pushNew, linear: linearPushable(issuesApi.project(card.projectId)) && issuesApi.project(card.projectId).linear.pushNew });
+  // 计划内序号（从 1 开始）→ 已创建的工作项编号；没勾选的项不创建，依赖它的项也就不再依赖它
+  const byIndex = new Map();
+  for (const [n, x] of card.items.entries()) {
+    if (!x.on || !x.title.trim()) continue;
+    const dependsOn = (x.dependsOn ?? []).map((d) => byIndex.get(d)).filter(Boolean);
+    const i = await issuesApi.create({ projectId: card.projectId, title: x.title.trim(), description: x.description, priority: Number(x.priority), assignee: x.assignee || null, labels: x.labels, dependsOn, status: card.startNow ? undefined : "backlog", github: !!issuesApi.project(card.projectId)?.repo && issuesApi.project(card.projectId).sync.pushNew, linear: linearPushable(issuesApi.project(card.projectId)) && issuesApi.project(card.projectId).linear.pushNew });
     keys.push(i.key);
+    byIndex.set(n + 1, i.key);
   }
   card.created = keys;
   saveButler();
@@ -2565,12 +2673,13 @@ function planCard(m) {
       on.checked = x.on;
       const t = h("input", { class: "pc-title", oninput: (e) => { x.title = e.target.value; saveButler(); } });
       t.value = x.title;
-      return h("div", { class: "pc-row" }, on, t,
+      return h("div", { class: "pc-row" }, on, h("span", { class: "muted", style: "font-size:12px;min-width:22px" }, `#${c.items.indexOf(x) + 1}`), t,
+        x.dependsOn?.length ? h("span", { class: "tag", title: "依赖这些项完成后才开始" }, `依赖 ${x.dependsOn.map((d) => "#" + d).join(" ")}`) : null,
         select(assigneeOptions(), x.assignee ?? "", (v) => { x.assignee = v; saveButler(); }, { style: "width:auto" }),
         select(prioOptions(), x.priority, (v) => { x.priority = Number(v); saveButler(); }, { style: "width:auto" }));
     }),
     c.note ? h("div", { class: "muted", style: "font-size:12.5px" }, `已补充：${c.note}`) : null,
-    h("div", { class: "pc-foot" }, h("label", { class: "chk" }, start, "创建后立即开始执行"), h("span", { style: "margin-left:auto" }),
+    h("div", { class: "pc-foot" }, h("label", { class: "chk" }, start, c.items.some((x) => x.dependsOn?.length) ? "创建后立即开始（有依赖的项等依赖完成后自动开始）" : "创建后立即开始执行"), h("span", { style: "margin-left:auto" }),
       h("button", { class: "primary", onclick: async () => {
         const keys = await createPlan(c);
         await rpc("assistant.append", { role: "ai", text: `已创建 ${keys.join("、")}。` });
@@ -2636,8 +2745,10 @@ async function sendButler(text) {
     if (r?.fallback) {
       S.butler.pop();
       const reply = await butlerReply(text || "我发了附件，你看一下");
+      // 明确告诉用户这不是 AI 回复，以及怎么接上模型
+      const note = `> 当前没有可用的模型${r.reason ? `（${r.reason}）` : ""}，下面是按关键词匹配的规则回复。到「设置 → 模型接入」配置模型 API，或在本机安装并登录 Claude Code 后，管家会用 AI 回答。\n\n`;
       await rpc("assistant.append", { role: "me", text: text || "（发送了附件）", attachments: atts.length ? atts : undefined });
-      await rpc("assistant.append", { role: "ai", ...reply });
+      await rpc("assistant.append", { role: "ai", ...reply, text: note + reply.text, via: "rules" });
     }
   } catch (e) { fail(e); }
   butlerBusy = false;
@@ -2645,8 +2756,17 @@ async function sendButler(text) {
   renderHome();
 }
 
+/** 打开首页时预热管家的 Claude Code 进程（服务端判断是否需要；不发消息、不消耗额度）。一分钟最多一次 */
+let butlerWarmAt = 0;
+function warmButler() {
+  if (Date.now() - butlerWarmAt < 60_000) return;
+  butlerWarmAt = Date.now();
+  rpc("assistant.warm").catch(() => {});
+}
+
 async function renderHome() {
   if (!viewActive("home")) return;
+  warmButler();
   // 注意：这里拿到的还是上一轮的节点。fill 之后会换成新节点，
   // 所以「是否贴底」必须现在算，不能等替换完成后再读新节点的 scrollTop（永远是 0）
   const prevBox = $("#homeMsgs");
@@ -2680,7 +2800,9 @@ async function renderHome() {
           h("summary", {}, "思考过程", h("span", { class: "muted" }, ` ${m.thinking.length} 字`)),
           h("div", { class: "think-body" }, m.thinking)) : null,
         mdEl(m.text),
-        m.card?.type === "plan" ? planCard(m) : m.card?.type === "action" ? actionCard(m) : null)));
+        m.card?.type === "plan" ? planCard(m) : m.card?.type === "action" ? actionCard(m) : null,
+        // 标注回复来自哪个通道：规则回复不能让人误以为是 AI
+        m.via ? h("div", { class: "muted", style: "font-size:11.5px;margin-top:4px" }, { api: "模型 API", "claude-code": "本机 Claude Code", rules: "规则回复（未连接模型）" }[m.via] ?? "") : null)));
 
   fill($("#homeChat"),
     h("div", { class: "home-chat-head" }, h("span", { class: "ai-mark" }, "✦"), h("b", {}, "管家"), h("span", { class: "muted" }, "讨论需求 · 拆分任务 · 调整计划"),
@@ -2699,7 +2821,11 @@ async function renderHome() {
       hasOlder ? h("button", { class: "load-older", onclick: () => { butlerShown += 20; butlerRestore = { h: prevH, top: prevTop }; renderHome(); } },
         `加载更早的对话（还有 ${total - shown} 条）`) : null,
       welcome, msgs,
-      butlerBusy ? h("div", { class: "ai-row" }, h("span", { class: "ai-mark" }, "✦"), h("div", { class: "bubble ai typing" }, "正在思考")) : null),
+      // 管家在处理（本页发的，或别处发起、服务端还在跑）：显示它此刻在做什么
+      butlerBusy || S.butlerProgress ? h("div", { class: "ai-row" }, h("span", { class: "ai-mark" }, "✦"), h("div", { class: "ai-col" },
+        S.butlerProgress?.steps?.length ? h("div", { class: "muted", style: "font-size:12.5px;display:flex;flex-direction:column;gap:3px;margin-bottom:6px" },
+          S.butlerProgress.steps.map((s) => h("div", {}, s))) : null,
+        h("div", { class: "bubble ai typing" }, S.butlerProgress ? `正在处理 · ${Math.max(1, Math.round((Date.now() - Date.parse(S.butlerProgress.since)) / 1000))} 秒` : "正在思考"))) : null),
     (() => {
       const pend = pendingActions();
       if (pend.length < 2) return null;
@@ -2795,15 +2921,21 @@ function prSection(d) {
   const pr = d.pr;
   const state = pr.state === "reverted" ? h("span", { class: "badge s-cancelled" }, `已回滚（#${pr.revert}）`) : pr.state === "merged" ? h("span", { class: "badge s-completed" }, "已合并") : pr.state === "closed" ? h("span", { class: "badge s-cancelled" }, "已关闭") : h("span", { class: "badge s-running" }, "待合并");
   const checks = pr.checks === "passing" ? h("span", { class: "ok-text", style: "font-size:12.5px" }, `✓ 检查通过${pr.tests ? `（测试 ${pr.tests}）` : ""}`) : pr.checks === "failing" ? h("span", { class: "err-text", style: "font-size:12.5px" }, "✕ 检查未通过") : h("span", { class: "muted", style: "font-size:12.5px" }, "检查进行中…");
+  // GitHub 上真实的 CI（PR 最新提交）：和 Hub 自己的验收分开显示
+  const ci = !pr.ci || pr.ci.state === "none" ? null
+    : pr.ci.state === "passing" ? h("span", { class: "ok-text", style: "font-size:12.5px", title: `提交 ${pr.ci.sha.slice(0, 7)}` }, "✓ CI 通过")
+    : pr.ci.state === "failing" ? h("span", { class: "err-text", style: "font-size:12.5px", title: `提交 ${pr.ci.sha.slice(0, 7)}` }, `✕ CI 未通过：${pr.ci.failed.join("、")}`)
+    : pr.ci.state === "unknown" ? h("span", { class: "warn", style: "font-size:12.5px", title: pr.ci.error }, "⚠ 无法读取 CI")
+    : h("span", { class: "muted", style: "font-size:12.5px" }, `CI 进行中：${pr.ci.pending.join("、")}`);
   return [h("div", { class: "section-title" }, "代码变更"),
     h("div", { class: "callout" }, ghIcon(), h("b", {}, `PR #${pr.number}`), state, h("code", { class: "muted" }, pr.branch),
       h("span", { class: "muted", style: "font-size:12.5px" }, h("span", { class: "ok-text" }, `+${pr.additions}`), " ", h("span", { class: "err-text" }, `−${pr.deletions}`), ` · ${pr.files} 个文件`),
-      checks, h("span", { style: "margin-left:auto" }),
+      checks, ci, h("span", { style: "margin-left:auto" }),
       pr.url ? h("a", { class: "link", style: "font-size:12.5px", href: pr.url, target: "_blank", rel: "noopener" }, "在 GitHub 查看") : null,
       pr.state === "open" ? h("button", { class: "primary", disabled: pr.checks === "passing" ? null : "", onclick: () => issuesApi.mergePR(d.key).then(() => toast(`已合并 PR #${pr.number}，${d.key} 完成`, "ok")).catch(fail) }, "合并 PR") : null)];
 }
 
-// ======================= 测试（DevEye 浏览器验收） =======================
+// ======================= 测试（浏览器验收） =======================
 /** 需求质量评估（服务端返回的 quality 优先；新建草稿等没有 quality 时在本地计算，规则与服务端一致） */
 function assessRequirement(i) {
   if (i.quality) return i.quality;
@@ -2990,12 +3122,18 @@ function envView(S) {
     h("div", { class: "center-block" }, h("div", { class: "bh" }, "浏览器"),
       h("div", { class: "panel-box", style: "padding:14px" }, h("div", { class: "fields" },
         h("div", { class: "radio-row" },
-          h("div", { class: "radio-card" + (S.browser === "pool" ? " sel" : ""), onclick: () => set({ browser: "pool" }) }, h("b", {}, "服务器上的浏览器池"), h("span", {}, "由 DevEye 在服务器上拉起相互隔离的 Chrome 实例（独立用户目录），可并行验收")),
+          h("div", { class: "radio-card" + (S.browser === "pool" ? " sel" : ""), onclick: () => set({ browser: "pool" }) }, h("b", {}, "服务器上的浏览器"), h("span", {}, "Hub 在服务器上用本机 Chrome 为每次验收开一个独立的浏览器会话（cookie、存储互不干扰），可并行验收")),
           h("div", { class: "radio-card" + (S.browser === "local" ? " sel" : ""), onclick: () => set({ browser: "local" }) }, h("b", {}, "远程 Chrome"), h("span", {}, "你电脑上的 Chrome 安装 DevEye 扩展后连接到服务器，在你眼前执行，一次一个"))),
         S.browser === "pool" ? [
           field("并行浏览器数", (() => { const el = h("input", { type: "number", min: 1, max: 8, style: "max-width:100px", onchange: (e) => set({ maxParallel: Math.max(1, Math.min(8, Number(e.target.value) || 1)) }) }); el.value = S.maxParallel; return el; })(), "同时最多运行的验收数量"),
           checkboxP(S.headless, (on) => set({ headless: on }), "无界面模式（headless）", "关闭后会弹出可见的浏览器窗口"),
-        ] : h("div", { class: "callout" }, h("span", { class: "busy-dot on" }), qa.get().deveye ? "服务器上已安装 DevEye" : "服务器上未检测到 DevEye（deveye 命令）", h("span", { class: "muted", style: "font-size:12.5px" }, "在 DevEye 扩展里填写服务器地址（ws://<服务器>:9888）和令牌")),
+          field("浏览器驱动", select([["builtin", "内置（推荐）：Hub 自带，直接驱动本机 Chrome"], ["deveye", "DevEye：需单独安装 DevEye"]], S.engine ?? "builtin", (v) => set({ engine: v }), { style: "max-width:360px" }),
+            (S.engine ?? "builtin") === "deveye" ? (db.engine === "deveye" ? "✓ 已就绪：Hub 会托管 DevEye 服务端，为每次验收创建无头浏览器" : "DevEye 不可用，暂时改用内置驱动。需要本机能运行 deveye 命令，并填写下面的扩展目录")
+              : db.browserReady ? "✓ 已就绪：找到了本机 Chrome" : "没有找到 Chrome：请安装 Google Chrome，或在下面填写 Chrome / Chromium 的路径"),
+          (S.engine ?? "builtin") === "deveye"
+            ? field("DevEye 扩展目录", (() => { const el = h("input", { placeholder: "/path/to/DevEye/packages/chrome-extension/dist", onchange: (e) => set({ deveyeExtension: e.target.value.trim() }) }); el.value = S.deveyeExtension ?? ""; return el; })(), "DevEye Chrome 扩展构建产物（dist）的目录")
+            : field("Chrome 路径", (() => { const el = h("input", { placeholder: "留空自动查找，如 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome", onchange: (e) => set({ chromePath: e.target.value.trim() }) }); el.value = S.chromePath ?? ""; return el; })(), "Chrome、Chromium、Edge 均可"),
+        ] : h("div", { class: "callout" }, h("span", { class: "busy-dot on" }), db.deveyeInstalled ? "服务器上已安装 DevEye" : "服务器上未检测到 DevEye（deveye 命令）", h("span", { class: "muted", style: "font-size:12.5px" }, "在 DevEye 扩展里填写服务器地址（ws://<服务器>:9888）和令牌")),
         field("调度方式", select([["auto", "自动：互不冲突的验收并行执行"], ["serial", "串行：一次只执行一个"]], S.schedule, (v) => set({ schedule: v }), { style: "max-width:360px" }), "冲突判断：同一环境下测试账号相同，或会修改同一类数据（订单、登录会话、内容）"),
         S.browser === "pool" ? field("实例", db.browsers.length ? h("div", { class: "chips" }, db.browsers.map((b) => h("span", { class: "tag" }, `${b.id} · ${b.status === "busy" ? "执行中" : "空闲"}`))) : h("span", { class: "muted", style: "font-size:12.5px" }, "按需创建，空闲超时后自动回收")) : null))),
     h("div", { class: "center-block" }, h("div", { class: "bh" }, "测试环境", h("span", { class: "muted" }, "按项目配置")),
@@ -3007,7 +3145,8 @@ function envView(S) {
         return h("div", { class: "proj-row", style: "cursor:default" }, pbadge(p), h("div", { class: "meta fields", style: "gap:8px" }, h("b", {}, p.name),
           field("测试地址", inp("baseUrl", "https://staging.example.com")),
           field("PR 预览地址", inp("preview", "https://pr-{pr}.preview.example.com"), "有 PR 时优先在预览环境验收，{pr} 会替换为 PR 编号；不同 PR 互不冲突"),
-          field("测试账号", acc, "账号密码保存在 DevEye vault，智能体只能引用不能读取")));
+          field("本地预览命令", inp("previewCmd", "scripts/preview.sh"), "配置后，每次验收前 Hub 在该工作项的 worktree 里执行这条命令，启动本分支的前后端，验收结束自动关闭。命令拿到 PREVIEW_PORT（前端）、PREVIEW_API_PORT（后端）、HUB_ISSUE_SLUG（用于隔离数据库等），需前台运行；就绪以前端地址可访问为准（最多 3 分钟）。优先于上面两个地址"),
+          field("测试账号", acc, "会写进验收任务交给测试智能体，请只填测试专用账号")));
       }))));
 }
 
@@ -3120,6 +3259,21 @@ const rtInstalled = (id) => id === "builtin" ? true : rtState.data?.runtimes.fin
 const rtCfg = (id) => { const S = settings.get(); S.runtimes ??= {}; return (S.runtimes[id] ??= { template: rtDef(id).template ?? "", max: 2 }); };
 
 /** 设置页：运行底座 */
+/** 等服务重启完成：以 /health 的启动时间变化为准（旧进程退出前 /health 也是 200），然后刷新页面 */
+async function waitRestart(btn) {
+  let boot = null;
+  try { boot = (await (await fetch("/health", { cache: "no-store" })).json()).boot; } catch { /* 已经在重启 */ }
+  const t0 = Date.now();
+  // 空闲时重启可能要等很久（运行中的工作项结束），不设超时；立即重启 30 秒没起来就报错
+  const limit = btn ? 30_000 : Infinity;
+  const timer = setInterval(async () => {
+    try {
+      const h = await (await fetch("/health", { cache: "no-store" })).json();
+      if (h.boot && h.boot !== boot) { clearInterval(timer); toast("服务已重启", "ok"); setTimeout(() => location.reload(), 400); return; }
+    } catch { /* 还没起来 */ }
+    if (Date.now() - t0 > limit) { clearInterval(timer); toast("重启超时，请检查服务器日志", "err"); if (btn) { btn.disabled = false; btn.textContent = "立即重启"; } }
+  }, btn ? 800 : 3000);
+}
 function runtimesSection(customService) {
   const d = rtState.data;
   // 内置底座能否真正调用：模拟模式，或至少有一条验证过的连接
@@ -3179,10 +3333,25 @@ function runtimesSection(customService) {
               h("a", { class: "link", style: "font-size:12px", onclick: async (e) => { e.target.textContent = "检测中…"; await loadRuntimeModels(r.id, true); renderSettings(); } }, "重新检测"),
               h("span", { class: "muted", style: "font-size:12px" }, data.source ?? "")));
         })(), "在「智能体与工具」里给每个智能体选择具体使用哪个模型") : null,
-        r.id === "builtin" && !builtinReady ? field("缺少凭据", h("div", { class: "row" },
-          h("span", { class: "muted", style: "font-size:12.5px" }, "内置底座走 Anthropic Messages API，需要一条可用的连接"),
-          h("button", { onclick: () => { sg.editing = settings.get().providers.find((p) => !p.verifiedAt)?.id ?? "new"; renderSettings(); } }, "去配置模型服务")),
-          "也可以让智能体改用本机已登录的 CLI 底座（在「智能体与工具」里改）") : null,
+        r.id === "builtin" && !builtinReady ? field("缺少凭据", h("div", {},
+          h("div", { class: "row" },
+            h("span", { class: "muted", style: "font-size:12.5px" }, "内置底座走 Anthropic Messages API，需要一条可用的连接"),
+            h("button", { onclick: () => { sg.editing = settings.get().providers.find((p) => !p.verifiedAt)?.id ?? "new"; renderSettings(); } }, "去配置模型服务")),
+          // 没有 API 连接、但本机有已登录的 CLI：一键把还在用内置底座的智能体切过去，不用逐个改
+          (() => {
+            const ready = (d?.runtimes ?? []).filter((x) => x.id !== "builtin" && x.installed && x.login?.ok);
+            if (!ready.length || !used.length) return null;
+            const target = ready.find((x) => x.id === "claude-code") ?? ready[0];
+            return h("div", { class: "callout warn", style: "margin-top:8px" },
+              h("div", { style: "flex:1" }, h("b", {}, `${used.length} 个智能体用的是内置底座，现在跑不起来：`), h("span", { class: "muted", style: "font-size:12.5px" }, used.join("、"))),
+              h("button", { class: "primary", onclick: async (e) => {
+                if (!confirm(`把这 ${used.length} 个智能体改用本机的 ${target.name}？`)) return;
+                e.target.disabled = true;
+                try { const n = await rpc("studio.switchRuntime", "builtin", target.id); await refreshState(); renderSettings(); toast(`已把 ${n} 个智能体改用 ${target.name}`, "ok"); }
+                catch (err) { e.target.disabled = false; fail(err); }
+              } }, `全部改用 ${target.name}`));
+          })()),
+          "也可以在「智能体与工具」里逐个修改") : null,
         modelMax ? field("模型并发", h("div", { class: "row" }, modelMax, h("span", { class: "muted", style: "font-size:12.5px" }, "同时在途的模型请求数，所有内置智能体共享；超出时按优先级排队，修改后立即生效")), "受 Anthropic 账号的速率限制约束，调太大会遇到 429") : null));
   };
   return section("模型接入", "模型有两个来源：本机已安装并登录的 CLI 底座，或自定义模型服务。有可用的底座就直接用它的模型，没有底座再接自定义服务。检测的是 Hub 所在的机器（部署后即服务器）。",
@@ -3198,20 +3367,27 @@ function runtimesSection(customService) {
         } catch (err) { fail(err); }
         finally { e.target.disabled = false; e.target.textContent = "重新加载配置"; }
       }, title: "重新读取配置、重新检测 CLI 与模型，不中断运行中的任务" }, "重新加载配置"),
-      h("button", { class: "danger", onclick: async (e) => {
-        if (!confirm("重启服务？运行中的任务会被中断，重启后按规则重试或上报（重启约 1～3 秒）。")) return;
-        e.target.disabled = true; e.target.textContent = "重启中…";
-        try { await rpc("system.restart"); } catch { /* 重启时连接会断，属正常 */ }
-        toast("服务正在重启，页面会自动刷新", "review");
-        const t0 = Date.now();
-        const timer = setInterval(async () => {
-          try {
-            const res = await fetch("/health", { cache: "no-store" });
-            if (res.ok) { clearInterval(timer); toast("服务已重启", "ok"); setTimeout(() => location.reload(), 400); return; }
-          } catch { /* 还没起来 */ }
-          if (Date.now() - t0 > 30_000) { clearInterval(timer); toast("重启超时，请检查服务器日志", "err"); e.target.disabled = false; e.target.textContent = "重启服务"; }
-        }, 800);
-      }, title: "结束当前进程并拉起新进程；运行中的任务会被中断" }, "重启服务")),
+      (() => {
+        // 空闲时重启：等运行中的工作项结束再重启，不打断智能体；立即重启会中断它们（哨兵会重试）
+        const pending = S.restartPending;
+        if (pending) return h("span", { class: "row", style: "gap:6px" },
+          h("span", { class: "warn" }, `⏳ 将在空闲时重启：还在等 ${pending.waiting} 个运行中的任务（含测试和子任务）`),
+          h("button", { onclick: async () => { const n = await rpc("system.cancelRestart"); await refreshState(); renderSettings(); toast(n ? `已取消，放行了 ${n} 个挂起的工作项` : "已取消重启", "ok"); } }, "取消"));
+        const running = (S.issues ?? []).filter((i) => i.activeRuns).length;
+        return h("span", { class: "row", style: "gap:6px" },
+          h("button", { title: "暂停开始新的工作项，等运行中的都结束后再重启；被挂起的工作项重启后自动开始", onclick: async () => {
+            const msg = await rpc("system.restart", "idle");
+            toast(msg, "review");
+            await refreshState(); renderSettings();
+            waitRestart(null);
+          } }, "空闲时重启"),
+          h("button", { class: "danger", onclick: async (e) => {
+            if (!confirm(running ? `有 ${running} 个工作项正在运行，立即重启会中断它们（之后由哨兵重试）。确定立即重启？` : "立即重启服务？（约 1～3 秒）")) return;
+            e.target.disabled = true; e.target.textContent = "重启中…";
+            waitRestart(e.target);
+            try { await rpc("system.restart", "now"); } catch { /* 重启时连接会断，属正常 */ }
+          }, title: "结束当前进程并拉起新进程；运行中的任务会被中断" }, "立即重启"));
+      })()),
     (() => {
       const ready = RUNTIME_DEFS.filter((r) => {
         if (r.id === "builtin") return builtinReady;

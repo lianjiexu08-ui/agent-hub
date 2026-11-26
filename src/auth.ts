@@ -18,9 +18,42 @@ export interface Security {
   token?: string;
   /** 用户在首次登录后设置的账号密码（data/auth.json） */
   credentials?: Credentials;
+  /**
+   * 进程级随机密钥：给 CLI 底座的任务桥签发任务级令牌（只能访问 /internal/tasks/<自己的 id>/*）。
+   * 这样任务桥不再需要 HUB_TOKEN，只设了登录密码时 CLI 底座也能回调 Hub。
+   */
+  internalSecret?: string;
 }
 
 export const loginEnabled = (s?: Security | null): s is Security => !!s?.password || !!s?.credentials?.initialized;
+
+/** 是否需要鉴权：每次请求重新判断，首次设置密码后立即生效，不必重启 */
+// 注意：不要用 loginEnabled(s)，类型守卫在 false 分支会把 s 收窄成 never
+export const authRequired = (s?: Security | null): boolean => !!s && (!!s.password || !!s.credentials?.initialized || !!s.token);
+
+/** 任务级令牌：HMAC(进程密钥, 任务 id)，只对该任务的 /internal 接口有效 */
+export const TASK_TOKEN_HEADER = "x-hub-task-token";
+export const taskToken = (taskId: string, secret: string): string => createHmac("sha256", secret).update(`task:${taskId}`).digest("base64url");
+export function verifyTaskToken(taskId: string, token: string | null | undefined, secret: string | undefined): boolean {
+  if (!secret || !token) return false;
+  return safeEqual(token, taskToken(taskId, secret));
+}
+
+/**
+ * 跨站请求防护：浏览器发起的跨站请求一定带 Origin（或 Sec-Fetch-Site: cross-site）。
+ * Origin 与请求的 Host 不一致就拒绝；CLI / MCP / curl 不带 Origin，不受影响。
+ */
+export function isCrossSite(headers: { origin?: string | null; host?: string | null; secFetchSite?: string | null }): boolean {
+  if (headers.secFetchSite === "cross-site") return true;
+  const origin = headers.origin;
+  if (!origin) return false;
+  if (origin === "null") return true; // 沙箱 iframe、file:// 等不透明来源
+  try {
+    return new URL(origin).host !== (headers.host ?? "");
+  } catch {
+    return true;
+  }
+}
 
 /** 会话签名密钥：用户设置过密码就用随机会话密钥（改密码即换），否则用初始密码 */
 export const sessionSecret = (s: Security): string => s.credentials?.secret || s.password;

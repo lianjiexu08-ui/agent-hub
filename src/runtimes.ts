@@ -180,6 +180,36 @@ export function parsePiAuth(raw: string | null): RuntimeLogin | null {
   }
 }
 
+/** pi 的 auth.json 里登录了哪些供应商（只取键名） */
+export function piAuthProviders(raw: string): string[] {
+  try {
+    const j = JSON.parse(raw) as Record<string, unknown>;
+    return Object.entries(j).filter(([, v]) => v && typeof v === "object").map(([k]) => k);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 解析 `pi --list-models` 的表格：provider  model  context  max-out  ...
+ * 列出的是所有已登录供应商的模型（内置目录 + models.json 自定义的）。
+ */
+export function parsePiListModels(raw: string): RuntimeModel[] {
+  const out: RuntimeModel[] = [];
+  const seen = new Set<string>();
+  for (const line of raw.split("\n")) {
+    const cols = line.trim().split(/\s{2,}|\t+/).filter(Boolean);
+    if (cols.length < 2 || /^provider$/i.test(cols[0]) || /^-+$/.test(cols[0])) continue;
+    const [provider, model, context] = cols;
+    if (!/^[\w.-]+$/.test(provider) || !/^[\w./:-]+$/.test(model)) continue;
+    const id = `${provider}/${model}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, name: model, note: `${provider}${context ? ` · ${context} 上下文` : ""}` });
+  }
+  return out;
+}
+
 /** 解析 `pi auth check --provider X --model Y` 的输出 */
 export function parsePiAuthCheck(raw: string | null): { ok: boolean; note: string } {
   const text = (raw ?? "").trim();
@@ -197,8 +227,12 @@ export function runtimeLogin(id: string): RuntimeLogin | null {
       return existsSync(f) ? parseCodexAuth(readFileSync(f, "utf8")) : { ok: false, method: "未登录" };
     }
     if (id === "pi") {
+      // 登录凭据在 auth.json（pi auth login 写入，只看有哪些供应商，不读内容）；models.json 里也可能直接配了 apiKey
+      const auth = join(dir, "agent", "auth.json");
+      const providers = existsSync(auth) ? piAuthProviders(readFileSync(auth, "utf8")) : [];
+      if (providers.length) return { ok: true, method: `已登录 ${providers.join("、")}` };
       const f = join(dir, "agent", "models.json");
-      return existsSync(f) ? parsePiAuth(readFileSync(f, "utf8")) : { ok: false, method: "供应商未配置" };
+      return existsSync(f) ? parsePiAuth(readFileSync(f, "utf8")) : { ok: false, method: "未登录任何供应商（pi auth login）" };
     }
     if (id === "gemini") {
       if (!existsSync(join(dir, "oauth_creds.json"))) return { ok: false, method: "未登录" };
@@ -332,10 +366,16 @@ export async function detectRuntimeModels(id: string, opts: { force?: boolean } 
     if (raw) { try { models = parseCodexModels(raw); source = "codex debug models"; } catch { source = "codex 输出无法解析"; } }
     else source = "无法运行 codex debug models";
   } else if (id === "pi") {
-    try {
-      models = parsePiModels(readFileSync(join(home, "agent", "models.json"), "utf8"));
-      source = "~/.pi/agent/models.json";
-    } catch { source = "没有读到 pi 的模型配置"; }
+    // 优先用 pi 自己列出的可用模型（含已登录供应商的内置目录）；拿不到时退回 models.json
+    const raw = await exec("pi", ["--list-models"], 30_000);
+    if (raw) models = parsePiListModels(raw);
+    if (models.length) source = "pi --list-models";
+    else {
+      try {
+        models = parsePiModels(readFileSync(join(home, "agent", "models.json"), "utf8"));
+        source = "~/.pi/agent/models.json";
+      } catch { source = "没有读到 pi 的模型配置"; }
+    }
   } else if (id === "claude-code") {
     let json: string | null = null;
     try { json = readFileSync(join(home, "settings.json"), "utf8"); } catch { /* 无配置 */ }

@@ -1,6 +1,18 @@
 /** GitHub REST 客户端（Personal Access Token）。Token 只保存在服务端。 */
 export interface GhIssue { number: number; title: string; body: string | null; state: string; state_reason?: string | null; labels: (string | { name: string })[]; pull_request?: unknown }
 
+export interface CiStatus { state: "passing" | "failing" | "pending" | "none" | "unknown"; sha: string; failed: string[]; pending: string[]; checkedAt: string; /** 失败 job 的页面链接（交回开发修复时附上） */ failedUrls?: string[]; /** state = unknown 时读不到的原因 */ error?: string; /** 结果来自哪个接口 */ source?: "checks" | "actions" }
+/** 汇总 check runs：cancelled / timed_out / action_required 也算失败（需要人看） */
+export function summarizeChecks(sha: string, runs: { name: string; status: string; conclusion: string | null; html_url?: string }[]): CiStatus {
+  const ok = new Set(["success", "neutral", "skipped"]);
+  const bad = runs.filter((r) => r.status === "completed" && !ok.has(r.conclusion ?? ""));
+  const failed = bad.map((r) => r.name);
+  const failedUrls = bad.map((r) => r.html_url).filter((u): u is string => !!u);
+  const pending = runs.filter((r) => r.status !== "completed").map((r) => r.name);
+  const state = !runs.length ? "none" : failed.length ? "failing" : pending.length ? "pending" : "passing";
+  return { state, sha, failed, pending, checkedAt: new Date().toISOString(), ...(failedUrls.length ? { failedUrls } : {}) };
+}
+
 export class GitHub {
   private token: () => string | null;
   private base: string;
@@ -55,6 +67,19 @@ export class GitHub {
     }
     return [...new Set(out)];
   }
+  /** 令牌可见的组织（新建仓库时可选的归属） */
+  async orgs(): Promise<string[]> {
+    const list = await this.req<{ login: string }[]>("GET", "/user/orgs?per_page=100");
+    return list.map((o) => o.login);
+  }
+  /**
+   * 新建仓库。auto_init 会生成带 README 的初始提交：Hub 给工作项开分支要基于默认分支，
+   * 完全空的仓库没有默认分支，第一次运行就会失败。
+   */
+  createRepo(input: { org?: string | null; name: string; private: boolean; description?: string }) {
+    const body = { name: input.name, private: input.private, description: input.description ?? "", auto_init: true };
+    return this.req<{ full_name: string; default_branch: string }>("POST", input.org ? `/orgs/${encodeURIComponent(input.org)}/repos` : "/user/repos", body);
+  }
   repo(full: string) { return this.req<{ default_branch: string; full_name: string }>("GET", `/repos/${full}`); }
   /** 分页读取 issue（不含 PR）。state=all 时用于拉回远端的关闭 / 重新打开；since 只取此后有更新的 */
   async listIssues(full: string, opts: { state?: "open" | "all"; since?: string | null; maxPages?: number } = {}): Promise<GhIssue[]> {
@@ -76,7 +101,31 @@ export class GitHub {
   removeLabel(full: string, n: number, label: string) { return this.req("DELETE", `/repos/${full}/issues/${n}/labels/${encodeURIComponent(label)}`); }
   createPR(full: string, o: { title: string; head: string; base: string; body: string }) { return this.req<{ number: number }>("POST", `/repos/${full}/pulls`, o); }
   mergePR(full: string, n: number) { return this.req("PUT", `/repos/${full}/pulls/${n}/merge`, { merge_method: "squash" }); }
-  pr(full: string, n: number) { return this.req<{ merge_commit_sha: string | null; base: { ref: string } }>("GET", `/repos/${full}/pulls/${n}`); }
+  pr(full: string, n: number) { return this.req<{ merge_commit_sha: string | null; base: { ref: string }; head: { sha: string } }>("GET", `/repos/${full}/pulls/${n}`); }
+  /**
+   * PR 最新提交的 CI 结果（GitHub Actions 等 check runs）。
+   * 任何一个失败 → failing；还有没跑完的 → pending；全部成功 / 跳过 → passing；没有配置 CI → none。
+   */
+  async ciStatus(full: string, n: number): Promise<CiStatus> {
+    const { head } = await this.pr(full, n);
+    try {
+      const d = await this.req<{ check_runs: { name: string; status: string; conclusion: string | null; html_url?: string }[] }>("GET", `/repos/${full}/commits/${head.sha}/check-runs?per_page=100`);
+      return { ...summarizeChecks(head.sha, d.check_runs), source: "checks" };
+    } catch (e) {
+      // 细粒度令牌读不了 check runs（403 Resource not accessible）：改读 GitHub Actions 的运行与 job（需要 Actions: Read）
+      if (!/→ (403|404)/.test((e as Error).message)) throw e;
+    }
+    const runs = await this.req<{ workflow_runs: { id: number; name: string; run_attempt?: number; created_at: string }[] }>("GET", `/repos/${full}/actions/runs?head_sha=${head.sha}&per_page=50`);
+    // 同一个工作流可能被重跑：每个工作流只看最新的一次
+    const latest = new Map<string, { id: number; created_at: string }>();
+    for (const r of runs.workflow_runs) { const cur = latest.get(r.name); if (!cur || r.created_at > cur.created_at) latest.set(r.name, r); }
+    const jobs: { name: string; status: string; conclusion: string | null; html_url?: string }[] = [];
+    for (const r of latest.values()) {
+      const d = await this.req<{ jobs: { name: string; status: string; conclusion: string | null; html_url?: string }[] }>("GET", `/repos/${full}/actions/runs/${r.id}/jobs?per_page=100`);
+      jobs.push(...d.jobs);
+    }
+    return { ...summarizeChecks(head.sha, jobs), source: "actions" };
+  }
   async prFiles(full: string, n: number): Promise<string[]> {
     const files = await this.req<{ filename: string }[]>("GET", `/repos/${full}/pulls/${n}/files?per_page=100`);
     return files.map((f) => f.filename);
