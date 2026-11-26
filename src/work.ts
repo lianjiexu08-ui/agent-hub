@@ -1442,6 +1442,9 @@ export class Work {
     const last = runs.at(-1);
     const quota = i.status === "todo" && last?.status === "failed" ? quotaReset(last.error, new Date(last.updatedAt)) : null;
     if (quota && +quota > Date.now()) return { text: `等额度 ${quota.toTimeString().slice(0, 5)}`, tone: "wait", title: `模型额度用完，预计 ${quota.toLocaleString()} 恢复后自动继续` };
+    // 被重启或网络抖动打断：不是这张单的问题，哨兵会自动续跑，别显示成「失败」
+    if (i.status === "todo" && last?.status === "failed" && (/interrupted by service restart|服务重启/.test(last.error ?? "") || isTransientError(last.error)))
+      return { text: "等待续跑", tone: "wait", title: `${(last.error ?? "").slice(0, 200)}。不是需求或代码的问题，哨兵会自动从中断的阶段继续` };
     if (i.status === "todo" && last?.status === "failed") return { text: "上次失败", tone: "fail", title: last.error ?? "" };
     if (i.status === "in_review" && i.pr?.guard && i.pr.state === "open") return { text: "等你确认合并", tone: "need", title: i.pr.guard };
     if (i.status === "in_review" && i.pr?.local === "local" && i.pr.state === "merged") return { text: "待提测", tone: "wait", title: "已合并本地开发分支，等人工提测" };
