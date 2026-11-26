@@ -79,6 +79,13 @@ export class CliRunner implements CliExecutor {
   private store: Store | null = null;
   /** 任务所属工作项的编号（测试任务取被测工作项）：注入 HUB_ISSUE_KEY，方便项目按工作项隔离测试库、端口等 */
   private issueKeyFor: (task: Task) => string | null;
+  /**
+   * 这次运行用哪个会话：同一张单同一轮固定一个会话 ID。resume = 之前用这个会话跑过（被中断了），
+   * 这次带着原来的对话接着跑，而不是从头再来。返回 null 表示不管理会话。
+   */
+  sessionFor: ((task: Task) => { id: string; resume: boolean } | null) | null = null;
+  /** 会话里已经有内容了（之后中断可以恢复） */
+  onSessionStarted: ((task: Task, id: string) => void) | null = null;
   constructor(settings: Settings, opts: { tmpDir: string; hubUrl: () => string; cwdFor: (task: Task) => string | null; store?: Store; taskToken?: (taskId: string) => string; issueKeyFor?: (task: Task) => string | null }) {
     this.issueKeyFor = opts.issueKeyFor ?? (() => null);
     this.taskToken = opts.taskToken ?? null;
@@ -198,6 +205,13 @@ export class CliRunner implements CliExecutor {
     // 模型留空时去掉 --model / -m 参数
     if (!agent.cliModel) args = args.filter((a, i) => !(a === "{model}" || (["--model", "-m"].includes(a) && args[i + 1] === "{model}")));
     args = args.map((a) => a.replace(/\{(prompt|system|model|mcp_config)\}/g, (_, k) => vars[k] ?? ""));
+    // 会话：pi 用 --session-id（有就续、没有就建）；Claude Code 首次 --session-id、续跑 --resume
+    const sess = this.sessionFor?.(task) ?? null;
+    let sessMarked = false;
+    if (sess && !args.some((a) => ["--session-id", "--resume", "-r", "--session", "--continue", "-c", "--no-session-persistence", "--no-session"].includes(a))) {
+      if (agent.runtime === "pi") args.push("--session-id", sess.id);
+      else if (agent.runtime === "claude-code") args.push(...(sess.resume ? ["--resume", sess.id] : ["--session-id", sess.id]));
+    }
     // pi 不信任项目文件时不会读 .pi/mcp.json，Hub 工具就接不上：老模板里没有 -a 的补上
     if (agent.runtime === "pi" && !args.some((a) => a === "-a" || a === "--approve")) args.splice(1, 0, "-a");
     const [cmd, ...rest] = args;
@@ -212,7 +226,11 @@ export class CliRunner implements CliExecutor {
       let ev: any;
       try { ev = JSON.parse(line); } catch { return; }
       const before = transcript.length;
-      try { handle(ev); } finally { if (transcript.length !== before) ctx.progress?.(transcript); }
+      try { handle(ev); } finally {
+        if (transcript.length !== before) ctx.progress?.(transcript);
+        // 智能体说过话了，会话里就有内容可恢复
+        if (sess && !sessMarked && transcript.some((m) => m.role === "assistant")) { sessMarked = true; this.onSessionStarted?.(task, sess.id); }
+      }
     };
     const handle = (ev: any) => {
       // Claude Code stream-json

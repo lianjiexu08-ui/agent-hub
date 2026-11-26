@@ -133,6 +133,10 @@ runtime.cli = cliRunner;
 // 上一个 Hub 进程被强杀 / 崩溃时留下的 CLI：先清掉，免得它和即将重试的新运行同时改一个 worktree
 const reaped = cliRunner.reapOrphans();
 if (reaped) console.warn(`结束了上次遗留的 ${reaped} 个 CLI 进程`);
+// 中断后续跑：CLI 底座按会话恢复，内置底座装回之前的对话
+cliRunner.sessionFor = (task) => work.sessionFor(task);
+cliRunner.onSessionStarted = (task, id) => work.sessionStarted(task, id);
+runtime.resumeMessagesFor = (task) => work.resumeMessagesFor(task);
 // 可选的文件 / 命令 / 知识检索工具：按智能体的 builtinTools 逐个开启
 registerToolbox(runtime, { work, workspace, store, settings });
 // 智能体会话：两个智能体围绕一个议题多轮往返，收敛出一条结论。

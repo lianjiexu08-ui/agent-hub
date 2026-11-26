@@ -22,6 +22,8 @@ import { pickState, statusForStateType, type Linear, type LinearState } from "./
 import type { Workspace } from "./workspace.ts";
 import { backoffMs, isTransientError } from "./transient.ts";
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import type { BetaMessageParam } from "@anthropic-ai/sdk/resources/beta/messages/messages";
 
 export const PHASES = ["understand", "plan", "do", "test", "review"] as const;
 export type Phase = (typeof PHASES)[number];
@@ -46,6 +48,11 @@ export interface Issue {
     auto?: { claimed?: boolean; fired?: boolean; warned?: boolean } } | null;
   pr: PR | null; phases: PhaseRec[]; cycle: number; phase: Phase | null;
   /** 因网络抖动自动续跑的次数（成功一次即清零） */ netRetries?: number;
+  /**
+   * 智能体会话：同一张单、同一负责人、同一轮用同一个会话。被中断（网络、重启）后带着原来的对话接着跑，
+   * 而不是把这个阶段从头再做一遍。started = 会话里已经有内容；prevTask = 被中断的那次运行（内置底座从它恢复对话）
+   */
+  session?: { id: string; agent: string; cycle: number; started: boolean; prevTask?: string | null } | null;
   /** 项目负责人正在代为确认需求（此时还不需要人处理） */ leadDeciding?: boolean;
   /** 项目负责人已确定的部分需求，人回答剩余问题时合并进去 */ leadDraft?: string | null;
   blocked: string[] | null; reqConfirmed?: boolean; budgetHold?: boolean; lifecycleDone?: boolean;
@@ -926,10 +933,20 @@ export class Work {
     const p = this.proj(i.projectId);
     const cfg = p?.linear;
     if (!cfg || i.linear || !this.canPushLinear(p)) return null;
-    const created = await this.linear.createIssue({ teamId: cfg.teamId, title: i.title, description: i.description, priority: i.priority });
-    i.linear = { id: created.id, identifier: created.identifier, url: created.url, state: "open", stateId: created.state?.id, priority: i.priority, localStatus: i.status, syncedAt: now() };
+    // 子单：挂到父单的 Linear issue 下，指派人跟父单一致（团队在父单下面就能看到拆分和进度）
+    const parent = i.parentId != null ? this.getIssue(i.parentId) : undefined;
+    const parentLin = parent?.linear;
+    const state = pickState(await this.linearStatesFor(cfg.teamId).catch(() => []), i.status);
+    const origin = i.createdBy !== ME && parent ? `\n\n---\n由 Hub 智能体 ${i.createdBy} 从 ${this.key(parent)}${parentLin ? `（${parentLin.identifier}）` : ""} 拆分。` : "";
+    const created = await this.linear.createIssue({
+      teamId: cfg.teamId, title: i.title, description: `${i.description}${origin}`, priority: i.priority,
+      ...(state ? { stateId: state.id } : {}),
+      ...(parentLin ? { parentId: parentLin.id } : {}),
+      ...(parentLin?.assignee?.id ? { assigneeId: parentLin.assignee.id } : {}),
+    });
+    i.linear = { id: created.id, identifier: created.identifier, url: created.url, state: "open", stateId: created.state?.id, priority: i.priority, localStatus: i.status, syncedAt: now(), assignee: parentLin?.assignee ?? null };
     this.save(i);
-    this.addComment(i.id, "system", "system", `↗ 已创建 Linear ${created.identifier}`);
+    this.addComment(i.id, "system", "system", `↗ 已创建 Linear ${created.identifier}${parentLin ? `（挂在 ${parentLin.identifier} 下）` : ""}`);
     return created.identifier;
   }
 
@@ -1089,7 +1106,9 @@ export class Work {
     }
     this.save(i);
     const n = input.github ? await this.pushNew(i).catch(() => null) : null;
-    const ln = input.linear ? await this.pushLinearNew(i).catch(() => null) : null;
+    // 人建单时按勾选决定；智能体建的（比如拆出来的子单）按项目「新建工作项时同时创建 Linear issue」的设置
+    const wantLinear = input.linear ?? (actor !== ME && !!this.proj(i.projectId)?.linear?.pushNew);
+    const ln = wantLinear ? await this.pushLinearNew(i).catch((e) => { this.addComment(i.id, "system", "system", `⚠ 创建 Linear issue 失败：${(e as Error).message}`); return null; }) : null;
     this.save(i);
     const depNote = i.dependsOn?.length ? `，依赖 ${i.dependsOn.map((d) => this.key(this.getIssue(d)!)).join("、")}` : "";
     this.addComment(i.id, "system", "system", `${actor} 创建了${input.hotfix ? " ⚡ Hotfix" : "工作项"}${depNote}${n ? `，并创建了 GitHub #${n}` : ""}${ln ? `，并创建了 Linear ${ln}` : ""}`);
@@ -1499,10 +1518,58 @@ export class Work {
         this.preparing.delete(i.id);
       }
     }
-    const task = this.runtime.submit(i.assignee!, this.buildInput(i, resume), { source: "issue", issueId: i.id, hops: opts.hops ?? 0, priority: i.priority });
-    this.addComment(i.id, "system", "system", resume ? `▶ ${i.assignee} 从「${PHASE_LABEL[i.phase!]}」继续（由 ${by} 触发，仍是第 ${i.cycle} 轮）` : `▶ ${i.assignee} 开始执行（由 ${by} 触发），第 ${i.cycle} 轮`, task.id);
+    const cur0 = this.getIssue(i.id) ?? i;
+    const prev = this.runsOf(i.id).at(-1);
+    const same = resume && cur0.session && cur0.session.agent === i.assignee && cur0.session.cycle === i.cycle;
+    cur0.session = same ? { ...cur0.session!, prevTask: prev?.id ?? null } : { id: randomUUID(), agent: i.assignee!, cycle: i.cycle, started: false, prevTask: null };
+    const continuing = !!same && (cur0.session.started || this.builtinHasHistory(cur0.session.prevTask));
+    this.save(cur0);
+    const input = continuing ? this.continueInput(cur0) : this.buildInput(cur0, resume);
+    const task = this.runtime.submit(i.assignee!, input, { source: "issue", issueId: i.id, hops: opts.hops ?? 0, priority: i.priority });
+    this.addComment(i.id, "system", "system", continuing ? `▶ ${i.assignee} 接着上次的进度继续「${PHASE_LABEL[cur0.phase!]}」（由 ${by} 触发，保留之前的对话，第 ${i.cycle} 轮）`
+      : resume ? `▶ ${i.assignee} 从「${PHASE_LABEL[cur0.phase!]}」继续（由 ${by} 触发，仍是第 ${i.cycle} 轮）` : `▶ ${i.assignee} 开始执行（由 ${by} 触发），第 ${i.cycle} 轮`, task.id);
     this.emit("issue");
     return task;
+  }
+
+  /** 带着原对话续跑时发的那一句：不重复整份需求，提醒它接着做、别重来 */
+  private continueInput(i: Issue): string {
+    return [
+      `（运行被中断了——网络异常或服务重启，不是你的问题。上面是你之前的完整过程，工作目录里的改动都还在。）`,
+      `请接着做 ${this.key(i)} 的「${PHASE_LABEL[i.phase ?? "understand"]}」阶段：先看一眼工作目录现状确认做到哪了，然后从中断的地方继续，不要重做已经完成的步骤。`,
+      "阶段完成后照常调用 report_phase 汇报。",
+    ].join("\n");
+  }
+  /** CLI 底座询问这次运行用哪个会话 */
+  sessionFor(task: Task): { id: string; resume: boolean } | null {
+    if (task.issueId == null || task.parentId !== null || task.source !== "issue") return null;
+    const s = this.getIssue(task.issueId)?.session;
+    if (!s || s.agent !== task.agent) return null;
+    return { id: s.id, resume: s.started };
+  }
+  sessionStarted(task: Task, id: string) {
+    const i = task.issueId != null ? this.getIssue(task.issueId) : undefined;
+    if (i?.session?.id === id && !i.session.started) { i.session = { ...i.session, started: true }; this.save(i); }
+  }
+  /** 内置底座续跑：把被中断那次运行的对话装回去（去掉末尾没有结果的工具调用），再接上新的一句 */
+  resumeMessagesFor(task: Task): BetaMessageParam[] | null {
+    if (task.issueId == null || task.parentId !== null || task.source !== "issue") return null;
+    const s = this.getIssue(task.issueId)?.session;
+    if (!s?.prevTask || s.agent !== task.agent) return null;
+    const msgs = this.store.getMessages(s.prevTask);
+    if (msgs.length < 2) return null;
+    const out = msgs.slice();
+    // 末尾是带工具调用的助手消息（结果没回来就被打断了）：去掉，不然接口会报缺少 tool_result
+    while (out.length && out.at(-1)!.role === "assistant") out.pop();
+    // 末尾是工具结果：后面要接新的用户消息，合并成同一条用户消息
+    const tail = out.at(-1);
+    const add = { type: "text" as const, text: task.input };
+    if (tail?.role === "user") out[out.length - 1] = { role: "user", content: [...(Array.isArray(tail.content) ? tail.content : [{ type: "text" as const, text: String(tail.content) }]), add] as never };
+    else out.push({ role: "user", content: task.input });
+    return out;
+  }
+  private builtinHasHistory(taskId?: string | null): boolean {
+    return !!taskId && this.store.getMessages(taskId).length > 1;
   }
 
   private buildInput(i: Issue, resume = false): string {
@@ -1712,17 +1779,25 @@ export class Work {
       this.save(i);
       await this.syncStatusRemote(i);
       await this.afterDeliver(i);
+    } else if (task.status === "failed" && i.session && /No conversation found|already in use|session.{0,20}not found/i.test(task.error ?? "") && i.assignee) {
+      // 会话恢复本身失败（会话丢了 / ID 被占用）：换一个新会话，从当前阶段开头接着做
+      i.session = null;
+      this.save(i);
+      this.addComment(i.id, "system", "system", `⟳ 之前的对话无法恢复（${(task.error ?? "").slice(0, 60)}），改为从「${PHASE_LABEL[i.phase ?? "understand"]}」阶段开头继续`, task.id);
+      this.emit("issue");
+      setTimeout(() => { const cur = this.getIssue(i.id); if (cur && !this.activeRun(cur.id)) void this.startRun(cur, "会话恢复", { resume: true }).catch(() => {}); }, 2000);
+      return;
     } else if (task.status === "failed" && isTransientError(task.error) && (i.netRetries ?? 0) < 6 && i.assignee) {
       // 网络抖动（连不上模型服务、5xx、限流）：不算失败，工作目录与阶段进度都保留，退避后从中断的阶段接着跑。
       // 不改状态、不同步到 Linear / GitHub、不写「运行失败」，避免一次抖动把整张单打回待办。
       const n = i.netRetries ?? 0;
       const act = i.phases.findLast((r) => r.result === "active" || r.result === "blocked");
-      if (act) { act.result = "cancelled"; act.endedAt = now(); act.note = `网络异常中断：${task.error}`; i.resumeFrom = resumePoint(act.phase); }
+      // 阶段保持「进行中」：中断不是这个阶段的结论；phase 也不清空，续跑时接着同一个阶段、同一轮
+      if (act) act.note = `网络异常，自动续跑中（第 ${n + 1} 次）`;
       i.netRetries = n + 1;
-      i.phase = null;
       this.save(i);
       const wait = backoffMs(n);
-      this.addComment(i.id, "system", "system", `⟳ 网络异常（${(task.error ?? "").slice(0, 80)}），${wait} 秒后从「${act ? PHASE_LABEL[act.phase] : "中断处"}」继续（第 ${n + 1} 次，进度不丢）`, task.id);
+      this.addComment(i.id, "system", "system", `⟳ 网络异常（${(task.error ?? "").slice(0, 80)}），${wait} 秒后接着「${act ? PHASE_LABEL[act.phase] : "中断处"}」继续（第 ${n + 1} 次，保留之前的对话）`, task.id);
       this.emit("issue");
       setTimeout(() => {
         const cur = this.getIssue(i.id);
@@ -2102,6 +2177,7 @@ export class Work {
 
   /** 启动时：进行中但已无活跃运行的工作项（因重启中断）退回 todo */
   private reconcile() {
+    let resumed = 0;
     for (const i of this.issues().filter((x) => x.status === "in_progress")) {
       if (this.activeRun(i.id)) continue;
       // 生命周期已经走完，只是交付收尾（审核、合并）被重启打断：补做收尾，而不是打回待办
@@ -2114,12 +2190,24 @@ export class Work {
         continue;
       }
       const act = i.phases.findLast((r) => r.result === "active" || r.result === "blocked");
-      if (act) { act.result = "cancelled"; act.endedAt = now(); act.note = "服务重启，运行中断"; i.resumeFrom = resumePoint(act.phase); }
-      i.phase = null;
+      // 等人确认需求时被重启：问题还在，只是等待的运行没了，重新进入等待即可
+      if (act?.result === "blocked") {
+        act.result = "cancelled"; act.endedAt = now(); act.note = "服务重启，运行中断"; i.resumeFrom = resumePoint(act.phase);
+        i.phase = null; i.blocked = null; i.status = "todo";
+        this.save(i);
+        this.addComment(i.id, "system", "system", "服务重启，进行中的运行已中断。可重新运行（哨兵会自动重试）。");
+        continue;
+      }
+      // 其余：保持进行中、阶段不变，启动完成后带着原来的对话接着跑（错开几秒，避免同时拉起一堆进程）
+      if (act) act.note = "服务重启，自动接着跑";
       i.blocked = null;
-      i.status = "todo";
       this.save(i);
-      this.addComment(i.id, "system", "system", "服务重启，进行中的运行已中断。可重新运行（哨兵会自动重试）。");
+      this.addComment(i.id, "system", "system", `Hub 重启，「${act ? PHASE_LABEL[act.phase] : "当前阶段"}」会在启动后接着跑（保留之前的对话，不重做）`);
+      const delay = 3000 + resumed++ * 4000;
+      setTimeout(() => {
+        const cur = this.getIssue(i.id);
+        if (cur && cur.status === "in_progress" && cur.assignee && !this.activeRun(cur.id)) void this.startRun(cur, "重启恢复", { resume: true }).catch(() => {});
+      }, delay);
       void this.syncStatusRemote(i).catch(() => []);
     }
   }

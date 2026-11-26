@@ -35,6 +35,7 @@ const remote: Remote[] = [
 const updates: { id: string; input: Record<string, unknown> }[] = [];
 /** 远端 issue 上人写的评论（提测反馈） */
 const remoteComments: Record<string, string[]> = {};
+const creates: Record<string, unknown>[] = [];
 const comments: { issueId: string; body: string }[] = [];
 /** 下一次 issueUpdate 返回失败，用来验证失败会被记录下来 */
 let failUpdate = false;
@@ -62,6 +63,7 @@ const server = createServer(async (req, res) => {
     return ok({ team: { issues: { nodes: page.map(toIssue), pageInfo: { hasNextPage: more, endCursor: more ? String(start + 100) : null } } } });
   }
   if (query.includes("issueCreate")) {
+    creates.push(variables.input);
     const n = ++seq;
     const r: Remote = { id: `lin-${n}`, identifier: `ENG-${n}`, title: variables.input.title, description: variables.input.description ?? "", priority: variables.input.priority ?? 0, url: `https://linear.app/x/issue/ENG-${n}`, updatedAt: new Date().toISOString(), stateId: "s-todo", labels: [] };
     remote.push(r);
@@ -431,4 +433,30 @@ test("提测打回：Hub 交付过的单在 Linear 上被改回 In Progress，�
   const body = work.detail(imported.key).activity.find((c) => /提测未通过/.test(c.body))!.body;
   assert.match(body, /Chrome 120 必现/, "提测反馈带给了智能体");
   assert.notEqual(work.list(p.id).find((i) => i.key === imported.key)!.status, "in_review");
+});
+
+test("智能体拆出的子单自动推到 Linear，挂在父单下、指派人跟父单一致；人建的单仍按勾选", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "lin_…test", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+  const r1 = remote.find((r) => r.id === "lin-1")!;
+  r1.stateId = "s-todo";
+  r1.assignee = { id: "u-me", name: "me" };
+  const p = work.saveProject({ name: "子单推送", key: "SUBS" });
+  await work.connectLinear(p.id, "team-1");
+  await work.syncLinear(p.id);
+  const parent = work.list(p.id).find((i) => i.linear!.identifier === "ENG-1")!;
+  creates.length = 0;
+  const kid = await work.create({ projectId: p.id, title: "拆分出的子任务", description: "做 A", parent: parent.key, status: "backlog" }, "architect");
+  const k = work.list(p.id).find((i) => i.key === kid.key)!;
+  assert.ok(k.linear, "子单已关联 Linear");
+  assert.equal(creates.length, 1);
+  assert.equal(creates[0].parentId, "lin-1", "挂在父单下");
+  assert.equal(creates[0].assigneeId, "u-me", "指派人跟父单一致");
+  assert.match(String(creates[0].description), /由 Hub 智能体 architect 从/);
+  creates.length = 0;
+  await work.create({ projectId: p.id, title: "人建的不勾选", linear: false });
+  assert.equal(creates.length, 0, "人建单不勾选就不推");
 });

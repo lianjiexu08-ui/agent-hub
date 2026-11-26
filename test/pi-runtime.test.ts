@@ -109,3 +109,29 @@ test("pi 重试用尽仍失败：按失败处理，错误原样带出（交给 H
   await assert.rejects(runFakePi([failed, { type: "auto_retry_start", attempt: 1 }, failed, { type: "auto_retry_end", success: false, attempt: 3, finalError: TIMEOUT }]), /Connect Timeout/);
   await assert.rejects(runFakePi([failed, { type: "agent_end", messages: [] }]), /Connect Timeout/);
 });
+
+test("续跑：pi 带上同一个 --session-id；智能体说过话后通知会话已有内容", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hub-pi-sess-"));
+  const bin = join(root, "bin"); const cwd = join(root, "wt");
+  mkdirSync(bin); mkdirSync(cwd);
+  const seen = join(root, "args.json");
+  writeFileSync(join(bin, "pi"), `#!/usr/bin/env node
+require("fs").writeFileSync(${JSON.stringify(seen)}, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "接着做" }], stopReason: "stop", usage: {} } }));
+console.log(JSON.stringify({ type: "agent_end", messages: [] }));
+`);
+  chmodSync(join(bin, "pi"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  try {
+    const runner = new CliRunner(new Settings(new Store(":memory:")), { tmpDir: join(root, "tmp"), hubUrl: () => "http://127.0.0.1:1", cwdFor: () => cwd, taskToken: (id) => `tok-${id}` });
+    const started: string[] = [];
+    runner.sessionFor = () => ({ id: "sess-123", resume: true });
+    runner.onSessionStarted = (_t, id) => started.push(id);
+    const agent = AgentSchema.parse({ name: "backend-dev", description: "d", runtime: "pi", cliModel: "x/y" });
+    await runner.run({ id: "t-sess", agent: "backend-dev", input: "继续" } as unknown as Task, agent, { system: "s", signal: new AbortController().signal, heartbeat: () => {} });
+    const args = JSON.parse(readFileSync(seen, "utf8")) as string[];
+    assert.equal(args[args.indexOf("--session-id") + 1], "sess-123");
+    assert.deepEqual(started, ["sess-123"]);
+  } finally { process.env.PATH = oldPath; }
+});

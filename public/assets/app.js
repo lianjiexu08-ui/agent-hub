@@ -461,9 +461,9 @@ function connect() {
       else if (e.status === "cancelled") toast(`■ ${e.key} 已停止`);
     }
     if (e.kind === "phase" && e.result === "fail") toast(`${e.key} ${e.phase === "test" ? "测试未通过，回到执行修复" : "评审未通过，开始新一轮"}`, "err");
-    debounce("state", refreshState, 250);
+    throttleState();
   });
-  es.addEventListener("task", (ev) => { const { task } = JSON.parse(ev.data); if (task.issueId != null || task.source === "qa") debounce("state", refreshState, 400); });
+  es.addEventListener("task", (ev) => { const { task } = JSON.parse(ev.data); if (task.issueId != null || task.source === "qa") throttleState(); });
 }
 
 async function loadAll() {
@@ -513,6 +513,16 @@ async function rpc(method, ...args) {
   return r?.result;
 }
 let refreshing = null, refreshAgain = false;
+/**
+ * 事件驱动的整体刷新：节流到最多每 2.5 秒一次（期间的事件合并到下一次）。
+ * 多个智能体同时在跑时进度事件几乎不断，用防抖会变成一个刷新接一个刷新，把服务器压满。
+ */
+let stateTimer = null, stateLast = 0;
+function throttleState() {
+  if (stateTimer) return;
+  const wait = Math.max(0, 2500 - (Date.now() - stateLast));
+  stateTimer = setTimeout(() => { stateTimer = null; stateLast = Date.now(); refreshState(); }, wait);
+}
 function refreshState() {
   if (refreshing) { refreshAgain = true; return refreshing; }
   refreshing = (async () => {
@@ -2947,7 +2957,7 @@ async function uploadFiles(files) {
   if (!list.length) return;
   const fd = new FormData();
   for (const f of list.slice(0, 10)) fd.append("file", f, f.name || "截图.png");
-  const res = await fetch("/api/upload", { method: "POST", headers: token ? { authorization: `Bearer ${token}` } : {}, body: fd });
+  const res = await fetch("/api/upload", { method: "POST", body: fd });
   let data = null;
   try { data = await res.json(); } catch { /* 非 JSON */ }
   if (!res.ok) throw new Error(data?.error || `上传失败（HTTP ${res.status}）`);
@@ -2955,7 +2965,8 @@ async function uploadFiles(files) {
   renderHome();
 }
 /** 待发送的附件：图片显示缩略图，文件显示名称 */
-const attUrl = (u) => (token && (u?.startsWith("/uploads/") || u?.startsWith("/qa-shots/")) ? u + (u.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : u);
+// 登录改成了会话 Cookie：同源的图片请求会自动带上，不需要再拼令牌（旧的全局 token 已不存在，引用它会直接报错）
+const attUrl = (u) => u;
 function attachChips(list, onRemove) {
   if (!list?.length) return null;
   return h("div", { class: "att-chips" }, list.map((a, n) => h("span", { class: "att-chip", title: `${a.name} · ${Math.max(1, Math.round((a.size ?? 0) / 1024))} KB` },
@@ -3431,6 +3442,7 @@ function envView(S) {
 let qaOpen = null;
 function openRun(id) {
   qaOpen = id;
+  runSig = "";
   ui.focusReturn = document.activeElement;
   $("#qaDrawer").classList.add("open");
   $("#qaDrawer").setAttribute("aria-hidden", "false");
@@ -3439,9 +3451,17 @@ function openRun(id) {
   $("#qaDrawer").focus({ preventScroll: true });
 }
 function closeRun() { qaOpen = null; $("#qaDrawer").classList.remove("open"); $("#qaDrawer").setAttribute("aria-hidden", "true"); if (!ui.openKey) $("#scrim").classList.remove("open"); restoreFocus(); }
+/** 验收详情里人手动展开 / 收起的用例（按验收 id + 用例 id 记），重绘后保持 */
+const runOpen = new Map();
+let runSig = "";
 function renderRun() {
   const r = qaOpen && qa.run(qaOpen);
   if (!r) return;
+  // 内容没变就不重绘：结束的验收不会再变；进行中的只在步骤推进时重绘
+  const sig = JSON.stringify([r.id, r.status, r.wait, r.cursor, r.cases.map((c) => [c.status, c.steps.length, c.steps.filter((x) => x.status).length])]);
+  if (sig === runSig && $("#qaDrawer").children.length) return;
+  runSig = sig;
+  const keepScroll = $("#qaDrawer").scrollTop;
   const bad = r.cases.filter((c) => c.status === "failed").length;
   fill($("#qaDrawer"),
     h("div", { class: "dr-head" }, h("a", { onclick: () => { closeRun(); location.hash = "#issue=" + r.issueKey; } }, r.issueKey), h("span", {}, "/ 验收"), runBadge2(r.status),
@@ -3456,7 +3476,9 @@ function renderRun() {
       "结果", ["passed", "failed"].includes(r.status) ? `用例 ${caseCount(r)} 通过${bad ? `，${bad} 个未通过` : ""}` : r.wait ?? "执行中…"]),
     r.status === "failed" ? h("div", { class: "callout warn", style: "margin-top:12px" }, "未通过的用例和复现步骤已写回工作项，智能体会回到「执行」阶段修复后重新验收。") : null,
     h("div", { class: "section-title" }, "用例"),
-    r.cases.map((c, n) => h("details", { class: "case " + (c.status ?? "pending"), open: c.status === "failed" || (r.cursor && r.cursor.c === n) || null },
+    r.cases.map((c, n) => h("details", { class: "case " + (c.status ?? "pending"),
+      open: (runOpen.has(`${r.id}/${c.id}`) ? runOpen.get(`${r.id}/${c.id}`) : c.status === "failed" || (r.cursor && r.cursor.c === n)) || null,
+      ontoggle: (e) => runOpen.set(`${r.id}/${c.id}`, e.currentTarget.open) },
       h("summary", {}, h("span", { class: "cst" }, { passed: "✓", failed: "✕", running: "●", skipped: "–" }[c.status] ?? "○"),
         h("span", { class: "ctitle" }, c.title), h("span", { class: "tag" }, { browser: "浏览器验收", unit: "自动化测试", check: "检查清单", health: "健康检查" }[c.kind]),
         c.criterion != null ? h("span", { class: "muted", style: "font-size:11.5px" }, `标准 ${c.criterion + 1}`) : null),
@@ -3466,8 +3488,9 @@ function renderRun() {
             h("code", { class: "scmd" }, "$ ", s.cmd.replace("{url}", r.env ?? "").replace("{uid}", 12 + n * 3).replace("{run}", r.id).replace("{case}", c.id)),
             s.found ? h("div", { class: "muted", style: "font-size:12px" }, `定位到：${s.found}`) : null,
             s.error ? h("div", { class: "err-text", style: "font-size:12.5px;margin-top:2px" }, s.error) : null),
-          s.shot ? h("img", { class: "sshot", src: attUrl(`/qa-shots/${s.shot}`).replace("/uploads/", "/uploads/"), alt: "验收截图", loading: "lazy", onclick: (e) => zoomShot(e.target.src) })
+          s.shot ? h("img", { class: "sshot", src: `/qa-shots/${s.shot}`, alt: "验收截图", loading: "lazy", onclick: (e) => zoomShot(e.target.src) })
             : r.simulated && c.kind === "browser" && s.status && s.status !== "skipped" && (s.assert || s.locate) ? h("img", { class: "sshot", src: shotSvg(r, c, s, n), alt: "截图", onclick: (e) => zoomShot(e.target.src) }) : null)))))));
+  if (keepScroll) $("#qaDrawer").scrollTop = keepScroll;
 }
 function zoomShot(src) {
   fill($("#modal"), h("div", { class: "modal", style: "width:min(900px,calc(100vw - 32px))", onclick: (e) => e.stopPropagation() },

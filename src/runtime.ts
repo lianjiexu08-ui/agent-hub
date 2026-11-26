@@ -86,6 +86,9 @@ export class Runtime {
 
   // ======================= 对外 API =======================
 
+  /** 续跑时提供之前的对话（由 Work 注入）；返回 null 表示从头开始 */
+  resumeMessagesFor: ((task: Task) => BetaMessageParam[] | null) | null = null;
+
   /** 注册一个对所有智能体可用的内置工具 */
   addTool(def: BetaToolUnion & { name: string }, run: ToolHandler, when?: (task: Task, agent: Agent) => boolean) {
     this.extraTools.set(def.name, { def, run, when });
@@ -352,7 +355,9 @@ export class Runtime {
       const input = external.warnings.length
         ? `${task.input}\n\n[系统提示] 以下配置的工具当前不可用：\n- ${external.warnings.join("\n- ")}`
         : task.input;
-      const messages: BetaMessageParam[] = [{ role: "user", content: input }];
+      // 被中断的运行续跑：把之前的对话装回去接着跑，不从头再来
+      const prior = this.resumeMessagesFor?.(task) ?? null;
+      const messages: BetaMessageParam[] = prior ?? [{ role: "user", content: input }];
       this.store.saveMessages(id, messages);
       recordReceipt(
         this.store,

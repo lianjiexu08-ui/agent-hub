@@ -91,10 +91,18 @@ export class QA implements QAPort {
   private emit() { this.runtime.events.emit("event", { type: "work", kind: "qa" } as unknown as HubEvent); }
   runs(): QARun[] { return this.store.docList<QARun>("qa_runs"); }
   run(id: string) { return this.store.docGet<QARun>("qa_runs", id); }
-  private save(r: QARun) { this.store.docPut("qa_runs", r.id, r); }
+  private save(r: QARun) { this.store.docPut("qa_runs", r.id, r); this.byIssue = null; }
+  /** 按工作项分组的验收记录（只读缓存，任何写入都会让它失效）。看板每次刷新要给每张卡片查一遍，不能每次都整表解析 */
+  private byIssue: Map<string, QARun[]> | null = null;
   /** 测试任务属于哪张工作项（CLI 底座据此在该工作项的 worktree 里跑验收） */
   issueKeyOfTask(taskId: string): string | null { return this.runs().find((r) => r.taskId === taskId)?.issueKey ?? null; }
-  runsFor(key: string) { return this.runs().filter((r) => r.issueKey === key).reverse(); }
+  runsFor(key: string) {
+    if (!this.byIssue) {
+      this.byIssue = new Map();
+      for (const r of this.runs()) { const l = this.byIssue.get(r.issueKey); if (l) l.push(r); else this.byIssue.set(r.issueKey, [r]); }
+    }
+    return (this.byIssue.get(key) ?? []).slice().reverse();
+  }
   state() { return { runs: this.runs().slice(-200), settings: this.settings.get().qa, browsers: this.browsers, browserReady: this.browserOn, engine: this.previews?.engine() ?? (this.cliDevEye ? "deveye" : null), deveyeInstalled: this.cliDevEye }; }
 
   private buildCases(i: IssueLike, webOverride?: boolean): Case[] {
