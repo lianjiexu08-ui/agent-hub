@@ -20,7 +20,8 @@ import type { Settings } from "./settings.ts";
 import type { CiStatus, GitHub } from "./github.ts";
 import { pickState, statusForStateType, type Linear, type LinearState } from "./linear.ts";
 import type { Workspace } from "./workspace.ts";
-import { backoffMs, isTransientError } from "./transient.ts";
+import { backoffMs, isTransientError, quotaReset } from "./transient.ts";
+export { quotaReset };
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { BetaMessageParam } from "@anthropic-ai/sdk/resources/beta/messages/messages";
@@ -199,23 +200,6 @@ export interface QAPort {
   failureReport?(id: string, shotDir?: string): string;
 }
 
-/**
- * 运行失败是不是模型订阅 / 接口的额度用完了（5 小时额度、限流等）。是的话返回预计恢复的时间，否则 null。
- * 认得的写法：「reset at 2026-11-26 16:16:42」（无时区按本机时间）、ISO 时间、「limit reached|<unix 秒>」（Claude Code）、
- * 「try again in 30 minutes / 45s」「resets in 2h」；认出是额度问题但没给时间时，按 15 分钟后再试。
- */
-export function quotaReset(error: string | null | undefined, failedAt: Date = new Date()): Date | null {
-  const e = error ?? "";
-  if (!/usage limit|rate.?limit|quota|limit (?:reached|exceeded)|too many requests|\b429\b|额度|限额|限流/i.test(e)) return null;
-  const at = e.match(/reset(?:s)? (?:at|on)\s*:?\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/i);
-  if (at) { const d = new Date(at[1].replace(" ", "T")); if (!isNaN(+d)) return d; }
-  const epoch = e.match(/limit reached\|(\d{10})/i);
-  if (epoch) return new Date(Number(epoch[1]) * 1000);
-  const rel = e.match(/(?:try again|retry|reset(?:s)?) in (?:about )?(\d+(?:\.\d+)?)\s*(h|hours?|m|min(?:ute)?s?|s|sec(?:ond)?s?)\b/i);
-  if (rel) { const n = Number(rel[1]); const unit = rel[2][0].toLowerCase(); return new Date(+failedAt + n * (unit === "h" ? 3_600_000 : unit === "m" ? 60_000 : 1000)); }
-  return new Date(+failedAt + 15 * 60_000);
-}
-
 export class Work {
   private store: Store;
   private runtime: Runtime;
@@ -254,6 +238,11 @@ export class Work {
     runtime.setHooks({
       continuation: (task) => this.continuation(task),
       systemExtra: (task, agent) => this.systemExtra(task, agent),
+      fallback: (task, from, to, reason) => {
+        const root = task.parentId ? this.store.getTask(task.rootId) ?? task : task;
+        const i = root.issueId != null ? this.getIssue(root.issueId) : null;
+        if (i) this.addComment(i.id, "system", "system", `↪ ${task.agent} 的模型 ${from} 暂时用不了（${reason.slice(0, 160)}），这一步自动改用 ${to} 继续`, root.id);
+      },
     });
     this.registerTools();
     this.reconcile();

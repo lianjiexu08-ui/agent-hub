@@ -60,9 +60,15 @@ export interface GlobalSettings {
   defaultModel: string;
   assistantModel: string;
   defaultEffort: string;
-  runtimes: Record<string, { template: string; max: number }>;
+  /** max：这个底座同时运行的进程数；providers：按模型厂商（模型名「/」前的部分，如 kimi-coding）单独限制并发 */
+  runtimes: Record<string, { template: string; max: number; providers?: Record<string, number> }>;
   /** 内置运行底座同时在途的模型请求数 */
   concurrency: { model: number };
+  /**
+   * CLI 底座的兜底：智能体配置的模型用不了（额度用完、并发超限、鉴权失败、厂商故障）时，按顺序换成下一个能用的底座和模型重跑这一步。
+   * model 为空表示用该 CLI 的默认模型。
+   */
+  fallback: { on: boolean; chain: { runtime: string; model: string }[] };
   budget: BudgetConfig;
   guard: GuardConfig;
   notify: NotifyConfig;
@@ -82,6 +88,7 @@ const defaults = (): GlobalSettings => ({
   defaultEffort: "medium",
   runtimes: Object.fromEntries(Object.entries(RUNTIME_TEMPLATES).map(([k, v]) => [k, { template: v, max: 4 }])),
   concurrency: { model: Number(process.env.HUB_MAX_CONCURRENCY) || 8 },
+  fallback: { on: true, chain: [{ runtime: "pi", model: "zai/glm-5.4" }, { runtime: "pi", model: "kimi-coding/k3.1-pro" }, { runtime: "claude-code", model: "" }] },
   budget: { daily: 50, perIssue: 10, perProject: {} },
   guard: { isolation: "worktree", network: "allowlist", protectedBranches: ["main", "release/*"], protectedPaths: [".github/**", "**/migrations/**", "infra/**", "**/auth/**", "**/payment/**"], maxDiff: 800, requireTests: true, access: "token", secrets: [] },
   notify: DEFAULT_NOTIFY,
@@ -967,14 +974,14 @@ export class Settings {
   get(): GlobalSettings {
     const d = defaults();
     const s = this.store.docGet<GlobalSettings>("settings", "global") ?? d;
-    return { ...d, ...s, notify: { ...d.notify, ...s.notify }, guard: { ...d.guard, ...s.guard }, budget: { ...d.budget, ...s.budget }, qa: { ...d.qa, ...s.qa }, runtimes: { ...d.runtimes, ...s.runtimes }, concurrency: { ...d.concurrency, ...s.concurrency } };
+    return { ...d, ...s, notify: { ...d.notify, ...s.notify }, guard: { ...d.guard, ...s.guard }, budget: { ...d.budget, ...s.budget }, qa: { ...d.qa, ...s.qa }, runtimes: { ...d.runtimes, ...s.runtimes }, concurrency: { ...d.concurrency, ...s.concurrency }, fallback: { ...d.fallback, ...s.fallback } };
   }
   private put(s: GlobalSettings) { this.store.docPut("settings", "global", { id: "global", ...s }); }
   /** 允许前端修改的部分（不含密钥） */
-  patch(p: Partial<Pick<GlobalSettings, "defaultModel" | "defaultEffort" | "runtimes" | "budget" | "guard" | "notify" | "qa" | "models" | "concurrency" | "assistantModel">>) {
+  patch(p: Partial<Pick<GlobalSettings, "defaultModel" | "defaultEffort" | "runtimes" | "budget" | "guard" | "notify" | "qa" | "models" | "concurrency" | "assistantModel" | "fallback">>) {
     const s = this.get();
     for (const k of ["defaultModel", "defaultEffort", "models", "assistantModel"] as const) if (p[k] !== undefined) (s as any)[k] = p[k];
-    for (const k of ["runtimes", "budget", "guard", "notify", "qa", "concurrency"] as const) if (p[k]) (s as any)[k] = { ...(s as any)[k], ...p[k] };
+    for (const k of ["runtimes", "budget", "guard", "notify", "qa", "concurrency", "fallback"] as const) if (p[k]) (s as any)[k] = { ...(s as any)[k], ...p[k] };
     this.put(s);
   }
   private secrets(): Record<string, string> { return this.store.docGet("secrets", "global") ?? {}; }
