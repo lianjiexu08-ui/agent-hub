@@ -52,7 +52,8 @@ export function diffStat(numstat: string): { files: number; additions: number; d
 function git(args: string[], cwd: string): Promise<string> {
   return new Promise((res, rej) => {
     execFile("git", args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) rej(new Error((stderr || err.message).replace(/x-access-token:[^@]+@/g, "x-access-token:***@").slice(0, 400)));
+      // 有的 git 提示（如 nothing to commit）写在 stdout 里
+      if (err) rej(new Error((stderr.trim() || stdout.trim() || err.message).replace(/x-access-token:[^@]+@/g, "x-access-token:***@").slice(0, 400)));
       else res(stdout.trim());
     });
   });
@@ -119,7 +120,8 @@ export class Workspace {
       const f = join(dir, rel);
       if (existsSync(f) && readFileSync(f, "utf8").includes("HUB_TASK_ID")) await git(["restore", "--staged", "--", rel], dir).catch(() => {});
     }
-    const staged = await git(["status", "--porcelain"], dir);
+    // 只看暂存区：未跟踪的 Hub 配置（.pi/、.gemini/）不算；智能体自己已经提交过时暂存区为空，直接跳过
+    const staged = await git(["diff", "--cached", "--name-only"], dir);
     if (staged) await git(["-c", "user.name=agent-hub", "-c", "user.email=agent-hub@users.noreply.github.com", "commit", "-m", message], dir);
     const base = p.repo!.defaultBranch ?? "main";
     // 先把最新的主干合进来：并行开发时主干可能已经前进了。测试与评审要基于合并后的代码，PR 也不会带着冲突提上去

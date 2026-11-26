@@ -1349,6 +1349,16 @@ export class Work {
         const base = this.proj(i.projectId)?.repo?.defaultBranch ?? "main";
         return `你的改动已提交到本地分支，但主干（origin/${base}）在你开发期间有了新提交，合并时这些文件冲突：\n${out.conflict.map((f) => `- ${f}`).join("\n")}\n\n请在当前工作目录执行 \`git fetch origin ${base} && git merge origin/${base}\`，逐个解决冲突（保留双方都需要的改动），提交合并结果，确认测试仍然通过后，再调用 report_phase(phase="do") 重新汇报。不要用 rebase 或强推改写主干历史。`;
       }
+      if (typeof out === "string" && out.startsWith("（提交代码失败")) {
+        // 代码没提交上去：不能带着没有 PR 的改动进入测试和评审（否则会一路走到「待验收」却没有 PR）
+        rec.result = "active";
+        rec.endedAt = null;
+        rec.note = out.slice(1, 300);
+        this.save(i);
+        this.addComment(i.id, "system", "system", `⚠ ${out.slice(1, -1)}。已退回执行阶段，由 ${task.agent} 处理`, task.id);
+        this.emit("issue");
+        return `${out}\n代码没有提交和推送成功，还不能进入测试。请在当前工作目录查看 git 状态，处理好问题（例如提交遗留的改动、解决合并问题）后，再调用 report_phase(phase="do", result="pass")。如果是推送权限之类你解决不了的问题，用 report_phase(phase="do", result="blocked") 说明原因。`;
+      }
       const prMsg = out;
       this.enterPhase(i, "test");
       this.save(i);
