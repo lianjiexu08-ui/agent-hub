@@ -37,6 +37,8 @@ import { BuiltinBrowser, DevEyeBrowser } from "./browser.ts";
 const env = (k: string, d: string) => process.env[k] ?? d;
 const simulate = process.env.HUB_SIMULATE === "1";
 const dataDir = env("HUB_DATA", "./data");
+// 输出管道断了（启动 Hub 的终端已关闭）时不要因 EPIPE 整个退出
+for (const s of [process.stdout, process.stderr]) s.on("error", (e: NodeJS.ErrnoException) => { if (e.code !== "EPIPE") throw e; });
 mkdirSync(dataDir, { recursive: true });
 const port = Number(env("PORT", "18790"));
 const hostname = env("HOST", "127.0.0.1");
@@ -214,7 +216,7 @@ const cancelRestart = () => {
 };
 const restartState = () => (idleRestart ? { since: idleRestart.since, waiting: work.activeIssueRuns() } : null);
 const restartNow = () => {
-  const spec = restartSpec();
+  const spec = restartSpec(undefined, { logFile: join(dataDir, "logs", "hub.log") });
   console.log(`[系统] 正在重启：${spec.command} ${spec.args.join(" ")}`);
   setTimeout(() => {
     try { spawnReplacement(spec); } catch (e) { console.error("[系统] 拉起新进程失败", e); return; }
