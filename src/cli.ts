@@ -167,6 +167,11 @@ export class CliRunner implements CliExecutor {
     return n;
   }
 
+  queued(rt: string, model: string) {
+    const provider = model.includes("/") ? model.split("/")[0] : "";
+    return Math.max(this.slots.get(rt)?.waiting ?? 0, provider ? this.slots.get(`${rt}:${provider}`)?.waiting ?? 0 : 0);
+  }
+  overflow() { const s = this.settings.get().fallback; return s?.on ? s.overflow ?? 2 : 0; }
   busy(rt: string, model: string) {
     const s = this.settings.get().runtimes[rt];
     const provider = model.includes("/") ? model.split("/")[0] : "";

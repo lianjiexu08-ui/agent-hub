@@ -25,6 +25,9 @@ export interface CliExecutor {
   acquire?(runtime: string, priority: number, signal: AbortSignal, model?: string): Promise<() => void>;
   /** 这个底座 + 模型现在是否已经满载（再来的任务要排队） */
   busy?(runtime: string, model: string): boolean;
+  /** 这个底座 + 模型前面还有几个在排队；超过 overflow 时溢出到有空位的兜底模型 */
+  queued?(runtime: string, model: string): number;
+  overflow?(): number;
   /** 兜底：智能体配置的模型用不了时，依次可换的底座和模型 */
   fallbacks?(agent: Agent): { runtime: string; model: string }[];
   run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; /** 运行中的对话记录（增量，给界面实时看） */ progress?: (transcript: BetaMessageParam[]) => void; /** 不续原来的会话（兜底换了底座） */ fresh?: boolean }): Promise<{ result: string; cost?: number; inputTokens?: number; outputTokens?: number; transcript?: BetaMessageParam[] }>;
@@ -207,7 +210,10 @@ export class Runtime {
     const cands = [{ runtime: agent.runtime, model: agent.cliModel }, ...(this.cli?.fallbacks?.(agent) ?? [])];
     const usable = cands.filter((c) => !tried.has(`${c.runtime}|${c.model}`) && !this.isDown(c.runtime, c.model));
     // 自己的模型能用就用（满了就排队）；已经在兜底时，优先挑现在有空位的，都满了才排第一个的队
-    const own = usable[0] && usable[0].runtime === agent.runtime && usable[0].model === agent.cliModel ? usable[0] : null;
+    let own = usable[0] && usable[0].runtime === agent.runtime && usable[0].model === agent.cliModel ? usable[0] : null;
+    // 自己的模型排队太长（例如并发很小的订阅），而兜底链里有空位：溢出过去，别让一串任务干等
+    const limit = this.cli?.overflow?.() ?? 0;
+    if (own && limit > 0 && (this.cli?.queued?.(own.runtime, own.model) ?? 0) >= limit && usable.slice(1).some((c) => !this.cli?.busy?.(c.runtime, c.model))) own = null;
     const ok = own ?? usable.find((c) => !this.cli?.busy?.(c.runtime, c.model)) ?? usable[0];
     return ok ? { ...agent, runtime: ok.runtime, cliModel: ok.model } : null;
   }

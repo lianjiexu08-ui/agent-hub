@@ -105,3 +105,15 @@ test("Hub 退出过程中被杀掉的 CLI：不记失败，保持运行中，由
   assert.equal(s.store.failInterrupted(), 1);
   assert.match(s.store.getTask(t.id)!.error ?? "", /interrupted by service restart/);
 });
+
+test("自己的模型排队太长：溢出到有空位的兜底模型", async () => {
+  const s = setup(() => null);
+  s.cli.busy = (rt, m) => rt === "pi" && m === "kimi-coding/k3.1-pro";
+  s.cli.queued = (rt, m) => (m === "kimi-coding/k3.1-pro" ? 3 : 0);
+  s.cli.overflow = () => 2;
+  const a = await s.runtime.waitFor(s.runtime.submit("backend-dev", "A").id);
+  assert.equal(a.result, "pi:zai/glm-5.4");
+  s.cli.queued = () => 1;
+  const b = await s.runtime.waitFor(s.runtime.submit("backend-dev", "B").id);
+  assert.equal(b.result, "pi:kimi-coding/k3.1-pro", "排队不长时仍然用自己的模型");
+});

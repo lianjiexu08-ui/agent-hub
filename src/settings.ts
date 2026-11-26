@@ -73,7 +73,7 @@ export interface GlobalSettings {
    * CLI 底座的兜底：智能体配置的模型用不了（额度用完、并发超限、鉴权失败、厂商故障）时，按顺序换成下一个能用的底座和模型重跑这一步。
    * model 为空表示用该 CLI 的默认模型。
    */
-  fallback: { on: boolean; chain: { runtime: string; model: string }[] };
+  fallback: { on: boolean; chain: { runtime: string; model: string }[]; /** 智能体自己的模型前面排队达到几个时，溢出到有空位的兜底模型；0 = 不溢出 */ overflow?: number };
   budget: BudgetConfig;
   guard: GuardConfig;
   notify: NotifyConfig;

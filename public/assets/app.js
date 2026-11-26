@@ -3861,6 +3861,7 @@ function fallbackBlock() {
       h("span", { class: "muted", style: "font-size:12.5px" }, "智能体的模型用不了（额度用完、并发超限、鉴权失败、厂商故障）时，按下面的顺序换成下一个能用的继续这一步，并在工作项里留言")),
     h("div", { class: "checks" }, checkboxP(F.on, (on) => { F.on = on; settings.patch(); }, "开启兜底", "关闭后模型用不了就直接失败，等额度恢复后再续跑")),
     field("兜底顺序", chain, "从上到下依次尝试，跳过智能体自己正在用的那个；用不了的模型会暂时避开（额度按恢复时间，并发超限 2 分钟，鉴权失败 30 分钟）"),
+    field("排队溢出", h("div", { class: "row" }, (() => { const el = h("input", { type: "number", min: 0, max: 50, style: "width:70px", onchange: (e) => { F.overflow = Math.max(0, Number(e.target.value) || 0); settings.patch(); } }); el.value = F.overflow ?? 2; return el; })(), h("span", { class: "muted", style: "font-size:12.5px" }, "个任务在排队时，新任务改用有空位的兜底模型（0 = 不溢出，一直排队等自己的模型）")), "并发很小的订阅（如 Kimi）排起长队时，别让任务干等"),
     field("按厂商限并发", capEl, "同一底座下不同厂商的并发上限可以单独设（模型名「/」前的部分）。例如 Kimi 订阅只允许少量并发请求"),
     down.length ? h("div", { class: "warn", style: "font-size:12.5px" }, `暂时避开：${down.join("、")}`) : null);
 }
