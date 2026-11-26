@@ -65,6 +65,8 @@ export interface Issue {
   resumeFrom?: Phase | null;
   /** 生命周期走完却没有 PR、被自动退回执行阶段的次数（上限 1） */
   missingPrFixes?: number;
+  /** 资深评审做过几次（超过上限的大改动 / 受保护路径） */
+  seniorReviews?: number;
   /** 因 CI 未通过被自动交回开发智能体的次数（上限 2） */
   ciFixes?: number;
   /** 因与主干冲突被自动交回开发智能体的次数（上限 2） */
@@ -1963,6 +1965,19 @@ export class Work {
     // 人已批准过合并、这次只是解决了冲突：改动大小 / 受保护路径人已看过，不再拦；测试或 CI 失败仍然拦
     const approved = i.mergeApproved && gv && !/测试未通过|CI /.test(gv) ? i.mergeApproved : null;
     if (approved) gv = null;
+    // 资深评审代替人：只因改动大 / 涉及允许的受保护路径被拦时，交给资深评审看整个 PR
+    const R = this.settings.guard().reviewer;
+    if (gv && R?.agent && i.pr && !/测试未通过|CI /.test(gv)) {
+      const waive = { size: R.size, paths: R.paths };
+      const rest = await this.guardCheck(i, waive);
+      // 还有资深评审不能代替的原因：提示里把要人确认的那条放前面
+      if (rest && rest !== gv) gv = `${rest}（另：${gv}）`;
+      if (!rest) {
+        const verdict = await this.seniorReview(i, gv);
+        if (verdict === "pass") { lines.push(`🔍 ${gv}：已由 ${R.agent} 对整个 PR 做资深评审，结论通过，代替人工放行。`); gv = null; }
+        else if (verdict === "returned") { this.save(i); this.emit("lead"); return; }
+      }
+    }
     // CI 没过多半是代码问题：交回开发智能体看日志修复（最多 2 次），而不是停在人这里
     if (i.pr?.ci?.state === "failing" && await this.fixCiFailure(i, L.agent)) {
       lines.push(`❌ CI 未通过（${i.pr.ci.failed.join("、")}），已交回 ${i.assignee} 查看日志并修复（第 ${i.ciFixes} 次），修好后重新走测试和评审。`);
@@ -1993,7 +2008,8 @@ export class Work {
           this.notify.push("review", `${key} 等你最终验收`, `${i.title}：测试与 AI 审核已通过，PR #${i.pr.number} 已合并。`, key);
         }
       } catch (e) {
-        if (isMergeConflict(e) && await this.fixMergeConflict(i, L.agent)) lines.push(`合并 PR #${i.pr.number} 时与主干冲突（评审期间主干有新提交），已安排 ${i.assignee} 合并主干、解决冲突后重新走测试和评审。`);
+        if (e instanceof CiAfterSync && await this.fixCiFailure(i, L.agent)) lines.push(`${e.message}：和期间合入主干的改动合在一起出了问题，已交回 ${i.assignee} 查看日志并修复（第 ${i.ciFixes} 次）。`);
+        else if (isMergeConflict(e) && await this.fixMergeConflict(i, L.agent)) lines.push(`合并 PR #${i.pr.number} 时与主干冲突（评审期间主干有新提交），已安排 ${i.assignee} 合并主干、解决冲突后重新走测试和评审。`);
         else {
           lines.push(`合并 PR #${i.pr.number} 失败：${(e as Error).message}。请手动处理。`);
           this.notify.push("review", `${key} 合并失败，需要你处理`, (e as Error).message, key);
@@ -2092,7 +2108,7 @@ export class Work {
     return true;
   }
 
-  private async guardCheck(i: Issue): Promise<string | null> {
+  private async guardCheck(i: Issue, waive: { size?: boolean; paths?: string[] } = {}): Promise<string | null> {
     const G = this.settings.guard();
     if (!i.pr) return null;
     if (G.requireTests && i.pr.checks === "failing") return "测试未通过";
@@ -2101,11 +2117,11 @@ export class Work {
     // 行数上限只算要人评审的业务代码：锁文件 / 生成文件本来就不在 additions 里，测试代码在这里扣掉
     const tests = i.pr.testLines?.lines ?? 0;
     const n = i.pr.additions + i.pr.deletions - tests;
-    if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行${tests ? `（另有测试代码 ${tests} 行，不计入）` : ""}，超过自动合并上限 ${G.maxDiff} 行`;
+    if (G.maxDiff && n > G.maxDiff && !waive.size) return `改动 ${n} 行${tests ? `（另有测试代码 ${tests} 行，不计入）` : ""}，超过自动合并上限 ${G.maxDiff} 行`;
     const p = this.proj(i.projectId)!;
     let files: string[] = [];
     if (!i.pr.simulated && !i.pr.local && this.github.available() && p.repo) files = await this.github.prFiles(p.repo.fullName, i.pr.number).catch(() => []);
-    const hit = files.length ? G.protectedPaths.find((g) => files.some((f) => globMatch(g, f))) : null;
+    const hit = files.length ? G.protectedPaths.filter((g) => !waive.paths?.includes(g)).find((g) => files.some((f) => globMatch(g, f))) : null;
     if (hit) return `改动涉及受保护路径 ${hit}`;
     if (!files.length) {
       // 拿不到文件列表（演示模式）时按标题和描述的关键词判断
@@ -2115,6 +2131,80 @@ export class Work {
     }
     return null;
   }
+  /**
+   * 合并前确认 PR 包含最新主干：多个 PR 并行开发时，各自的 CI 都是对着旧主干跑的，
+   * 先合进去一个，另一个的 CI 结果就过时了（例如两边各加了一个同号的数据库迁移，单独都能过、合在一起就坏）。
+   * 落后时先让 GitHub 把主干合进分支（Update branch），等 CI 对新提交重新跑完；失败则抛 CiAfterSync，由调用方交回开发修。
+   * 有冲突时抛「merge conflict」，走原来的冲突处理。读不到比较结果时不拦（不比原来差）。
+   */
+  /**
+   * 资深评审：对整个 PR 做一次全面评审（被护栏拦下的大改动 / 受保护路径）。
+   * pass：放行；returned：带着意见交回开发（已安排续跑）；skip：评审没给出结论或次数用完，交给人。
+   */
+  private async seniorReview(i: Issue, why: string): Promise<"pass" | "returned" | "skip"> {
+    const R = this.settings.guard().reviewer;
+    const p = this.proj(i.projectId);
+    if (!R?.agent || !i.pr || !p || (i.seniorReviews ?? 0) >= 2 || !this.store.getAgent(R.agent)) return "skip";
+    i.seniorReviews = (i.seniorReviews ?? 0) + 1;
+    this.save(i);
+    const key = this.key(i);
+    const dir = this.workspace.enabledFor(p, this.store.getAgent(i.assignee ?? "") ?? undefined) ? this.workspace.dir(p, key) : null;
+    this.addComment(i.id, "system", "system", `🔍 ${why}。按设置交给 ${R.agent} 对整个 PR 做资深评审（第 ${i.seniorReviews} 次），通过后自动合并`);
+    this.emit("issue");
+    const input = [
+      `请对 ${key}「${i.title}」的 PR #${i.pr.number}（分支 ${i.pr.branch} → ${baseOf(p)}）做一次全面的资深评审。它被安全护栏拦下：${why}。你的结论将代替人工决定是否合并。`,
+      dir ? `代码在本机目录 ${dir}，用 \`git -C ${dir} diff origin/${baseOf(p)}...HEAD\` 查看全部改动。` : `用 \`gh pr diff ${i.pr.number} -R ${p.repo?.fullName}\` 查看全部改动。`,
+      `需求与验收标准：\n${i.description.slice(0, 4000)}`,
+      "重点：是否满足需求、正确性与边界、数据库迁移是否可升级 / 回滚且与主干上已有迁移不冲突、鉴权与数据安全、并发与幂等、是否有与需求无关的改动、测试是否覆盖关键路径。只读代码，不要修改、提交或推送。",
+      "最后一行必须是「结论：通过」或「结论：需要修改」。需要修改时，在前面逐条列出必须修改的问题（位置、原因、改法）；建议性的问题不要阻塞。",
+    ].join("\n\n");
+    const r = await this.runtime.callAgent(R.agent, input, { timeoutMs: 40 * 60_000, priority: 1 }).catch((e) => ({ status: "failed", result: null, error: (e as Error).message }));
+    const text = (r.result ?? "").trim();
+    const last = text.split("\n").filter((l) => l.trim()).at(-1) ?? "";
+    if (r.status === "completed" && /结论[:：]\s*通过/.test(last)) {
+      this.addComment(i.id, R.agent, "lead", `🔍 资深评审通过\n\n${text.slice(-3000)}`);
+      return "pass";
+    }
+    if (r.status === "completed" && /结论[:：]\s*需要修改/.test(last) && i.assignee) {
+      this.addComment(i.id, R.agent, "lead", `🔍 资深评审：需要修改，已交回 ${i.assignee}\n\n${text.slice(-6000)}`);
+      i.status = "todo";
+      i.lifecycleDone = false;
+      i.resumeFrom = "do";
+      this.save(i);
+      await this.syncStatusRemote(i).catch(() => []);
+      void this.startRun(this.getIssue(i.id)!, "资深评审");
+      return "returned";
+    }
+    this.addComment(i.id, "system", "system", `🔍 资深评审没有给出明确结论（${r.error ?? "最后一行不是「结论：…」"}），交给你决定`);
+    return "skip";
+  }
+
+  private async syncBeforeMerge(i: Issue, p: Project) {
+    if (!i.pr || !p.repo) return;
+    const full = p.repo.fullName;
+    const head = await this.github.pr(full, i.pr.number).then((r) => r.head.sha).catch(() => null);
+    if (!head) return;
+    const behind = await this.github.behindBy(full, baseOf(p), head).catch(() => 0);
+    if (!behind) return;
+    try { await this.github.updateBranch(full, i.pr.number, head); }
+    catch (e) {
+      if (/→ 422/.test((e as Error).message)) throw new Error(`merge conflict：PR 落后主干 ${behind} 个提交，自动同步时有冲突`);
+      throw e;
+    }
+    this.addComment(i.id, "system", "system", `↻ PR #${i.pr.number} 落后主干 ${behind} 个提交（期间合入了别的工作项），已把最新主干合进分支，等 CI 对合并结果重新跑完再合并`);
+    // GitHub 异步生成合并提交：等 PR 的 head 变了再看 CI
+    for (let t = 0; t < 30; t++) {
+      const cur: string = await this.github.pr(full, i.pr.number).then((r) => r.head.sha, () => head);
+      if (cur !== head) break;
+      await new Promise((r) => setTimeout(r, this.syncPollMs));
+    }
+    const ci = await this.waitCi(i, 20 * 60_000, this.syncPollMs * 15);
+    if (i.pr) { i.pr.ci = ci; this.save(i); }
+    if (ci?.state === "failing") throw new CiAfterSync(ci.failed);
+    if (ci?.state === "pending") throw new Error(`同步主干后 CI 超过 20 分钟还没跑完（${ci.pending.join("、")}），稍后再合并`);
+  }
+  /** 测试里调小 */
+  syncPollMs = 2000;
   private async merge(i: Issue, by: string) {
     if (!i.pr || i.pr.state !== "open") return;
     const p = this.proj(i.projectId)!;
@@ -2131,6 +2221,7 @@ export class Work {
       }
     } else if (!i.pr.simulated) {
       if (!this.github.available() || !p.repo) throw new Error("未配置 GitHub Token，无法合并");
+      await this.syncBeforeMerge(i, p);
       await this.github.mergePR(p.repo.fullName, i.pr.number);
     }
     i.pr.state = "merged";
@@ -2189,6 +2280,11 @@ export class Work {
     }
     try { await this.merge(i, ME); }
     catch (e) {
+      if (e instanceof CiAfterSync) {
+        i.mergeApproved = { by: ME, at: now() };
+        if (await this.fixCiFailure(i, ME)) throw new WorkError(`${e.message}，已交回 ${i.assignee} 修复（第 ${i.ciFixes} 次）。你已批准合并，修好后测试与 CI 通过会直接合并`, 409);
+        throw new WorkError(`${e.message}，请手动处理`, 409);
+      }
       if (isMergeConflict(e)) {
         if (await this.fixMergeConflict(i, ME)) throw new WorkError(`PR #${i.pr.number} 与主干冲突，已安排 ${i.assignee} 合并主干、解决冲突后重新提交（第 ${i.mergeFixes} 次）。你已批准合并，解决后测试与 CI 通过会直接合并`, 409);
         throw new WorkError(`PR #${i.pr.number} 与主干冲突，而且没有可以交回的开发智能体（先指派一个），请手动处理`, 409);
@@ -2435,6 +2531,11 @@ function ciReadError(e: unknown): string {
   return m.slice(0, 160);
 }
 /** GitHub 合并接口的冲突：405 Pull Request is not mergeable */
+/** 同步主干后 CI 没过：多半是和别的工作项的改动合在一起出了问题，交回开发修 */
+class CiAfterSync extends Error {
+  failed: string[];
+  constructor(failed: string[]) { super(`把最新主干合进 PR 后 CI 未通过（${failed.join("、")}）`); this.failed = failed; }
+}
 function isMergeConflict(e: unknown): boolean { return /→ 405|not mergeable|merge conflict/i.test((e as Error)?.message ?? ""); }
 function globMatch(glob: string, path: string): boolean {
   const re = new RegExp("^" + glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*\/?/g, "§").replace(/\*/g, "[^/]*").replace(/§/g, ".*") + "$");

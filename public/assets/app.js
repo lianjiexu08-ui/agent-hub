@@ -4078,6 +4078,14 @@ function guardSection() {
     field("受保护分支", listEditor(G.protectedBranches, guard.save, "每行一个，支持通配符"), "智能体不能直接推送到这些分支，只能通过 PR 合并"),
     field("受保护路径", listEditor(G.protectedPaths, guard.save, "每行一个，支持通配符"), "PR 改动涉及这些路径时不会自动合并，必须由你确认"),
     field("自动合并上限", h("div", { class: "row" }, numIn(G.maxDiff, (v) => { G.maxDiff = v; guard.save(); }), h("span", { class: "muted", style: "font-size:12.5px" }, "行（增加 + 删除），超过则需要你确认")), null),
+    field("资深评审代替人放行", (() => {
+      const R = G.reviewer ?? null;
+      const set = (patch) => { G.reviewer = patch ? { agent: "code-reviewer", size: true, paths: [], ...(G.reviewer ?? {}), ...patch } : null; guard.save(); renderSettings(); };
+      return h("div", { class: "fields", style: "gap:6px" },
+        h("div", { class: "row" }, select([["", "不使用（被拦下的都等你确认）"], ...(state.agents ?? S.agents ?? []).map((a) => [a.name, a.name])], R?.agent ?? "", (v) => set(v ? { agent: v } : null), { style: "max-width:320px" })),
+        R ? h("div", { class: "checks" }, checkboxP(R.size, (on) => set({ size: on }), "改动超过行数上限时", "由它看整个 PR，通过即合并")) : null,
+        R ? field("它还可以放行的受保护路径", listEditor(R.paths, () => set({}), "从上面的受保护路径里挑，每行一个"), "例如 **/migrations/**；没列出的受保护路径仍然要你确认") : null);
+    })(), "被安全护栏拦下、且测试与 CI 都通过时，先交给这个智能体（建议用最强的模型）对整个 PR 做一次资深评审：结论通过就自动合并，需要修改就带着意见交回开发。每个工作项最多 2 次，之后交给你"),
     h("div", { class: "checks" }, checkboxP(G.requireTests, (on) => { G.requireTests = on; guard.save(); }, "测试未通过时禁止合并", "包括 Hotfix")),
     field("回滚", h("span", { style: "font-size:13px" }, "已合并的 PR 可以在工作项详情里一键回滚：自动创建并合并 revert PR，工作项回到「待规划」。")),
     field("面板访问", select([["token", "访问令牌（HUB_TOKEN）"], ["password", "账号密码登录"], ["sso", "单点登录（规划中）"]], G.access, (v) => { G.access = v; guard.save(); }, { style: "max-width:320px" }), "部署到服务器后务必开启，并通过 HTTPS 访问"));

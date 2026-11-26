@@ -37,7 +37,12 @@ export interface Provider {
   models?: string[];
 }
 export interface ModelEntry { id: string; label: string; modelId: string; providerId: string; enabled: boolean; builtin?: boolean; desc?: string; price?: string; tag?: string; /** 每百万 tokens 的输入价格（美元） */ inputPrice?: number; /** 每百万 tokens 的输出价格（美元） */ outputPrice?: number }
-export interface GuardConfig { isolation: "worktree" | "container"; network: "allowlist" | "open"; protectedBranches: string[]; protectedPaths: string[]; maxDiff: number; requireTests: boolean; access: "token" | "password" | "sso"; secrets: { name: string; scope: string }[] }
+export interface GuardConfig { isolation: "worktree" | "container"; network: "allowlist" | "open"; protectedBranches: string[]; protectedPaths: string[]; maxDiff: number; requireTests: boolean;
+  /**
+   * 资深评审代替人放行：只因「改动超过行数上限」或「涉及这些受保护路径」被拦时，交给 agent 对整个 PR 做一次评审，
+   * 结论通过就照常自动合并，否则带着意见交回开发。测试 / CI 不过、涉及其余受保护路径仍然要人。
+   */
+  reviewer?: { agent: string; size: boolean; paths: string[] } | null; access: "token" | "password" | "sso"; secrets: { name: string; scope: string }[] }
 export interface BudgetConfig { daily: number; perIssue: number; perProject: Record<string, number> }
 export interface QASettings { schedule: "auto" | "serial"; maxParallel: number; browser: "pool" | "local"; headless: boolean;
   /** 浏览器验收用哪个驱动：builtin = Hub 内置（playwright-core + 本机 Chrome，默认）；deveye = 外部 DevEye（需单独安装） */

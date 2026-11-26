@@ -101,6 +101,13 @@ export class GitHub {
   removeLabel(full: string, n: number, label: string) { return this.req("DELETE", `/repos/${full}/issues/${n}/labels/${encodeURIComponent(label)}`); }
   createPR(full: string, o: { title: string; head: string; base: string; body: string }) { return this.req<{ number: number }>("POST", `/repos/${full}/pulls`, o); }
   mergePR(full: string, n: number) { return this.req("PUT", `/repos/${full}/pulls/${n}/merge`, { merge_method: "squash" }); }
+  /** base 比 head 多出几个提交（head 落后主干多少） */
+  async behindBy(full: string, base: string, head: string): Promise<number> {
+    const d = await this.req<{ behind_by: number }>("GET", `/repos/${full}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`);
+    return d.behind_by ?? 0;
+  }
+  /** 把最新主干合进 PR 分支（GitHub 的「Update branch」）；有冲突时 GitHub 返回 422 */
+  updateBranch(full: string, n: number, expectedHead: string) { return this.req("PUT", `/repos/${full}/pulls/${n}/update-branch`, { expected_head_sha: expectedHead }); }
   pr(full: string, n: number) { return this.req<{ merge_commit_sha: string | null; base: { ref: string }; head: { sha: string } }>("GET", `/repos/${full}/pulls/${n}`); }
   /**
    * PR 最新提交的 CI 结果（GitHub Actions 等 check runs）。

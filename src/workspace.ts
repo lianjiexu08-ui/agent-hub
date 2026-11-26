@@ -146,8 +146,18 @@ export class Workspace {
     const ahead = await git(["rev-list", "--count", `origin/${base}..HEAD`], dir);
     if (ahead === "0") return null;
     // 本地交付不碰远端：分支只留在 Hub 的工作区里，合并时由 mergeLocal 拉进本机仓库
-    if (!isLocal(p)) await git(["push", "--force-with-lease", this.url(p), `HEAD:refs/heads/${branch}`], dir);
+    if (!isLocal(p)) await this.pushBranch(p, dir, branch);
     return { branch, ...diffStat(await git(["diff", "--numstat", `origin/${base}...HEAD`], dir)) };
+  }
+
+  /**
+   * 推送工作项分支。按地址推送没有远端跟踪分支，裸的 --force-with-lease 会拿过时的信息比较而被拒（stale info）——
+   * 例如智能体自己已经推过这个分支。这里先查远端分支现在指向哪个提交，把它作为预期值：
+   * 远端没被别人改过就推上去（包括覆盖智能体自己推的旧提交），推送期间被改了才拒绝。
+   */
+  private async pushBranch(p: Proj, dir: string, branch: string) {
+    const remote = (await git(["ls-remote", this.url(p), `refs/heads/${branch}`], dir).catch(() => "")).split(/\s/)[0] ?? "";
+    await git(["push", `--force-with-lease=refs/heads/${branch}:${remote}`, this.url(p), `HEAD:refs/heads/${branch}`], dir);
   }
 
   private baseSrc(p: Proj) { return isLocal(p) ? p.delivery!.localPath! : this.url(p); }
@@ -203,7 +213,7 @@ export class Workspace {
     const dir = await this.prepareUnlocked(p, key);
     await git(["-c", "user.name=agent-hub", "-c", "user.email=agent-hub@users.noreply.github.com", "revert", "--no-edit", info.merge_commit_sha], dir);
     const branch = `agent/${key}`;
-    await git(["push", "--force-with-lease", this.url(p), `HEAD:refs/heads/${branch}`], dir);
+    await this.pushBranch(p, dir, branch);
     const pr = await gh.createPR(p.repo!.fullName, { title: `Revert #${prNumber}`, head: branch, base: info.base.ref, body: `回滚 #${prNumber}` });
     await gh.mergePR(p.repo!.fullName, pr.number);
     return pr.number;
