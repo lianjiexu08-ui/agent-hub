@@ -811,3 +811,4 @@ select, textarea, input { border-radius: 8px; padding: 7px 10px; }
 .attempt .a-note { color: var(--text); line-height: 1.6; margin-top: 2px; word-break: break-word; }
 .attempt .a-fails { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
 .attempt .a-fails .muted { font-size: 12px; line-height: 1.55; }
+.cell.inherit { opacity: .55; border-style: dashed; }

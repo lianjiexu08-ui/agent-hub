@@ -642,41 +642,50 @@ function toast(msg, kind = "", opts = {}) {
 }
 const fail = (err) => toast(err.message || String(err), "err");
 
-/**
- * 同一轮里的每次交付：执行 → 测试，测试不通过就再执行、再测试。按交付次数分块展示，
- * 每块写清这次改了什么、测试结果、哪条没过；点测试结果打开那次验收的完整记录和截图。
- * 重启、网络中断造成的中断记录不单列，折成一句。
- */
 /** 去掉 Markdown 标记，用于一行摘要 */
 const plainMd = (t) => String(t ?? "").replace(/\*\*|__|`/g, "").replace(/^#+\s*/gm, "");
-function attemptsOf(d, cy) {
-  const recs = d.phases.filter((r) => r.cycle === cy && (r.phase === "do" || r.phase === "test"));
-  if (!recs.some((r) => r.phase === "test")) return null;
-  const blocks = [];
-  let cur = null;
-  for (const r of recs) {
-    if (r.phase === "do") {
-      if (r.result === "cancelled") { if (cur) cur.interrupts++; else (blocks.pre ??= 0, blocks.pre++); continue; }
-      if (!cur || cur.test) { cur = { dos: [], test: null, interrupts: 0 }; blocks.push(cur); }
-      cur.dos.push(r);
-    } else if (cur) cur.test = r;
+/**
+ * 生命周期按「轮」展示：后端的一轮里，测试不通过会回到执行再交付一次。界面上每次交付算一轮，
+ * 五个阶段各一格：返工的那一轮里「理解」「计划」沿用上一轮，执行、测试、评审是这一轮自己的。
+ * 重启 / 网络造成的中断不单列，记在所属那一轮上。
+ */
+function lifecycleRounds(d) {
+  const out = [];
+  for (const cy of [...new Set(d.phases.map((r) => r.cycle))].sort((a, b) => a - b)) {
+    const recs = d.phases.filter((r) => r.cycle === cy);
+    const head = (ph) => recs.filter((r) => r.phase === ph).at(-1);
+    const parts = [];
+    let cur = null;
+    for (const r of recs) {
+      if (r.phase !== "do" && r.phase !== "test") continue;
+      if (r.phase === "do" && r.result === "cancelled") { if (cur) cur.interrupts++; continue; }
+      if (r.phase === "do" && (!cur || cur.test)) { cur = { dos: [], test: null, interrupts: 0 }; parts.push(cur); }
+      if (!cur) continue;
+      if (r.phase === "do") cur.dos.push(r); else cur.test = r;
+    }
+    if (!parts.length) parts.push({ dos: [], test: null, interrupts: 0 });
+    parts.forEach((pt, k) => {
+      const last = k === parts.length - 1;
+      const doRec = pt.dos.findLast((x) => x.result !== "cancelled") ?? pt.dos.at(-1);
+      const cell = (ph, rec, inherit) => ({ phase: PHASES.find((p) => p.id === ph), rec, state: inherit ? "inherit" : rec ? rec.result : "pending" });
+      const run = pt.test?.qaRun ? qa.run(pt.test.qaRun) : null;
+      out.push({
+        n: out.length + 1,
+        why: k > 0 ? "测试未通过后返工" : out.length > 0 ? "评审未通过后重来" : "",
+        interrupts: pt.interrupts,
+        run,
+        fails: run ? run.cases.filter((c) => c.status === "failed") : [],
+        cells: [
+          cell("understand", k === 0 ? head("understand") : null, k > 0),
+          cell("plan", k === 0 ? head("plan") : null, k > 0),
+          cell("do", doRec),
+          cell("test", pt.test),
+          cell("review", last ? head("review") : null),
+        ],
+      });
+    });
   }
-  if (!blocks.length) return null;
-  return h("div", { class: "attempts" }, blocks.map((b, n) => {
-    const done = b.dos.findLast((x) => x.result !== "active") ?? b.dos.at(-1);
-    const t = b.test;
-    const run = t?.qaRun ? qa.run(t.qaRun) : null;
-    const bad = run ? run.cases.filter((c) => c.status === "failed") : [];
-    return h("div", { class: "attempt " + (t ? t.result : "active") },
-      h("div", { class: "a-hd" }, h("b", {}, `第 ${n + 1} 次交付`),
-        t ? h("span", { class: t.result === "pass" ? "s-completed" : "warn", style: "font-size:12px" }, t.result === "pass" ? "测试通过" : "测试未通过")
-          : h("span", { class: "live" }, b.dos.some((x) => x.result === "active") ? "执行中" : "等测试"),
-        b.interrupts ? h("span", { class: "muted", style: "font-size:11.5px" }, `中途中断 ${b.interrupts} 次（重启 / 网络），已接着跑`) : null,
-        run ? h("a", { class: "link", style: "margin-left:auto;font-size:12px", onclick: () => openRun(run.id) }, `看验收记录与截图（${caseCount(run)}）→`) : null),
-      done?.note && done.result !== "active" ? h("div", { class: "a-note" }, h("span", { class: "muted" }, "执行："), short(done.note, 220)) : null,
-      bad.length ? h("ul", { class: "a-fails" }, bad.map((c) => h("li", {}, h("b", {}, `${c.id} `), short(plainMd(c.title), 90), c.note ? h("div", { class: "muted" }, short(plainMd(c.note), 260)) : null)))
-        : t && t.result === "fail" ? h("div", { class: "a-note warn" }, short(t.note, 260)) : null);
-  }));
+  return out;
 }
 /** 某一轮各阶段的状态：pass / fail / active / cancelled / pending */
 function cycleCells(i, cycle) {
@@ -694,10 +703,10 @@ function miniSteps(i) {
       cells.map((c) => h("i", { class: c.state }))),
     h("div", { class: "steps-label" }, i.phase ? h("b", {}, cur) : h("span", {}, cur), i.cycle > 1 ? h("span", {}, `第 ${i.cycle} 轮`) : null));
 }
-const CELL_TEXT = { pass: "通过", fail: "未通过", active: "进行中", cancelled: "已停止", blocked: "待确认", pending: "—" };
+const CELL_TEXT = { pass: "通过", fail: "未通过", active: "进行中", cancelled: "已停止", blocked: "待确认", pending: "—", inherit: "沿用上一轮" };
 const phaseCell = (c) => h("div", { class: "cell " + c.state, title: c.rec?.note || "" },
   h("span", { class: "st" }, CELL_TEXT[c.state]),
-  c.rec?.note ? h("span", { class: "note" }, c.rec.note) : c.state === "active" ? h("span", { class: "note" }, ago(c.rec.startedAt)) : null);
+  c.state === "active" ? h("span", { class: "note" }, ago(c.rec.startedAt)) : c.rec?.note ? h("span", { class: "note" }, c.rec.note) : null);
 
 
 // ---------- 运行中心 ----------
@@ -976,17 +985,23 @@ async function renderDrawer(force = false) {
           ? h("div", { class: "row" }, h("span", { class: "muted", style: "font-size:12.5px" }, "未关联"),
               linearPushable(curProject()) ? h("button", { onclick: () => issuesApi.pushToLinear(d.key).then(() => toast("已在 Linear 创建 issue", "ok")).catch(fail) }, "创建 Linear issue") : null)
           : h("span", { class: "muted", style: "font-size:12.5px" }, "项目未绑定 Linear")),
-    d.phases.length ? [
-      h("div", { class: "section-title" }, `生命周期 · ${d.phase ? `${phaseLabel(d.phase)}中，` : ""}共 ${d.cycle} 轮`),
-      h("div", { class: "lc-cycles" }, [...new Set(d.phases.map((r) => r.cycle))].sort((a, b) => b - a).map((cy) => {
-        const cells = cycleCells(d, cy);
-        const failed = cells.find((c) => c.state === "fail");
-        return h("div", { class: "lc-cycle" },
-          h("div", { class: "hd" }, h("b", { style: "color:var(--text)" }, `第 ${cy} 轮`),
-            cy === d.cycle && d.phase ? h("span", { class: "live" }, "进行中") : failed ? h("span", { class: "warn" }, `${failed.phase.label}未通过`) : cells.every((c) => c.state === "pass") ? h("span", { class: "s-completed", style: "font-size:12px" }, "全部通过") : null),
-          h("div", { class: "grid5" }, cells.map((c) => h("div", {}, h("div", { class: "muted", style: "font-size:11.5px;margin-bottom:2px" }, c.phase.label), phaseCell(c)))),
-          attemptsOf(d, cy));
-      }))] : null,
+    d.phases.length ? (() => {
+      const rounds = lifecycleRounds(d);
+      return [
+        h("div", { class: "section-title" }, `生命周期 · ${d.phase ? `${phaseLabel(d.phase)}中，` : ""}共 ${rounds.length} 轮`),
+        h("div", { class: "lc-cycles" }, rounds.slice().reverse().map((rd) => {
+          const failed = rd.cells.find((c) => c.state === "fail");
+          const live = rd.cells.some((c) => c.state === "active");
+          return h("div", { class: "lc-cycle" },
+            h("div", { class: "hd" }, h("b", { style: "color:var(--text)" }, `第 ${rd.n} 轮`),
+              rd.why ? h("span", { class: "muted", style: "font-size:12px" }, rd.why) : null,
+              live ? h("span", { class: "live" }, "进行中") : failed ? h("span", { class: "warn" }, `${failed.phase.label}未通过`) : rd.cells.every((c) => ["pass", "inherit"].includes(c.state)) ? h("span", { class: "s-completed", style: "font-size:12px" }, "全部通过") : null,
+              rd.interrupts ? h("span", { class: "muted", style: "font-size:11.5px" }, `中途中断 ${rd.interrupts} 次（重启 / 网络），已接着跑`) : null,
+              rd.run ? h("a", { class: "link", style: "margin-left:auto;font-size:12px", onclick: () => openRun(rd.run.id) }, `验收记录与截图（${caseCount(rd.run)}）→`) : null),
+            h("div", { class: "grid5" }, rd.cells.map((c) => h("div", {}, h("div", { class: "muted", style: "font-size:11.5px;margin-bottom:2px" }, c.phase.label), phaseCell(c)))),
+            rd.fails.length ? h("ul", { class: "a-fails" }, rd.fails.map((c) => h("li", {}, h("b", {}, `${c.id} `), short(plainMd(c.title), 90), c.note ? h("div", { class: "muted" }, short(plainMd(c.note), 260)) : null))) : null);
+        }))];
+    })() : null,
     prSection(d),
     (() => { const runs = qa.runsFor(d.key); return runs.length ? [h("div", { class: "section-title" }, `测试 ${runs.length}`),
       runs.map((r) => h("div", { class: "run-row", onclick: () => openRun(r.id) }, runBadge2(r.status), h("span", {}, `用例 ${caseCount(r)}`),
