@@ -1655,7 +1655,7 @@ export class Work {
     // 行数上限只算要人评审的业务代码：锁文件 / 生成文件本来就不在 additions 里，测试代码在这里扣掉
     const tests = i.pr.testLines?.lines ?? 0;
     const n = i.pr.additions + i.pr.deletions - tests;
-    if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行${tests ? `（不含测试 ${tests} 行）` : ""}，超过自动合并上限 ${G.maxDiff} 行`;
+    if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行${tests ? `（另有测试代码 ${tests} 行，不计入）` : ""}，超过自动合并上限 ${G.maxDiff} 行`;
     const p = this.proj(i.projectId)!;
     let files: string[] = [];
     if (!i.pr.simulated && this.github.available() && p.repo) files = await this.github.prFiles(p.repo.fullName, i.pr.number).catch(() => []);
