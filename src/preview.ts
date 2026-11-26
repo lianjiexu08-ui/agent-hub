@@ -4,14 +4,12 @@
  * - 预览：在被测工作项的 worktree 里执行项目配置的预览命令（如 scripts/preview.sh），
  *   传入 PREVIEW_PORT / PREVIEW_API_PORT / HUB_ISSUE_SLUG，端口每次现分配，多个工作项可以同时预览。
  *   以「前端地址返回非 5xx」判断就绪；测试结束对整个进程组发 SIGTERM（5 秒后 SIGKILL）。
- * - 浏览器：Hub 自己托管一个 DevEye 服务端（前台子进程、专用端口 9899，状态文件与 socket 按端口独立，
- *   不影响用户自己在 9888 开的 DevEye），每次测试新建一个无头浏览器实例，测完销毁。
- *   tester 的 browser 工具带上 DEVEYE_SERVER / DEVEYE_BROWSER_ID。
- *   需要 DevEye 包含 fix/server-daemon-port-isolation（托管浏览器能连非默认端口、状态文件按端口隔离）。
+ * - 浏览器：交给 BrowserBackend（见 browser.ts）。默认是 Hub 内置的浏览器驱动（playwright-core + 本机 Chrome），
+ *   可选 DevEye。每次验收一个独立的浏览器会话，测完销毁。
  */
-import { spawn, execFile, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync } from "node:fs";
+import type { BrowserBackend, BrowserResult } from "./browser.ts";
 
 export interface PreviewHandle { url: string; port: number; apiPort: number; log: string; ready: boolean; error?: string }
 
@@ -45,22 +43,21 @@ async function waitReady(url: string, child: ChildProcess, timeoutMs: number): P
 
 export class Previews {
   private procs = new Map<string, ChildProcess>();
-  private browsers = new Map<string, string>();
-  private devEye: ChildProcess | null = null;
-  private devEyeReady: Promise<boolean> | null = null;
+  /** 每次验收用的是哪个浏览器后端（中途切换设置也不影响已经建好的会话） */
+  private sessions = new Map<string, BrowserBackend>();
   private opts: {
     tmpDir: string;
-    /** DevEye Chrome 扩展的 dist 目录；没有则不做浏览器 */
-    extensionPath: () => string | null;
-    /** Hub 托管的 DevEye 服务端端口 */
-    devEyePort?: number;
+    /** 当前选用的浏览器后端 */
+    backend: () => BrowserBackend;
+    /** 全部后端（退出时都要关） */
+    backends?: () => BrowserBackend[];
     readyTimeoutMs?: number;
   };
   constructor(opts: Previews["opts"]) { this.opts = opts; }
 
-  /** 配置了 DevEye 扩展目录且目录存在：才能为验收建浏览器 */
-  hasExtension() { const e = this.opts.extensionPath(); return !!e && existsSync(e); }
-  get devEyeServer() { return `ws://127.0.0.1:${this.opts.devEyePort ?? 9899}`; }
+  /** 当前后端能为验收建浏览器 */
+  hasBrowser() { return this.opts.backend().available(); }
+  engine() { return this.opts.backend().name; }
 
   /** 启动预览：返回地址与日志尾部；失败时 ready=false 并带原因（不抛错，测试照常进行、退化为检查型验收） */
   async start(runId: string, cwd: string, cmd: string, env: Record<string, string>): Promise<PreviewHandle> {
@@ -86,16 +83,26 @@ export class Previews {
     return { url, port, apiPort, log: log.slice(-2000), ready: true };
   }
 
-  /** 为这次测试准备一个无头浏览器；DevEye 不可用时返回 null */
+  /** 为这次验收准备一个浏览器会话；不可用时返回 null（error 里是原因） */
   async browser(runId: string): Promise<string | null> {
-    if (!(await this.ensureDevEye())) return null;
-    const out = await this.deveye(["browser", "create", "--headless", "--json"], {}, 60_000);
-    const id = (() => { try { const j = JSON.parse(out.text.slice(out.text.indexOf("{"))); return j.browserId ?? j.id ?? null; } catch { return null; } })();
-    if (id) this.browsers.set(runId, id);
+    const b = this.opts.backend();
+    if (!b.available()) return null;
+    const id = await b.create(runId);
+    if (id) this.sessions.set(runId, b);
     return id;
   }
+  browserIdOf(runId: string) { return this.sessions.has(runId) ? runId : null; }
 
-  /** 测试结束：关预览、销毁浏览器 */
+  /** 以 tester 的身份执行一条浏览器命令；这次验收还没有浏览器时先建一个 */
+  async exec(runId: string, args: string[], signal?: AbortSignal): Promise<BrowserResult> {
+    if (!this.sessions.has(runId)) {
+      try { if (!(await this.browser(runId))) return { ok: false, text: "没有可用的浏览器（找不到 Chrome，或所选的 DevEye 不可用）" }; }
+      catch (e) { return { ok: false, text: `浏览器启动失败：${(e as Error).message}` }; }
+    }
+    return this.sessions.get(runId)!.exec(runId, args, signal);
+  }
+
+  /** 测试结束：关预览、销毁浏览器会话 */
   stop(runId: string) {
     const child = this.procs.get(runId);
     if (child) {
@@ -103,51 +110,13 @@ export class Previews {
       killGroup(child, "SIGTERM");
       setTimeout(() => killGroup(child, "SIGKILL"), 5000).unref?.();
     }
-    const b = this.browsers.get(runId);
-    if (b) { this.browsers.delete(runId); void this.deveye(["browser", "destroy", b], {}, 20_000); }
+    const b = this.sessions.get(runId);
+    if (b) { this.sessions.delete(runId); void b.destroy(runId).catch(() => {}); }
   }
 
-  /** Hub 退出时：关掉所有预览和托管的 DevEye 服务端 */
-  stopAll() {
-    for (const id of [...this.procs.keys()]) this.stop(id);
-    if (this.devEye) killGroup(this.devEye, "SIGTERM");
-  }
-
-  /** 以 tester 的身份执行 DevEye 命令（指向 Hub 托管的服务端与这次测试的浏览器） */
-  deveye(args: string[], env: Record<string, string>, timeoutMs = 60_000, signal?: AbortSignal): Promise<{ ok: boolean; text: string }> {
-    return new Promise((resolve) => {
-      const child = execFile("deveye", args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, DEVEYE_SERVER: this.devEyeServer, ...env } },
-        (e, stdout, stderr) => resolve({ ok: !e, text: `${stdout}${stderr}`.slice(0, 8000) }));
-      signal?.addEventListener("abort", () => child.kill(), { once: true });
-    });
-  }
-  browserIdOf(runId: string) { return this.browsers.get(runId) ?? null; }
-
-  /** 托管的 DevEye 服务端：没在跑就以前台子进程启动（带扩展目录，才能管理浏览器） */
-  private ensureDevEye(): Promise<boolean> {
-    if (this.devEye && this.devEye.exitCode === null && this.devEyeReady) return this.devEyeReady;
-    const ext = this.opts.extensionPath();
-    if (!ext || !existsSync(ext)) return Promise.resolve(false);
-    mkdirSync(this.opts.tmpDir, { recursive: true });
-    const port = this.opts.devEyePort ?? 9899;
-    // 专用端口上已经有 Hub 之前起的服务端（比如 Hub 重启过）：直接复用
-    this.devEyeReady = this.deveye(["browser", "list", "--json"], {}, 5000).then(async (probe) => probe.ok || this.spawnDevEye(ext, port));
-    return this.devEyeReady;
-  }
-  private spawnDevEye(ext: string, port: number): Promise<boolean> {
-    // 非默认端口的 PID / 信息 / 日志文件和 IPC socket 都按端口独立（/tmp/deveye-<port>.sock），不会覆盖用户自己那份
-    const child = spawn("deveye", ["server", "start", "--port", String(port), "--extension-path", ext], { detached: true, stdio: "ignore" });
-    this.devEye = child;
-    child.once("exit", () => { if (this.devEye === child) { this.devEye = null; this.devEyeReady = null; } });
-    this.devEyeReady = (async () => {
-      for (let n = 0; n < 30; n++) {
-        if (child.exitCode !== null) return false;
-        const r = await this.deveye(["browser", "list", "--json"], {}, 5000);
-        if (r.ok) return true;
-        await new Promise((res) => setTimeout(res, 500));
-      }
-      return false;
-    })();
-    return this.devEyeReady;
+  /** Hub 退出时：关掉所有预览和浏览器 */
+  async stopAll() {
+    for (const id of [...this.procs.keys(), ...this.sessions.keys()]) this.stop(id);
+    for (const b of this.opts.backends?.() ?? [this.opts.backend()]) await b.close().catch(() => {});
   }
 }

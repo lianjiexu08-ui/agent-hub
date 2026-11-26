@@ -31,6 +31,7 @@ import { Sessions } from "./session.ts";
 import { registerSessionTools } from "./session-tools.ts";
 import { CliChat } from "./assistant-cli.ts";
 import { Previews } from "./preview.ts";
+import { BuiltinBrowser, DevEyeBrowser } from "./browser.ts";
 
 const env = (k: string, d: string) => process.env[k] ?? d;
 const simulate = process.env.HUB_SIMULATE === "1";
@@ -77,10 +78,21 @@ runtime.forceBuiltin = simulate;
 
 const work = new Work(store, runtime, { notify: notifier, settings, github, linear, workspace, simulate });
 const qa = new QA(store, runtime, settings, (id) => work.proj(id), simulate);
-// 本分支预览 + 无头浏览器：测试阶段在工作项的 worktree 里起预览，交给 tester 用浏览器验收
+// 本分支预览 + 无头浏览器：测试阶段在工作项的 worktree 里起预览，交给 tester 用浏览器验收。
+// 浏览器默认用 Hub 内置驱动（本机 Chrome）；设置里选了 DevEye 且可用时改走 DevEye。
+const builtinBrowser = new BuiltinBrowser({
+  headless: () => settings.get().qa.headless !== false,
+  chromePath: () => settings.get().qa.chromePath || process.env.HUB_CHROME_PATH || null,
+  shotDir: join(dataDir, "tmp", "screenshots"),
+});
+const devEyeBrowser = new DevEyeBrowser({
+  extensionPath: () => settings.get().qa.deveyeExtension || process.env.HUB_DEVEYE_EXTENSION || null,
+  installed: () => qa.cliDevEye,
+});
 const previews = new Previews({
   tmpDir: join(dataDir, "tmp", "preview"),
-  extensionPath: () => settings.get().qa.deveyeExtension || process.env.HUB_DEVEYE_EXTENSION || null,
+  backend: () => settings.get().qa.engine === "deveye" && devEyeBrowser.available() ? devEyeBrowser : builtinBrowser,
+  backends: () => [builtinBrowser, devEyeBrowser],
 });
 qa.previews = simulate ? null : previews;
 qa.worktreeFor = (key) => {
@@ -91,7 +103,7 @@ qa.worktreeFor = (key) => {
   return existsSync(dir) ? dir : null;
 };
 work.qa = qa;
-void detectDevEye().then((ok) => { qa.deveye = ok; });
+void detectDevEye().then((ok) => { qa.cliDevEye = ok; });
 const cliRunner = new CliRunner(settings, {
   store,
   tmpDir: join(dataDir, "tmp"),
@@ -202,8 +214,7 @@ const restartNow = () => {
     try { spawnReplacement(spec); } catch (e) { console.error("[系统] 拉起新进程失败", e); return; }
     assistant.closeLive();
     cliRunner.killAll();
-    previews.stopAll();
-    void runtime.mcp.closeAll().finally(() => process.exit(0));
+    void Promise.all([previews.stopAll(), runtime.mcp.closeAll()]).finally(() => process.exit(0));
   }, 150);
   return "正在重启";
 };
@@ -244,4 +255,4 @@ function listen(attempt = 1) {
 listen();
 
 for (const sig of ["SIGINT", "SIGTERM"] as const)
-  process.on(sig, () => { assistant.closeLive(); cliRunner.killAll(); previews.stopAll(); void runtime.mcp.closeAll().finally(() => process.exit(0)); });
+  process.on(sig, () => { assistant.closeLive(); cliRunner.killAll(); void Promise.all([previews.stopAll(), runtime.mcp.closeAll()]).finally(() => process.exit(0)); });

@@ -10,7 +10,7 @@ AI 驱动的多智能体研发协作平台。人只负责**提出和确认需求
 - **管家**（首页）：多轮对话讨论需求、拆分任务、调整优先级、汇总进展
 - **项目负责人**：每个项目一个，可设为 关闭 / 按需 / 持续迭代；负责分诊、流转、审核、合并策略，持续迭代模式下会主动提出改进项
 - **任务中心**：所有项目共用同一批智能体，按五个阶段排队展示，完成后离开队列进入「待审核」
-- **测试板块**：基于 [DevEye](#浏览器验收deveye) 的浏览器验收 + 单元测试 / 检查 / 健康检查；排队执行，不冲突的用例并行
+- **测试板块**：[浏览器验收](#浏览器验收)（内置驱动，本分支预览）+ 单元测试 / 检查 / 健康检查；排队执行，不冲突的用例并行
 - **Hotfix**：创建即进入执行，跳过需求门禁，测试通过后由 AI 验收并合并
 - **自动化**：哨兵巡检（阶段超时、心跳、卡住自动重启 / 改派 / 上报）+ cron 定时任务
 - **运行底座**：内置（Claude API 工具循环）、Claude Code CLI、Codex CLI、Gemini CLI、pi
@@ -66,7 +66,9 @@ src/server.ts          HTTP 路由、鉴权、SSE、供 CLI 智能体回调的 /
 src/api.ts             状态快照与 RPC 白名单
 src/runtime.ts         智能体运行时：工具循环、委派、消息总线、取消、心跳、费用
 src/work.ts            项目 / 工作项 / 生命周期 / PR / 负责人 / 哨兵动作
-src/qa.ts              测试板块：用例生成、队列与冲突调度、DevEye 浏览器验收
+src/qa.ts              测试板块：用例生成、队列与冲突调度、浏览器验收
+src/preview.ts         工作项预览环境：在 worktree 里按端口起本分支前后端
+src/browser.ts         浏览器驱动：内置（playwright-core + 本机 Chrome），可选 DevEye
 src/automation.ts      哨兵与 cron 定时任务
 src/assistant.ts       管家对话与「用 AI 创建智能体」
 src/cli.ts, mcp-task.ts  CLI 底座：启动外部 CLI，并通过 MCP 桥把 Hub 工具暴露给它
@@ -90,9 +92,22 @@ src/mcp.ts             把 Hub 作为 MCP 服务提供给 Claude Code 等客户�
 - 汇报「执行」完成后自动提交 PR，并把验收任务放进测试队列，工具调用等待验收结果后告诉智能体下一步
 - 智能体提前结束对话时，运行时会提醒它继续，直到走完评审
 
-### 浏览器验收（DevEye）
+### 浏览器验收
 
-服务器上安装了 DevEye 的 `deveye` 命令（浏览器自动化 CLI）时，测试智能体通过受限的 `browser` 工具（只允许 navigate / snapshot / click / type / wait / console 等子命令）打开页面、定位元素并逐条汇报用例结果。未安装时只运行非浏览器用例。
+测试智能体通过受限的 `browser` 工具操作浏览器、逐条汇报用例结果：
+
+```
+navigate goto <url> [--wait-for <css>]     snapshot [--interactive-only]
+click --uid eN    type --uid eN "文本" [--enter]    select --uid eN "选项"
+wait --text "文字" | --selector <css> | --url-contains <s>
+console [--level error]    network [--status 5xx]    screenshot [--full]    eval "<表达式>"
+```
+
+`snapshot` 给页面上可见的可交互元素编号（e1、e2…），点击、输入后直接返回新的快照。
+
+- **浏览器驱动**：默认用 Hub 内置驱动（[playwright-core](https://playwright.dev)，Apache-2.0），驱动本机已安装的 Chrome / Chromium / Edge，不下载浏览器、不依赖其他工具。每次验收一个独立的浏览器会话（cookie、存储隔离），可并行。找不到 Chrome 时在「测试 → 环境」里填写路径（或设环境变量 `HUB_CHROME_PATH`）。也可以改用 DevEye（需单独安装）。
+- **本分支预览**：项目的测试环境里配置「本地预览命令」（如 `scripts/preview.sh`）后，每次验收前 Hub 在该工作项的 worktree 里执行它，传入 `PREVIEW_PORT`、`PREVIEW_API_PORT`、`HUB_ISSUE_SLUG`，等前端地址可访问后交给测试智能体，验收结束关闭整个进程组。
+- 没有浏览器、也没有测试地址时只运行非浏览器用例。
 
 ## 作为 MCP 服务使用
 

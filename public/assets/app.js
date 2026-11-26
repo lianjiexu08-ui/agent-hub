@@ -495,7 +495,7 @@ const prioOrder = (p) => (p >= 1 && p <= 4 ? p : 5);
  */
 // ======================= 数据层：后端状态缓存 + RPC =======================
 /** S 是 GET /api/state 的快照；修改通过 RPC，完成后重新拉取并通知各视图刷新 */
-let S = { projects: [], syncLogs: {}, issues: [], agents: [], skills: [], settings: null, qa: { runs: [], settings: {}, browsers: [], deveye: false }, auto: { rules: {}, jobs: [], log: [], state: {} }, notifications: [], knowledge: [], costs: [], attention: [], health: [], butler: [], tools: [], mcpServers: [], runtimes: null, simulate: false };
+let S = { projects: [], syncLogs: {}, issues: [], agents: [], skills: [], settings: null, qa: { runs: [], settings: {}, browsers: [], browserReady: false, engine: null, deveyeInstalled: false }, auto: { rules: {}, jobs: [], log: [], state: {} }, notifications: [], knowledge: [], costs: [], attention: [], health: [], butler: [], tools: [], mcpServers: [], runtimes: null, simulate: false };
 const simulateMode = () => S?.simulate === true;
 const dataListeners = new Set();
 async function rpc(method, ...args) {
@@ -2935,7 +2935,7 @@ function prSection(d) {
       pr.state === "open" ? h("button", { class: "primary", disabled: pr.checks === "passing" ? null : "", onclick: () => issuesApi.mergePR(d.key).then(() => toast(`已合并 PR #${pr.number}，${d.key} 完成`, "ok")).catch(fail) }, "合并 PR") : null)];
 }
 
-// ======================= 测试（DevEye 浏览器验收） =======================
+// ======================= 测试（浏览器验收） =======================
 /** 需求质量评估（服务端返回的 quality 优先；新建草稿等没有 quality 时在本地计算，规则与服务端一致） */
 function assessRequirement(i) {
   if (i.quality) return i.quality;
@@ -3122,14 +3122,18 @@ function envView(S) {
     h("div", { class: "center-block" }, h("div", { class: "bh" }, "浏览器"),
       h("div", { class: "panel-box", style: "padding:14px" }, h("div", { class: "fields" },
         h("div", { class: "radio-row" },
-          h("div", { class: "radio-card" + (S.browser === "pool" ? " sel" : ""), onclick: () => set({ browser: "pool" }) }, h("b", {}, "服务器上的浏览器池"), h("span", {}, "由 DevEye 在服务器上拉起相互隔离的 Chrome 实例（独立用户目录），可并行验收")),
+          h("div", { class: "radio-card" + (S.browser === "pool" ? " sel" : ""), onclick: () => set({ browser: "pool" }) }, h("b", {}, "服务器上的浏览器"), h("span", {}, "Hub 在服务器上用本机 Chrome 为每次验收开一个独立的浏览器会话（cookie、存储互不干扰），可并行验收")),
           h("div", { class: "radio-card" + (S.browser === "local" ? " sel" : ""), onclick: () => set({ browser: "local" }) }, h("b", {}, "远程 Chrome"), h("span", {}, "你电脑上的 Chrome 安装 DevEye 扩展后连接到服务器，在你眼前执行，一次一个"))),
         S.browser === "pool" ? [
           field("并行浏览器数", (() => { const el = h("input", { type: "number", min: 1, max: 8, style: "max-width:100px", onchange: (e) => set({ maxParallel: Math.max(1, Math.min(8, Number(e.target.value) || 1)) }) }); el.value = S.maxParallel; return el; })(), "同时最多运行的验收数量"),
           checkboxP(S.headless, (on) => set({ headless: on }), "无界面模式（headless）", "关闭后会弹出可见的浏览器窗口"),
-          field("DevEye 扩展目录", (() => { const el = h("input", { placeholder: "/path/to/DevEye/packages/chrome-extension/dist", onchange: (e) => set({ deveyeExtension: e.target.value.trim() }) }); el.value = S.deveyeExtension ?? ""; return el; })(),
-            qa.get().deveye ? "✓ 已就绪：Hub 会托管 DevEye 服务端，为每次验收创建无头浏览器" : "需要本机能运行 deveye 命令，并填写 DevEye Chrome 扩展构建产物（dist）的目录"),
-        ] : h("div", { class: "callout" }, h("span", { class: "busy-dot on" }), qa.get().deveye ? "服务器上已安装 DevEye" : "服务器上未检测到 DevEye（deveye 命令）", h("span", { class: "muted", style: "font-size:12.5px" }, "在 DevEye 扩展里填写服务器地址（ws://<服务器>:9888）和令牌")),
+          field("浏览器驱动", select([["builtin", "内置（推荐）：Hub 自带，直接驱动本机 Chrome"], ["deveye", "DevEye：需单独安装 DevEye"]], S.engine ?? "builtin", (v) => set({ engine: v }), { style: "max-width:360px" }),
+            (S.engine ?? "builtin") === "deveye" ? (db.engine === "deveye" ? "✓ 已就绪：Hub 会托管 DevEye 服务端，为每次验收创建无头浏览器" : "DevEye 不可用，暂时改用内置驱动。需要本机能运行 deveye 命令，并填写下面的扩展目录")
+              : db.browserReady ? "✓ 已就绪：找到了本机 Chrome" : "没有找到 Chrome：请安装 Google Chrome，或在下面填写 Chrome / Chromium 的路径"),
+          (S.engine ?? "builtin") === "deveye"
+            ? field("DevEye 扩展目录", (() => { const el = h("input", { placeholder: "/path/to/DevEye/packages/chrome-extension/dist", onchange: (e) => set({ deveyeExtension: e.target.value.trim() }) }); el.value = S.deveyeExtension ?? ""; return el; })(), "DevEye Chrome 扩展构建产物（dist）的目录")
+            : field("Chrome 路径", (() => { const el = h("input", { placeholder: "留空自动查找，如 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome", onchange: (e) => set({ chromePath: e.target.value.trim() }) }); el.value = S.chromePath ?? ""; return el; })(), "Chrome、Chromium、Edge 均可"),
+        ] : h("div", { class: "callout" }, h("span", { class: "busy-dot on" }), db.deveyeInstalled ? "服务器上已安装 DevEye" : "服务器上未检测到 DevEye（deveye 命令）", h("span", { class: "muted", style: "font-size:12.5px" }, "在 DevEye 扩展里填写服务器地址（ws://<服务器>:9888）和令牌")),
         field("调度方式", select([["auto", "自动：互不冲突的验收并行执行"], ["serial", "串行：一次只执行一个"]], S.schedule, (v) => set({ schedule: v }), { style: "max-width:360px" }), "冲突判断：同一环境下测试账号相同，或会修改同一类数据（订单、登录会话、内容）"),
         S.browser === "pool" ? field("实例", db.browsers.length ? h("div", { class: "chips" }, db.browsers.map((b) => h("span", { class: "tag" }, `${b.id} · ${b.status === "busy" ? "执行中" : "空闲"}`))) : h("span", { class: "muted", style: "font-size:12.5px" }, "按需创建，空闲超时后自动回收")) : null))),
     h("div", { class: "center-block" }, h("div", { class: "bh" }, "测试环境", h("span", { class: "muted" }, "按项目配置")),
@@ -3142,7 +3146,7 @@ function envView(S) {
           field("测试地址", inp("baseUrl", "https://staging.example.com")),
           field("PR 预览地址", inp("preview", "https://pr-{pr}.preview.example.com"), "有 PR 时优先在预览环境验收，{pr} 会替换为 PR 编号；不同 PR 互不冲突"),
           field("本地预览命令", inp("previewCmd", "scripts/preview.sh"), "配置后，每次验收前 Hub 在该工作项的 worktree 里执行这条命令，启动本分支的前后端，验收结束自动关闭。命令拿到 PREVIEW_PORT（前端）、PREVIEW_API_PORT（后端）、HUB_ISSUE_SLUG（用于隔离数据库等），需前台运行；就绪以前端地址可访问为准（最多 3 分钟）。优先于上面两个地址"),
-          field("测试账号", acc, "账号密码保存在 DevEye vault，智能体只能引用不能读取")));
+          field("测试账号", acc, "会写进验收任务交给测试智能体，请只填测试专用账号")));
       }))));
 }
 

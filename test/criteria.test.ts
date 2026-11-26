@@ -37,7 +37,7 @@ test("其它写法：Markdown 标题、冒号小节、带括号的小节名；�
   assert.deepEqual(extractCriteria("- 第一条\n- 第二条"), ["第一条", "第二条"]);
 });
 
-test("真实模式：没有测试地址或没有 DevEye 时不生成浏览器用例", () => {
+test("真实模式：没有测试地址或没有浏览器 时不生成浏览器用例", () => {
   const store = new Store(":memory:");
   const settings = new Settings(store);
   const runtime = new Runtime(store, simulatedLLM({ delayMs: [1, 1] }), { maxConcurrency: 1, maxDepth: 1, maxHops: 1 });
@@ -45,12 +45,12 @@ test("真实模式：没有测试地址或没有 DevEye 时不生成浏览器用
   const qa = new QA(store, runtime, settings, () => ({ env }) as never, false);
   const issue = { key: "S2T-1", title: "01 项目骨架：前端页面", description: DESC, labels: [], projectId: "p", pr: null, priority: 1, quality: assessRequirement({ title: "x", description: DESC }) };
   const build = () => (qa as unknown as { buildCases(i: typeof issue): { kind: string }[] }).buildCases(issue);
-  qa.deveye = true;
-  assert.deepEqual(build().map((c) => c.kind), ["check", "check", "check", "check"], "有 DevEye 但没有测试地址");
+  qa.cliDevEye = true;
+  assert.deepEqual(build().map((c) => c.kind), ["check", "check", "check", "check"], "有浏览器但没有测试地址");
   env = { baseUrl: "http://localhost:5173", preview: "", accounts: [] };
-  qa.deveye = false;
-  assert.ok(build().every((c) => c.kind === "check"), "有地址但没有 DevEye");
-  qa.deveye = true;
+  qa.cliDevEye = false;
+  assert.ok(build().every((c) => c.kind === "check"), "有地址但没有浏览器");
+  qa.cliDevEye = true;
   assert.deepEqual(build().map((c) => c.kind), ["browser", "browser", "browser", "browser", "health"]);
   qa.stop();
 });
