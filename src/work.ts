@@ -37,7 +37,7 @@ const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const now = () => new Date().toISOString();
 
 export interface PhaseRec { cycle: number; phase: Phase; result: "active" | "pass" | "fail" | "blocked" | "cancelled"; note: string; startedAt: string; endedAt: string | null; qaRun?: string }
-export interface PR { number: number; branch: string; state: "open" | "merged" | "closed" | "reverted"; checks: "pending" | "passing" | "failing"; tests: string | null; additions: number; deletions: number; /** GitHub 上的真实 CI 结果（PR 最新提交） */ ci?: CiStatus | null; /** 锁文件等生成文件的改动（不计入 additions / deletions） */ generated?: { files: number; lines: number }; files: number; reviewed?: boolean; guard?: string | null; mergedAt?: string; revert?: number; simulated?: boolean; /** 交付方式为 local / branch 时没有 GitHub PR，number 为 0 */ local?: "local" | "branch" }
+export interface PR { number: number; branch: string; state: "open" | "merged" | "closed" | "reverted"; checks: "pending" | "passing" | "failing"; tests: string | null; additions: number; deletions: number; /** GitHub 上的真实 CI 结果（PR 最新提交） */ ci?: CiStatus | null; /** 锁文件等生成文件的改动（不计入 additions / deletions） */ generated?: { files: number; lines: number }; /** 其中测试代码的改动（计入 additions / deletions，但不计入护栏的行数上限） */ testLines?: { files: number; lines: number }; files: number; reviewed?: boolean; guard?: string | null; mergedAt?: string; revert?: number; simulated?: boolean; /** 交付方式为 local / branch 时没有 GitHub PR，number 为 0 */ local?: "local" | "branch" }
 export interface Issue {
   id: number; projectId: string; number: number; title: string; description: string; status: string; priority: number;
   assignee: string | null; labels: string[]; parentId: number | null; createdBy: string; createdAt: string; updatedAt: string;
@@ -62,6 +62,8 @@ export interface Issue {
   dependsOn?: number[];
   /** 因基础设施原因（重启、运行失败、提前收工）中断时所在的阶段：下次运行从这里继续，不新开一轮 */
   resumeFrom?: Phase | null;
+  /** 生命周期走完却没有 PR、被自动退回执行阶段的次数（上限 1） */
+  missingPrFixes?: number;
   /** 因 CI 未通过被自动交回开发智能体的次数（上限 2） */
   ciFixes?: number;
   /** 因与主干冲突被自动交回开发智能体的次数（上限 2） */
@@ -197,6 +199,23 @@ export interface QAPort {
   failureReport?(id: string, shotDir?: string): string;
 }
 
+/**
+ * 运行失败是不是模型订阅 / 接口的额度用完了（5 小时额度、限流等）。是的话返回预计恢复的时间，否则 null。
+ * 认得的写法：「reset at 2026-11-26 16:16:42」（无时区按本机时间）、ISO 时间、「limit reached|<unix 秒>」（Claude Code）、
+ * 「try again in 30 minutes / 45s」「resets in 2h」；认出是额度问题但没给时间时，按 15 分钟后再试。
+ */
+export function quotaReset(error: string | null | undefined, failedAt: Date = new Date()): Date | null {
+  const e = error ?? "";
+  if (!/usage limit|rate.?limit|quota|limit (?:reached|exceeded)|too many requests|\b429\b|额度|限额|限流/i.test(e)) return null;
+  const at = e.match(/reset(?:s)? (?:at|on)\s*:?\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/i);
+  if (at) { const d = new Date(at[1].replace(" ", "T")); if (!isNaN(+d)) return d; }
+  const epoch = e.match(/limit reached\|(\d{10})/i);
+  if (epoch) return new Date(Number(epoch[1]) * 1000);
+  const rel = e.match(/(?:try again|retry|reset(?:s)?) in (?:about )?(\d+(?:\.\d+)?)\s*(h|hours?|m|min(?:ute)?s?|s|sec(?:ond)?s?)\b/i);
+  if (rel) { const n = Number(rel[1]); const unit = rel[2][0].toLowerCase(); return new Date(+failedAt + n * (unit === "h" ? 3_600_000 : unit === "m" ? 60_000 : 1000)); }
+  return new Date(+failedAt + 15 * 60_000);
+}
+
 export class Work {
   private store: Store;
   private runtime: Runtime;
@@ -319,6 +338,8 @@ export class Work {
       pr: i.pr && p?.repo && !i.pr.local ? { ...i.pr, url: `https://github.com/${p.repo.fullName}/pull/${i.pr.number}` } : i.pr,
       comments: this.comments(i.id).filter((c) => c.kind !== "system").length,
       runs: runs.length, activeRuns: runs.filter((r) => !TERMINAL.has(r.status)).length, failStreak: this.failStreak(i, runs),
+      /** 上次运行因额度用完失败：预计恢复时间（之后哨兵自动续跑） */
+      quotaUntil: last?.status === "failed" && i.status === "todo" ? quotaReset(last.error, new Date(last.updatedAt))?.toISOString() ?? null : null,
       /** 运行已提交但还在等并发槽位 */
       queued: !!last && last.status === "pending",
       lastRun: last ? { id: last.id, status: last.status === "pending" ? "running" : last.status, error: last.error, agent: last.agent, startedAt: last.createdAt } : null,
@@ -1388,9 +1409,9 @@ export class Work {
     let n = 0;
     for (const r of [...runs].reverse()) {
       if (r.status === "completed") { if (n === 0 && !i.lifecycleDone) n = 1; break; }
-      // 不是这张单自己的问题，不该消耗重试次数：服务重启中断、网络抖动、被停止 / 取消
+      // 不是这张单自己的问题，不该消耗重试次数：服务重启中断、网络抖动、额度用完、被停止 / 取消
       if (r.status === "cancelled") continue;
-      if (r.status === "failed" && (/interrupted by service restart|服务重启/.test(r.error ?? "") || isTransientError(r.error))) continue;
+      if (r.status === "failed" && (/interrupted by service restart|服务重启/.test(r.error ?? "") || isTransientError(r.error) || quotaReset(r.error))) continue;
       if (TERMINAL.has(r.status)) n++;
     }
     return n;
@@ -1418,6 +1439,8 @@ export class Work {
     if (waiting.length && ["todo", "backlog"].includes(i.status)) return { text: "等依赖", tone: "wait", title: `等 ${waiting.map((d) => d.key).join("、")} 完成` };
     if (this.pauseStarts && i.assignee && i.status === "todo") return { text: "重启后开始", tone: "wait" };
     const last = runs.at(-1);
+    const quota = i.status === "todo" && last?.status === "failed" ? quotaReset(last.error, new Date(last.updatedAt)) : null;
+    if (quota && +quota > Date.now()) return { text: `等额度 ${quota.toTimeString().slice(0, 5)}`, tone: "wait", title: `模型额度用完，预计 ${quota.toLocaleString()} 恢复后自动继续` };
     if (i.status === "todo" && last?.status === "failed") return { text: "上次失败", tone: "fail", title: last.error ?? "" };
     if (i.status === "in_review" && i.pr?.guard && i.pr.state === "open") return { text: "等你确认合并", tone: "need", title: i.pr.guard };
     if (i.status === "in_review" && i.pr?.local === "local" && i.pr.state === "merged") return { text: "待提测", tone: "wait", title: "已合并本地开发分支，等人工提测" };
@@ -1814,7 +1837,7 @@ export class Work {
       const gen = res.generated.lines ? `（其中 ${res.generated.files} 个锁文件 / 生成文件共 ${res.generated.lines} 行，不计入改动行数）` : "";
       if (dv.mode !== "pr") {
         // 不开 PR：本地合并或只推分支。用 number=0 的占位记录，后续测试、评审、合并照常走
-        i.pr = { number: 0, branch: res.branch, state: "open", checks: "pending", tests: null, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated, local: dv.mode };
+        i.pr = { number: 0, branch: res.branch, state: "open", checks: "pending", tests: null, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated, testLines: res.tests, local: dv.mode };
         this.save(i);
         this.addComment(i.id, "system", "system", dv.mode === "local"
           ? `✓ 已提交到本地分支 ${res.branch}，+${res.additions} −${res.deletions}，${res.files} 个文件${gen}。评审通过后合并进 ${dv.localPath} 的 ${baseOf(p)}，不推远端`
@@ -1822,9 +1845,9 @@ export class Work {
         return dv.mode === "local" ? `改动已提交到本地分支 ${res.branch}。` : `已推送分支 ${res.branch}。`;
       }
       const pr = i.pr?.state === "open" && !i.pr.local ? i.pr : await this.github.createPR(p.repo!.fullName, { title: `${this.key(i)}: ${i.title}`, head: res.branch, base: baseOf(p), body: `${i.description}\n\n${i.github ? `Closes #${i.github.number}` : ""}` }).then((r) => ({ number: r.number, branch: res.branch, state: "open" as const, checks: "pending" as const, tests: null, additions: res.additions, deletions: res.deletions, files: res.files }));
-      i.pr = { ...pr, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated };
+      i.pr = { ...pr, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated, testLines: res.tests };
       this.save(i);
-      this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch} → ${baseOf(p)}），+${res.additions} −${res.deletions}，${res.files} 个文件${gen}`);
+      this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch} → ${baseOf(p)}），+${res.additions} −${res.deletions}，${res.files} 个文件${gen}${res.tests.lines ? `，其中测试 ${res.tests.lines} 行` : ""}`);
       return `已提交 PR #${i.pr.number}。`;
     }
     if (this.simulate && p.repo && (["developer", "frontend-dev", "backend-dev", "devops"].includes(task.agent) || i.labels.includes("bug")) && !i.pr) {
@@ -1896,7 +1919,11 @@ export class Work {
       if (task.status !== "cancelled" && act) i.resumeFrom = resumePoint(act.phase);
       i.phase = null;
       i.blocked = null;
-      const msg = task.status === "cancelled" ? "■ 运行已停止。可修改后重新运行。" : task.status === "completed" ? "✕ 智能体没有走完生命周期就结束了。可重新运行。" : `✕ 运行失败：${task.error}。可修改后重新运行。`;
+      const quota = task.status === "failed" ? quotaReset(task.error) : null;
+      const at = quota ? quota.toLocaleString("zh-CN", { hour12: false, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+      const msg = task.status === "cancelled" ? "■ 运行已停止。可修改后重新运行。" : task.status === "completed" ? "✕ 智能体没有走完生命周期就结束了。可重新运行。"
+        : quota ? `⏸ ${task.agent} 所用模型的额度用完了（${(task.error ?? "").slice(0, 160)}）。预计 ${at} 恢复，届时哨兵会从「${i.resumeFrom ? PHASE_LABEL[i.resumeFrom] ?? i.resumeFrom : "开头"}」自动继续，不消耗轮次；着急的话可以把这个智能体换个模型或底座后点重新运行。`
+        : `✕ 运行失败：${task.error}。可修改后重新运行。`;
       this.addComment(i.id, "system", "system", msg, task.id);
       if (i.status === "in_progress") i.status = "todo";
       this.save(i);
@@ -1917,6 +1944,8 @@ export class Work {
       if (out && typeof out === "object") this.addComment(i.id, "system", "system", `⚠ 交付代码与本地开发分支冲突：${out.conflict.join("、")}，需要处理后才能合并`);
       i = this.getIssue(i.id) ?? i;
     }
+    // 再登记也没拿到 PR：退回执行阶段，让智能体检查 git 状态后重新提交（只兜一次）
+    if (await this.missingPr(i)) return;
     const key = this.key(i);
     const lead = this.leadOf(i);
     const hot = i.labels.includes("hotfix");
@@ -1992,6 +2021,26 @@ export class Work {
   }
 
   /**
+   * 兜底：项目关联了仓库、开发智能体在工作目录里干活，生命周期却走完了还没有 PR（比如提交失败被吞掉）。
+   * 退回「执行」阶段续跑一次，重新提交并创建 PR，再走测试和评审。只自动处理 1 次，再缺就交给人。返回是否已安排。
+   */
+  private async missingPr(i: Issue): Promise<boolean> {
+    if (i.pr || this.simulate || !i.assignee || (i.missingPrFixes ?? 0) >= 1) return false;
+    const p = this.proj(i.projectId);
+    if (!p?.repo || !this.workspace.enabledFor(p, this.store.getAgent(i.assignee))) return false;
+    i.missingPrFixes = (i.missingPrFixes ?? 0) + 1;
+    i.status = "todo";
+    i.lifecycleDone = false;
+    i.resumeFrom = "do";
+    this.save(i);
+    this.addComment(i.id, "system", "system", `⚠ 生命周期已走完，但代码还没有提交成 PR（可能是之前提交失败了）。退回「执行」阶段，由 ${i.assignee} 检查工作目录的 git 状态后重新提交，提交成功后会重新测试和评审。`);
+    await this.syncStatusRemote(i).catch(() => []);
+    this.emit("issue");
+    void this.startRun(this.getIssue(i.id)!, "system");
+    return true;
+  }
+
+  /**
    * PR 与主干冲突：交回开发智能体，新一轮执行时提交前会先合并主干，冲突由它解决。
    * 最多自动处理 2 次，再冲突就交给人。返回是否已安排。
    */
@@ -2060,8 +2109,10 @@ export class Work {
     if (G.requireTests && i.pr.checks === "failing") return "测试未通过";
     if (G.requireTests && i.pr.ci?.state === "failing") return `CI 未通过（${i.pr.ci.failed.join("、")}）`;
     if (G.requireTests && i.pr.ci?.state === "pending") return `CI 还没跑完（${i.pr.ci.pending.join("、")}），等它结束后再合并`;
-    const n = i.pr.additions + i.pr.deletions;
-    if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行，超过自动合并上限 ${G.maxDiff} 行`;
+    // 行数上限只算要人评审的业务代码：锁文件 / 生成文件本来就不在 additions 里，测试代码在这里扣掉
+    const tests = i.pr.testLines?.lines ?? 0;
+    const n = i.pr.additions + i.pr.deletions - tests;
+    if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行${tests ? `（另有测试代码 ${tests} 行，不计入）` : ""}，超过自动合并上限 ${G.maxDiff} 行`;
     const p = this.proj(i.projectId)!;
     let files: string[] = [];
     if (!i.pr.simulated && !i.pr.local && this.github.available() && p.repo) files = await this.github.prFiles(p.repo.fullName, i.pr.number).catch(() => []);
@@ -2261,8 +2312,10 @@ export class Work {
     });
   }
 
-  /** 启动时：进行中但已无活跃运行的工作项（因重启中断）退回 todo */
+  /** 启动时：进行中但已无活跃运行的工作项（因重启中断）退回 todo；待验收却没有 PR 的补救一次 */
   private reconcile() {
+    for (const i of this.issues().filter((x) => x.status === "in_review" && x.lifecycleDone && !x.pr && !this.activeRun(x.id)))
+      setImmediate(() => void this.missingPr(this.getIssue(i.id)!).catch(() => {}));
     let resumed = 0;
     for (const i of this.issues().filter((x) => x.status === "in_progress")) {
       if (this.activeRun(i.id)) continue;

@@ -139,8 +139,9 @@ test("等 CI 期间：进度实时写进 PR，工作项不出现在「需要你�
     Object.assign(i, { status: "in_review", pr: { number: 24, branch: "agent/wc-1", state: "open", checks: "passing", tests: "5/5", additions: 1, deletions: 0, files: 1 } });
     store.docPut("issues", i.id, i);
     assert.equal(work.attention().length, 1, "等 CI 之前：待验收");
-    const waiting = work["waitCi"](work.find(v.key), 5000, 30) as Promise<{ state: string }>;
-    await new Promise((r) => setTimeout(r, 15));
+    // 轮询间隔放宽到 300ms，留出足够的「等待中」窗口；不靠固定的 sleep，等到第一次结果写进 PR 再检查
+    const waiting = work["waitCi"](work.find(v.key), 10_000, 300) as Promise<{ state: string }>;
+    for (const t0 = Date.now(); !work.find(v.key).pr!.ci && Date.now() - t0 < 5000;) await new Promise((r) => setTimeout(r, 10));
     assert.equal(work.attention().length, 0, "等 CI 期间不打扰人");
     assert.equal(work.find(v.key).pr!.ci!.state, "pending", "进度写进 PR");
     assert.equal((await waiting).state, "passing");

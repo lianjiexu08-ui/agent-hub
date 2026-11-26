@@ -56,3 +56,25 @@ test("worktree：准备失败时不启动，退回待办并说明原因", async 
   assert.equal(seenAtStart.length, 0);
   assert.ok(work.detail(v.key).activity.some((c) => /准备工作目录失败.*权限不足/.test(c.body)));
 });
+
+test("生命周期走完却没有 PR：退回执行阶段重新提交（只自动处理 1 次）", async () => {
+  const { work, store, projectId } = setup(async () => "/tmp/wt");
+  const v = await work.create({ projectId, title: "工作台", status: "backlog", assignee: "backend-dev" });
+  for (const t of store.listTasks({ status: "running" })) work["runtime"].cancel(t.id);
+  const i = work.find(v.key);
+  Object.assign(i, { status: "in_review", lifecycleDone: true, cycle: 1, pr: null });
+  store.docPut("issues", i.id, i);
+  const started: string[] = [];
+  work["startRun"] = async (x: { resumeFrom?: string | null }, by: string) => { started.push(`${x.resumeFrom} ${by}`); return null; };
+  await work["afterDeliver"](work.find(v.key));
+  const a = work.find(v.key);
+  assert.equal(a.status, "todo");
+  assert.equal(a.lifecycleDone, false);
+  assert.deepEqual(started, ["do system"], "从执行阶段续跑");
+  assert.match(work.detail(v.key).activity.at(-1)!.body, /还没有提交成 PR/);
+  Object.assign(a, { status: "in_review", lifecycleDone: true });
+  store.docPut("issues", a.id, a);
+  await work["afterDeliver"](work.find(v.key));
+  assert.equal(started.length, 1, "第二次不再自动退回，交给人");
+  assert.equal(work.find(v.key).status, "in_review");
+});

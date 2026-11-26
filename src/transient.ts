@@ -4,11 +4,15 @@
  */
 const TRANSIENT = /timed? ?out|timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EPIPE|socket hang up|UND_ERR|fetch failed|network|overloaded|rate.?limit|too many requests|\b(429|500|502|503|504|529)\b/i;
 
+/** 订阅 / 接口额度用完（如「5 小时额度」）：要等到恢复时间，短间隔重试没用，交给工作项层面「等额度恢复后续跑」 */
+const QUOTA = /usage limit|quota|limit (?:reached|exceeded)|额度|限额/i;
+
 export function isTransientError(e: unknown): boolean {
   const err = e as { name?: string; status?: number; message?: string; cause?: { code?: string; message?: string } } | string | null | undefined;
   if (!err) return false;
-  if (typeof err === "string") return TRANSIENT.test(err);
+  if (typeof err === "string") return TRANSIENT.test(err) && !QUOTA.test(err);
   if (err.name === "AbortError") return false; // 人主动停止
+  if (QUOTA.test(err.message ?? "")) return false;
   if (typeof err.status === "number" && [408, 429, 500, 502, 503, 504, 529].includes(err.status)) return true;
   return TRANSIENT.test(`${err.message ?? ""} ${err.cause?.code ?? ""} ${err.cause?.message ?? ""}`);
 }

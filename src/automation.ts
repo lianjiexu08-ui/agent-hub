@@ -189,6 +189,8 @@ export class Automation {
     const unfinished = (i: { status: string; lastRun?: { status: string } | null; lifecycleDone?: boolean; resumeFrom?: string | null }) =>
       i.lastRun?.status === "failed" || (i.lastRun?.status === "completed" && !i.lifecycleDone) || (!!i.resumeFrom && i.lastRun?.status === "cancelled");
     if (R.retryFailed.on) for (const i of this.work.list().filter((i) => i.status === "todo" && unfinished(i) && !this.retried.has(i.lastRun!.id)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))) {
+      // 额度用完：等到恢复时间再续跑（不记为已重试，到点后下一轮巡检会拉起）
+      if (i.quotaUntil && Date.parse(i.quotaUntil) > Date.now()) continue;
       this.retried.add(i.lastRun!.id);
       const tries = i.runs;
       // 按最近连续失败次数限流（见 Work.failStreak）；以前用总运行次数，跑过几轮的工作项就再也不会被重试

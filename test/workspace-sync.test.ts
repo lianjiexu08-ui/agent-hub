@@ -61,3 +61,17 @@ test("主干前进且冲突：撤销合并、列出冲突文件，不推送", as
   assert.ok(again && !("conflict" in again && again.conflict));
   assert.ok(git(remote, "rev-parse", "--verify", "agent/s2t-6"));
 });
+
+test("智能体自己已经提交、工作目录只剩 Hub 的 pi 配置：照常推送，不因「没有可提交的内容」失败", async () => {
+  const { ws, p, remote } = setup();
+  const dir = await ws.prepare(p, "S2T-13");
+  writeFileSync(join(dir, "app.txt"), "line1 by agent\nline2\nline3\n");
+  git(dir, "commit", "-am", "agent 自己提交");
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(join(dir, ".pi"), { recursive: true });
+  writeFileSync(join(dir, ".pi", "mcp.json"), '{"env":{"HUB_TASK_ID":"t1","HUB_TASK_TOKEN":"secret"}}');
+  const res = await ws.commitAndPush(p, "S2T-13", "S2T-13: 工作台");
+  assert.ok(res && !("conflict" in res && res.conflict), "推送成功");
+  assert.ok(git(remote, "rev-parse", "--verify", "agent/s2t-13"));
+  assert.throws(() => git(remote, "cat-file", "-e", "agent/s2t-13:.pi/mcp.json"), "含令牌的 pi 配置没有提交");
+});
