@@ -23,7 +23,7 @@ import type { Workspace } from "./workspace.ts";
 import { backoffMs, isTransientError, quotaReset } from "./transient.ts";
 export { quotaReset };
 import { existsSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { BetaMessageParam } from "@anthropic-ai/sdk/resources/beta/messages/messages";
 
 export const PHASES = ["understand", "plan", "do", "test", "review"] as const;
@@ -79,7 +79,7 @@ export interface Issue {
   waitingRestart?: boolean;
 }
 export interface Comment { id: number; issueId: number; author: string; kind: "user" | "agent" | "lead" | "system"; body: string; runId: string | null; createdAt: string }
-export interface Lead { agent: string; mode: "off" | "on_demand" | "autopilot"; duties: { flow: boolean; review: boolean; bugs: boolean; testing: boolean }; mergePolicy: "auto" | "manual"; dailyRuns: number; runsToday: number; runsDay?: string; activity: { at: string; text: string }[] }
+export interface Lead { agent: string; mode: "off" | "on_demand" | "autopilot"; duties: { flow: boolean; review: boolean; bugs: boolean; testing: boolean }; mergePolicy: "auto" | "manual"; dailyRuns: number; runsToday: number; runsDay?: string; activity: { at: string; text: string }[]; /** 上次例行巡检：时间与当时工作项状态的指纹（没有变化就不再花一次模型调用） */ patrol?: { at: string; sig: string; taskId?: string } }
 export interface LinearBinding {
   teamId: string; teamKey: string; teamName: string;
   mode: "two_way" | "import" | "push" | "off";
@@ -1080,6 +1080,8 @@ export class Work {
   private leadOf(i: Issue): Lead | null { const l = this.proj(i.projectId)?.lead; return l && l.mode !== "off" ? l : null; }
 
   /** 负责人巡检：分诊 bug；持续迭代模式下提出改进项 */
+  /** 两次例行巡检的最短间隔（测试里调小） */
+  patrolGapMs = 30 * 60_000;
   async leadTick() {
     const day = new Date().toDateString();
     for (const p of this.projectsRaw()) {
@@ -1116,7 +1118,15 @@ export class Work {
         // 真实模式：让负责人智能体巡检项目，必要时用 create_issue 提出改进项
         if (!this.store.getAgent(L.agent)) continue;
         const open = its.filter((i) => !["done", "canceled"].includes(i.status)).map((i) => `- ${this.key(i)} [${STATUS_LABEL[i.status]}] ${i.title}`).join("\n");
-        this.runtime.submit(L.agent, `你是项目「${p.name}」的负责人，正在做例行巡检。\n\n未完成的工作项：\n${open || "（无）"}\n\n如果发现明确、有价值且不与现有工作项重复的改进点，用 create_issue 提出至多 1 个（写清验收标准，指派给合适的智能体并设为 todo）；没有就直接回复「无需新增」。`, { source: "issue" });
+        // 巡检要花一次完整的模型调用（负责人通常用最贵的模型）：上次巡检还没结束、距上次不到 30 分钟、
+        // 或者工作项状态和上次巡检时完全一样（例如夜里都在等额度），就跳过
+        const sig = createHash("sha1").update(open).digest("hex").slice(0, 16);
+        const prev = L.patrol;
+        const prevTask = prev?.taskId ? this.store.getTask(prev.taskId) : null;
+        if (prevTask && !TERMINAL.has(prevTask.status)) continue;
+        if (prev && (Date.now() - Date.parse(prev.at) < this.patrolGapMs || prev.sig === sig)) continue;
+        const patrolTask = this.runtime.submit(L.agent, `你是项目「${p.name}」的负责人，正在做例行巡检。\n\n未完成的工作项：\n${open || "（无）"}\n\n如果发现明确、有价值且不与现有工作项重复的改进点，用 create_issue 提出至多 1 个（写清验收标准，指派给合适的智能体并设为 todo）；没有就直接回复「无需新增」。`, { source: "issue" });
+        p.lead.patrol = { at: now(), sig, taskId: patrolTask.id };
         this.leadLog(p, "持续迭代：开始例行巡检");
       }
       p.lead.runsToday++;

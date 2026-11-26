@@ -36,9 +36,17 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  */
 export function quotaReset(error: string | null | undefined, failedAt: Date = new Date()): Date | null {
   const e = error ?? "";
-  if (!/usage limit|rate.?limit|quota|limit (?:reached|exceeded)|too many requests|\b429\b|额度|限额|限流/i.test(e)) return null;
+  if (!/usage limit|rate.?limit|quota|limit (?:reached|exceeded)|hit your .{0,30}limit|too many requests|\b429\b|额度|限额|限流/i.test(e)) return null;
   const at = e.match(/reset(?:s)? (?:at|on)\s*:?\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/i);
   if (at) { const d = new Date(at[1].replace(" ", "T")); if (!isNaN(+d)) return d; }
+  // Claude Code：「You've hit your 5-hour limit · resets 3:50am (Asia/Shanghai)」「resets Mon 9am (…)」
+  const clock = e.match(/resets?\s+(?:at\s+)?(?:(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b\s*(?:\(([^)]+)\))?/i);
+  if (clock) {
+    let h = Number(clock[2]) % 12;
+    if (clock[4].toLowerCase() === "pm") h += 12;
+    const d = nextClock(failedAt, h, Number(clock[3] ?? 0), clock[5], clock[1]);
+    if (d) return d;
+  }
   const epoch = e.match(/limit reached\|(\d{10})/i);
   if (epoch) return new Date(Number(epoch[1]) * 1000);
   const rel = e.match(/(?:try again|retry|reset(?:s)?) in (?:about )?(\d+(?:\.\d+)?)\s*(h|hours?|m|min(?:ute)?s?|s|sec(?:ond)?s?)\b/i);
@@ -62,4 +70,27 @@ export function downUntil(error: string | null | undefined, now = new Date()): n
   if (/concurren(?:t|cy) (?:request )?limit/i.test(error ?? "")) return +now + 2 * 60_000;
   if (isTransientError(error)) return +now + 3 * 60_000;
   return +now + 30 * 60_000; // 鉴权类：要人处理，半小时内别再用
+}
+
+const DOW = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+/** failedAt 之后、在时区 tz（缺省本机）里第一个 h:m（指定星期几时取那一天） */
+function nextClock(failedAt: Date, h: number, m: number, tz?: string, dow?: string): Date | null {
+  const zone = tz && (() => { try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); return tz; } catch { return undefined; } })();
+  // 某个 UTC 时刻在 tz 里的「墙上时间」各分量
+  const wall = (t: number) => {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: zone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", weekday: "short" }).formatToParts(t).map((p) => [p.type, p.value]));
+    return { y: +parts.year, mo: +parts.month, d: +parts.day, h: +parts.hour, mi: +parts.minute, wd: String(parts.weekday).toLowerCase().slice(0, 3) };
+  };
+  const base = wall(+failedAt);
+  for (let add = 0; add <= 7; add++) {
+    // 先当作 UTC 算，再用该时刻在 tz 的偏移修正（夏令时边界误差可忽略）
+    const guess = Date.UTC(base.y, base.mo - 1, base.d + add, h, m);
+    const w = wall(guess);
+    const offset = Date.UTC(w.y, w.mo - 1, w.d, w.h, w.mi) - guess;
+    const t = guess - offset;
+    if (t <= +failedAt) continue;
+    if (dow && wall(t).wd !== dow.toLowerCase().slice(0, 3)) continue;
+    return new Date(t);
+  }
+  return null;
 }
