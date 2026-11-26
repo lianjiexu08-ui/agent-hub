@@ -1,3 +1,4 @@
+import { resolve as resolvePath } from "node:path";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
@@ -133,6 +134,11 @@ runtime.cli = cliRunner;
 // 上一个 Hub 进程被强杀 / 崩溃时留下的 CLI：先清掉，免得它和即将重试的新运行同时改一个 worktree
 const reaped = cliRunner.reapOrphans();
 if (reaped) console.warn(`结束了上次遗留的 ${reaped} 个 CLI 进程`);
+work.shotDir = resolvePath(dataDir, "tmp", "screenshots");
+// 中断后续跑：CLI 底座按会话恢复，内置底座装回之前的对话
+cliRunner.sessionFor = (task) => work.sessionFor(task);
+cliRunner.onSessionStarted = (task, id) => work.sessionStarted(task, id);
+runtime.resumeMessagesFor = (task) => work.resumeMessagesFor(task);
 // 可选的文件 / 命令 / 知识检索工具：按智能体的 builtinTools 逐个开启
 registerToolbox(runtime, { work, workspace, store, settings });
 // 智能体会话：两个智能体围绕一个议题多轮往返，收敛出一条结论。
@@ -236,7 +242,7 @@ const security: Security = {
 };
 if (!["127.0.0.1", "localhost", "::1"].includes(hostname) && !security.password && !security.token && !credentials.initialized)
   console.warn("警告：服务监听在非本机地址且未设置登录密码或 HUB_TOKEN，任何人都能访问并让智能体执行命令。请设置 HUB_PASSWORD（或 HUB_TOKEN）。");
-const fetch = createApp(store, runtime, security, { ...api, uploads }).fetch;
+const fetch = createApp(store, runtime, security, { ...api, uploads, shotDir: join(dataDir, "tmp", "screenshots") }).fetch;
 /** 监听端口；作为重启拉起的新进程时旧进程可能还没释放端口，重试若干次 */
 function listen(attempt = 1) {
   const server = serve({ fetch, port, hostname }, () =>

@@ -266,12 +266,22 @@ async function loadRoots() {
   state.roots = await api(`/tasks?roots=1&limit=100${st ? "&status=" + st : ""}`);
   renderRoots();
 }
+/** 这个智能体实际用什么在跑：内置循环报模型名，CLI 底座报底座名与指定的模型 */
+function agentRuntimeLabel(name) {
+  const a = (S.agents ?? []).find((x) => x.name === name);
+  if (!a) return "";
+  const rt = a.runtime ?? "builtin";
+  if (rt === "builtin") return `内置 · ${modelShort(a.model)}`;
+  return `${rtDef(rt).short}${a.cliModel ? ` · ${modelShort(a.cliModel)}` : " · 默认模型"}`;
+}
 function renderRoots() {
   const list = $("#rootList");
   fill(list, 
     ...(state.roots.length ? state.roots.map((t) =>
       h("div", { class: "task-item" + (t.id === state.selRoot ? " sel" : ""), onclick: () => selectRoot(t.id) },
-        h("div", { class: "row" }, badge(t.status), h("b", {}, t.agent), t.source !== "api" ? h("span", { class: "tag" }, t.source) : null,
+        h("div", { class: "row" }, badge(t.status), h("b", {}, t.agent),
+          agentRuntimeLabel(t.agent) ? h("span", { class: "model-chip", title: "执行这次调用使用的模型与底座" }, agentRuntimeLabel(t.agent)) : null,
+          t.source !== "api" ? h("span", { class: "tag" }, t.source) : null,
           h("span", { class: "muted", style: "margin-left:auto;font-size:12px" }, ago(t.createdAt))),
         h("div", { class: "input" }, t.input))) : [h("div", { class: "empty" }, "暂无任务")]),
   );
@@ -451,9 +461,9 @@ function connect() {
       else if (e.status === "cancelled") toast(`■ ${e.key} 已停止`);
     }
     if (e.kind === "phase" && e.result === "fail") toast(`${e.key} ${e.phase === "test" ? "测试未通过，回到执行修复" : "评审未通过，开始新一轮"}`, "err");
-    debounce("state", refreshState, 250);
+    throttleState();
   });
-  es.addEventListener("task", (ev) => { const { task } = JSON.parse(ev.data); if (task.issueId != null || task.source === "qa") debounce("state", refreshState, 400); });
+  es.addEventListener("task", (ev) => { const { task } = JSON.parse(ev.data); if (task.issueId != null || task.source === "qa") throttleState(); });
 }
 
 async function loadAll() {
@@ -503,6 +513,16 @@ async function rpc(method, ...args) {
   return r?.result;
 }
 let refreshing = null, refreshAgain = false;
+/**
+ * 事件驱动的整体刷新：节流到最多每 2.5 秒一次（期间的事件合并到下一次）。
+ * 多个智能体同时在跑时进度事件几乎不断，用防抖会变成一个刷新接一个刷新，把服务器压满。
+ */
+let stateTimer = null, stateLast = 0;
+function throttleState() {
+  if (stateTimer) return;
+  const wait = Math.max(0, 2500 - (Date.now() - stateLast));
+  stateTimer = setTimeout(() => { stateTimer = null; stateLast = Date.now(); refreshState(); }, wait);
+}
 function refreshState() {
   if (refreshing) { refreshAgain = true; return refreshing; }
   refreshing = (async () => {
@@ -561,6 +581,7 @@ const issuesApi = {
   disconnectLinear: (id) => act("work.disconnectLinear", id),
   syncLinear: (id) => act("work.syncLinear", id),
   linearMembers: (id) => act("work.linearMembers", id),
+  linearMe: () => act("work.linearMe"),
   pushToLinear: (ref) => act("work.pushToLinear", ref),
 };
 
@@ -600,14 +621,72 @@ function select(options, value, onchange, attrs = {}) {
 const statusOptions = () => IS.statuses.map((s) => [s.id, `${s.icon} ${s.label}`]);
 const prioOptions = () => IS.priorities.map((l, i) => [i, l]);
 const assigneeOptions = () => [["", "未指派"], ...agentNames().map((n) => [n, n])];
-function toast(msg, kind = "") {
-  const el = h("div", { class: "toast " + kind }, msg);
+/**
+ * 右下角提示。文字里提到了某张工作项（如 OPS-470），或显式传了 key，就可以点击直接打开它。
+ * 鼠标停在上面时不自动消失。
+ */
+function toast(msg, kind = "", opts = {}) {
+  const text = String(msg ?? "");
+  const known = (k) => !!(S.issues ?? []).some((i) => i.key === k);
+  const key = opts.key ?? (text.match(/\b[A-Z][A-Z0-9]{1,5}-\d+\b/g) ?? []).find(known) ?? null;
+  const el = h("div", { class: "toast " + kind + (key ? " link" : ""), role: key ? "button" : null, tabindex: key ? "0" : null, title: key ? `点击打开 ${key}` : null,
+    onclick: key ? () => { el.remove(); openIssue(key); } : null,
+    onkeydown: key ? (e) => { if (e.key === "Enter") { el.remove(); openIssue(key); } } : null },
+    text, key ? h("span", { class: "toast-go" }, "打开 →") : null);
   $("#toasts").append(el);
   while ($("#toasts").children.length > 3) $("#toasts").firstChild.remove();
-  setTimeout(() => el.remove(), 4200);
+  let left = key ? 7000 : 4200, t0 = Date.now();
+  let timer = setTimeout(() => el.remove(), left);
+  el.addEventListener("mouseenter", () => { clearTimeout(timer); left -= Date.now() - t0; });
+  el.addEventListener("mouseleave", () => { t0 = Date.now(); timer = setTimeout(() => el.remove(), Math.max(1500, left)); });
 }
 const fail = (err) => toast(err.message || String(err), "err");
 
+/** 去掉 Markdown 标记，用于一行摘要 */
+const plainMd = (t) => String(t ?? "").replace(/\*\*|__|`/g, "").replace(/^#+\s*/gm, "");
+/**
+ * 生命周期按「轮」展示：后端的一轮里，测试不通过会回到执行再交付一次。界面上每次交付算一轮，
+ * 五个阶段各一格：返工的那一轮里「理解」「计划」沿用上一轮，执行、测试、评审是这一轮自己的。
+ * 重启 / 网络造成的中断不单列，记在所属那一轮上。
+ */
+function lifecycleRounds(d) {
+  const out = [];
+  for (const cy of [...new Set(d.phases.map((r) => r.cycle))].sort((a, b) => a - b)) {
+    const recs = d.phases.filter((r) => r.cycle === cy);
+    const head = (ph) => recs.filter((r) => r.phase === ph).at(-1);
+    const parts = [];
+    let cur = null;
+    for (const r of recs) {
+      if (r.phase !== "do" && r.phase !== "test") continue;
+      if (r.phase === "do" && r.result === "cancelled") { if (cur) cur.interrupts++; continue; }
+      if (r.phase === "do" && (!cur || cur.test)) { cur = { dos: [], test: null, interrupts: 0 }; parts.push(cur); }
+      if (!cur) continue;
+      if (r.phase === "do") cur.dos.push(r); else cur.test = r;
+    }
+    if (!parts.length) parts.push({ dos: [], test: null, interrupts: 0 });
+    parts.forEach((pt, k) => {
+      const last = k === parts.length - 1;
+      const doRec = pt.dos.findLast((x) => x.result !== "cancelled") ?? pt.dos.at(-1);
+      const cell = (ph, rec, inherit) => ({ phase: PHASES.find((p) => p.id === ph), rec, state: inherit ? "inherit" : rec ? rec.result : "pending" });
+      const run = pt.test?.qaRun ? qa.run(pt.test.qaRun) : null;
+      out.push({
+        n: out.length + 1,
+        why: k > 0 ? "测试未通过后返工" : out.length > 0 ? "评审未通过后重来" : "",
+        interrupts: pt.interrupts,
+        run,
+        fails: run ? run.cases.filter((c) => c.status === "failed") : [],
+        cells: [
+          cell("understand", k === 0 ? head("understand") : null, k > 0),
+          cell("plan", k === 0 ? head("plan") : null, k > 0),
+          cell("do", doRec),
+          cell("test", pt.test),
+          cell("review", last ? head("review") : null),
+        ],
+      });
+    });
+  }
+  return out;
+}
 /** 某一轮各阶段的状态：pass / fail / active / cancelled / pending */
 function cycleCells(i, cycle) {
   return PHASES.map((p) => {
@@ -624,10 +703,10 @@ function miniSteps(i) {
       cells.map((c) => h("i", { class: c.state }))),
     h("div", { class: "steps-label" }, i.phase ? h("b", {}, cur) : h("span", {}, cur), i.cycle > 1 ? h("span", {}, `第 ${i.cycle} 轮`) : null));
 }
-const CELL_TEXT = { pass: "通过", fail: "未通过", active: "进行中", cancelled: "已停止", blocked: "待确认", pending: "—" };
+const CELL_TEXT = { pass: "通过", fail: "未通过", active: "进行中", cancelled: "已停止", blocked: "待确认", pending: "—", inherit: "沿用上一轮" };
 const phaseCell = (c) => h("div", { class: "cell " + c.state, title: c.rec?.note || "" },
   h("span", { class: "st" }, CELL_TEXT[c.state]),
-  c.rec?.note ? h("span", { class: "note" }, c.rec.note) : c.state === "active" ? h("span", { class: "note" }, ago(c.rec.startedAt)) : null);
+  c.state === "active" ? h("span", { class: "note" }, ago(c.rec.startedAt)) : c.rec?.note ? h("span", { class: "note" }, c.rec.note) : null);
 
 
 // ---------- 运行中心 ----------
@@ -720,39 +799,40 @@ async function renderBoard() {
 }
 function issueCard(i) {
   return h("div", {
-      class: `icard${i.activeRuns ? " running" : ""}${i.status === "done" ? " done" : ""}${ui.openKey === i.key ? " sel" : ""}`,
+      class: `icard${i.live?.tone === "run" ? " running" : ""}${i.status === "done" ? " done" : ""}${ui.openKey === i.key ? " sel" : ""}`,
       draggable: "true",
       ondragstart: (e) => { e.dataTransfer.setData("text/plain", i.key); e.currentTarget.classList.add("dragging"); },
       ondragend: (e) => e.currentTarget.classList.remove("dragging"),
       onclick: () => openIssue(i.key),
     },
     h("div", { class: "icard-top" }, prio(i.priority), h("span", { class: "ikey" }, i.key),
-      i.activeRuns ? (i.queued ? h("span", { class: "warn", style: "color:var(--muted)", title: "并发已满，按优先级排队等待" }, "⏳ 排队中") : h("span", { class: "live" }, "执行中"))
-        : i.status === "todo" && i.quotaUntil && Date.parse(i.quotaUntil) > Date.now() ? h("span", { class: "warn", style: "color:var(--muted)", title: `模型额度用完，预计 ${new Date(i.quotaUntil).toLocaleString()} 恢复后自动继续` }, `⏸ 等额度 ${new Date(i.quotaUntil).toTimeString().slice(0, 5)}`)
-        : i.status === "todo" && i.waitingDeps ? h("span", { class: "warn", style: "color:var(--muted)", title: `等待 ${i.deps.filter((d) => !d.met).map((d) => d.key).join("、")} 完成后自动开始` }, "⏸ 等依赖")
-        : i.status === "todo" && i.lastRun?.status === "failed" ? h("span", { class: "warn" }, "✕ 上次失败")
-        : i.status === "todo" && !i.assignee ? h("span", { class: "warn", style: "color:var(--muted)" }, "待指派") : null,
+      i.live ? h("span", { class: `lstate ${i.live.tone}`, title: i.live.title || i.live.text }, i.live.text)
+        : i.status === "todo" && !i.assignee ? h("span", { class: "lstate wait" }, "待指派") : null,
       h("span", { style: "margin-left:auto" }, avatar(i.assignee))),
     h("div", { class: "ititle" }, i.title),
+    i.now ? h("div", { class: "inow", title: `${i.now.who}${i.now.step ? ` · ${i.now.step}` : ""}\n${i.now.action}` },
+      h("span", { class: "spin" }), h("b", {}, i.now.who), h("span", { class: "act" }, i.now.action),
+      h("span", { class: "el", "data-since": i.now.since }, elapsed(i.now.since))) : null,
     h("div", { class: "imeta" },
       i.labels.map((l) => h("span", { class: "label" + (l === "hotfix" ? " hot" : "") }, l === "hotfix" ? "⚡ HOTFIX" : l)),
       i.children.total ? h("span", { class: "tag", title: "子工作项完成度" }, `◫ ${i.children.done}/${i.children.total}`) : null,
       i.comments ? h("span", { class: "tag", title: "评论" }, `✎ ${i.comments}`) : null,
       ghTag(i.github), linearTag(i.linear),
-      i.pr ? h("span", { class: "gh" + (i.pr.state === "merged" ? " closed" : ""), title: `PR #${i.pr.number}（${i.pr.state === "merged" ? "已合并" : "待合并"}）` }, "⑂", `PR #${i.pr.number}`) : null),
+      i.pr ? h("span", { class: "gh" + (i.pr.state === "merged" ? " closed" : ""), title: `${prName(i.pr)}（${i.pr.state === "merged" ? "已合并" : "待合并"}）` }, "⑂", prName(i.pr)) : null),
     miniSteps(i));
 }
 
 // ---------- 详情抽屉 ----------
 async function openIssue(k) {
   if (ui.openKey !== k) { ui.feedbackOpen = false; ui.draft = ""; ui.feedbackDraft = ""; }
+  if (ui.openKey !== k) drawerSig = "";
   ui.openKey = k;
   ui.focusReturn = document.activeElement;
   history.replaceState(null, "", "#issue=" + k);
   $("#drawer").classList.add("open");
   $("#drawer").setAttribute("aria-hidden", "false");
   $("#scrim").classList.add("open");
-  await renderDrawer();
+  await renderDrawer(true);
   renderBoard();
   $("#drawer").focus({ preventScroll: true });
 }
@@ -772,10 +852,26 @@ function refreshDrawer() {
   if (a && $("#drawer").contains(a) && a.dataset.keep) { ui.pendingDrawer = true; return; }
   renderDrawer();
 }
-async function renderDrawer() {
+let drawerSig = "";
+let drawerBusy = false;
+let drawerDirty = false;
+async function renderDrawer(force = false) {
   if (!ui.openKey) return;
+  // 进行中的工作项每秒都有状态事件；整体重绘会让抽屉闪烁。串行化，并且只在结构真的变了时重绘
+  if (drawerBusy) { drawerDirty = true; return; }
+  drawerBusy = true;
+  try {
   let d;
   try { d = await issuesApi.detail(ui.openKey); } catch { return closeDrawer(); }
+  if (d.key !== ui.openKey) return; // 请求返回前已经切到别的单
+  // 指纹只取「会改变界面结构」的字段：相对时间每秒都在变，不能拿来判断
+  const sig = JSON.stringify([
+    d.id, d.status, d.phase, d.cycle, d.assignee, d.priority, d.labels, d.blocked, d.activeRuns,
+    d.lastRun?.status, d.lastRun?.id, d.pr?.state, d.pr?.checks, d.comments, d.now?.who, d.now?.action, d.now?.step, d.live?.text,
+    (d.activity ?? []).length, (d.deps ?? []).map((x) => x.met), d.github?.state, d.linear?.syncedAt,
+  ]);
+  if (!force && sig === drawerSig) return;
+  drawerSig = sig;
   ui.pendingDrawer = false;
   if (d.projectId !== curProject()?.id) setProject(d.projectId, { keepDrawer: true });
   // 评论框/反馈框：重绘后恢复焦点与光标
@@ -786,7 +882,10 @@ async function renderDrawer() {
 
   // 情境操作条：根据状态给出下一步最可能的动作
   let bar;
-  if (d.blocked) {
+  if (d.blocked && d.leadDeciding) {
+    bar = h("div", { class: "actionbar live-bar" }, h("span", { class: "live" }, "确认中"),
+      h("span", { class: "hint" }, `${d.assignee} 提了 ${d.blocked.length} 个需求问题，项目负责人正在回答；拿不准的会转给你`));
+  } else if (d.blocked) {
     const ans = h("textarea", { class: "feedback", "data-focus-id": "reqans", placeholder: "逐条回答上面的问题，会补充进需求描述…（⌘↵ 提交）", oninput: (e) => (ui.reqDraft = e.target.value) }, ui.reqDraft ?? "");
     const go = async () => { const a = ans.value.trim(); if (!a) return ans.focus(); ui.reqDraft = ""; ans.blur(); await issuesApi.confirmRequirement(d.key, a); toast(`${d.key} 需求已确认，继续执行`, "ok"); };
     ans.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) go(); });
@@ -795,8 +894,10 @@ async function renderDrawer() {
       h("ol", { style: "margin:0;padding-left:20px;font-size:13px;flex-basis:100%" }, d.blocked.map((q) => h("li", {}, q))),
       ans, h("div", { class: "row", style: "width:100%;justify-content:flex-end" }, h("button", { class: "primary", onclick: go }, "确认需求并继续")));
   } else if (d.activeRuns) {
-    bar = h("div", { class: "actionbar live-bar" }, h("span", { class: "live" }, "执行中"),
-      h("span", { class: "hint" }, `${d.assignee} 正在处理，完成后结果会出现在下方动态里`),
+    bar = h("div", { class: "actionbar live-bar" }, h("span", { class: "live" }, d.live?.text ?? "执行中"),
+      d.now ? h("span", { class: "hint now-line" }, h("span", { class: "spin" }), h("b", {}, d.now.who), d.now.step ? h("span", { class: "muted" }, ` · ${d.now.step}`) : null,
+          h("span", {}, ` · ${d.now.action}`), h("span", { class: "muted", "data-since": d.now.since }, ` · ${elapsed(d.now.since)}`))
+        : h("span", { class: "hint" }, `${d.assignee} 正在处理，完成后结果会出现在下方动态里`),
       h("button", { class: "danger", onclick: () => issuesApi.stop(d.key).catch(fail) }, "■ 停止"));
   } else if (d.status === "in_review") {
     const fb = h("textarea", { class: "feedback", "data-focus-id": "feedback", placeholder: "写下修改意见，智能体会按意见重做…（⌘↵ 提交）", oninput: (e) => (ui.feedbackDraft = e.target.value) }, ui.feedbackDraft);
@@ -810,9 +911,9 @@ async function renderDrawer() {
     };
     fb.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) sendBack(); });
     bar = h("div", { class: "actionbar review" },
-      h("span", { class: "hint" }, d.pr?.state === "merged" ? `已通过测试与 AI 审核，PR #${d.pr.number} 已合并，等待你最终验收` : `${d.assignee ?? "智能体"} 已交付，等待你最终验收`),
+      h("span", { class: "hint" }, d.pr?.state === "merged" ? `已通过测试与 AI 审核，${prName(d.pr)} 已合并，等待你最终验收` : `${d.assignee ?? "智能体"} 已交付，等待你最终验收`),
       d.pr?.state === "open"
-        ? h("button", { class: "primary", disabled: d.pr.checks === "passing" ? null : "", onclick: () => issuesApi.mergePR(d.key).then(() => toast(`已合并 PR #${d.pr.number}，${d.key} 完成`, "ok")).catch(fail) }, `✓ 验收并合并 PR #${d.pr.number}`)
+        ? h("button", { class: "primary", disabled: d.pr.checks === "passing" ? null : "", onclick: () => issuesApi.mergePR(d.key).then(() => toast(`已合并 ${prName(d.pr)}，${d.key} 完成`, "ok")).catch(fail) }, d.pr.local === "local" ? "✓ 验收并合并到本地" : `✓ 验收并合并 ${prName(d.pr)}`)
         : h("button", { class: "primary", onclick: () => set({ status: "done" }) }, "✓ 最终验收通过"),
       h("button", { onclick: () => { ui.feedbackOpen = !ui.feedbackOpen; renderDrawer(); } }, "↩ 退回修改"),
       ui.feedbackOpen ? [fb, h("div", { class: "row", style: "width:100%;justify-content:flex-end" },
@@ -845,6 +946,7 @@ async function renderDrawer() {
   const time = (iso) => h("span", { class: "time", title: new Date(iso).toLocaleString() }, ago(iso));
   const runBadge = (s) => h("span", { class: "badge s-" + (s === "cancelled" ? "cancelled" : s) }, STATUS[s] ?? s);
 
+  const keepScroll = $("#drawer").scrollTop;
   fill($("#drawer"), 
     h("div", { class: "dr-head" },
       h("a", { onclick: () => { closeDrawer(); showView("project"); }, title: "项目设置" }, d.projectName), h("span", {}, "/"),
@@ -883,19 +985,27 @@ async function renderDrawer() {
           ? h("div", { class: "row" }, h("span", { class: "muted", style: "font-size:12.5px" }, "未关联"),
               linearPushable(curProject()) ? h("button", { onclick: () => issuesApi.pushToLinear(d.key).then(() => toast("已在 Linear 创建 issue", "ok")).catch(fail) }, "创建 Linear issue") : null)
           : h("span", { class: "muted", style: "font-size:12.5px" }, "项目未绑定 Linear")),
-    d.phases.length ? [
-      h("div", { class: "section-title" }, `生命周期 · ${d.phase ? `${phaseLabel(d.phase)}中，` : ""}共 ${d.cycle} 轮`),
-      h("div", { class: "lc-cycles" }, [...new Set(d.phases.map((r) => r.cycle))].sort((a, b) => b - a).map((cy) => {
-        const cells = cycleCells(d, cy);
-        const failed = cells.find((c) => c.state === "fail");
-        return h("div", { class: "lc-cycle" },
-          h("div", { class: "hd" }, h("b", { style: "color:var(--text)" }, `第 ${cy} 轮`),
-            cy === d.cycle && d.phase ? h("span", { class: "live" }, "进行中") : failed ? h("span", { class: "warn" }, `${failed.phase.label}未通过`) : cells.every((c) => c.state === "pass") ? h("span", { class: "s-completed", style: "font-size:12px" }, "全部通过") : null),
-          h("div", { class: "grid5" }, cells.map((c) => h("div", {}, h("div", { class: "muted", style: "font-size:11.5px;margin-bottom:2px" }, c.phase.label), phaseCell(c)))));
-      }))] : null,
+    d.phases.length ? (() => {
+      const rounds = lifecycleRounds(d);
+      return [
+        h("div", { class: "section-title" }, `生命周期 · ${d.phase ? `${phaseLabel(d.phase)}中，` : ""}共 ${rounds.length} 轮`),
+        h("div", { class: "lc-cycles" }, rounds.slice().reverse().map((rd) => {
+          const failed = rd.cells.find((c) => c.state === "fail");
+          const live = rd.cells.some((c) => c.state === "active");
+          return h("div", { class: "lc-cycle" },
+            h("div", { class: "hd" }, h("b", { style: "color:var(--text)" }, `第 ${rd.n} 轮`),
+              rd.why ? h("span", { class: "muted", style: "font-size:12px" }, rd.why) : null,
+              live ? h("span", { class: "live" }, "进行中") : failed ? h("span", { class: "warn" }, `${failed.phase.label}未通过`) : rd.cells.every((c) => ["pass", "inherit"].includes(c.state)) ? h("span", { class: "s-completed", style: "font-size:12px" }, "全部通过") : null,
+              rd.interrupts ? h("span", { class: "muted", style: "font-size:11.5px" }, `中途中断 ${rd.interrupts} 次（重启 / 网络），已接着跑`) : null,
+              rd.run ? h("a", { class: "link", style: "margin-left:auto;font-size:12px", onclick: () => openRun(rd.run.id) }, `验收记录与截图（${caseCount(rd.run)}）→`) : null),
+            h("div", { class: "grid5" }, rd.cells.map((c) => h("div", {}, h("div", { class: "muted", style: "font-size:11.5px;margin-bottom:2px" }, c.phase.label), phaseCell(c)))),
+            rd.fails.length ? h("ul", { class: "a-fails" }, rd.fails.map((c) => h("li", {}, h("b", {}, `${c.id} `), short(plainMd(c.title), 90), c.note ? h("div", { class: "muted" }, short(plainMd(c.note), 260)) : null))) : null);
+        }))];
+    })() : null,
     prSection(d),
     (() => { const runs = qa.runsFor(d.key); return runs.length ? [h("div", { class: "section-title" }, `测试 ${runs.length}`),
-      runs.slice(0, 5).map((r) => h("div", { class: "run-row", onclick: () => openRun(r.id) }, runBadge2(r.status), h("span", {}, `用例 ${caseCount(r)}`),
+      runs.map((r) => h("div", { class: "run-row", onclick: () => openRun(r.id) }, runBadge2(r.status), h("span", {}, `用例 ${caseCount(r)}`),
+        h("span", { class: "tag" }, r.trigger === "post-merge" ? "合并后页面验收" : r.trigger === "manual" ? "手动重跑" : "交付验收"),
         h("span", { class: "muted", style: "font-size:12px" }, r.browser === "local" ? "远程 Chrome" : r.browser ? `浏览器 ${r.browser}` : r.env === "CI" ? "CI" : "排队中"),
         r.wait && r.status === "queued" ? h("span", { class: "muted", style: "font-size:12px" }, r.wait) : null, h("span", { class: "time" }, ago(r.endedAt ?? r.queuedAt))))] : null; })(),
     (() => { const q = assessRequirement(d); return h("div", { class: "section-title" }, "描述 · ", h("span", { class: "score " + (q.score >= 80 ? "hi" : q.score >= 60 ? "mid" : "lo"), title: q.dims.map((x) => `${x.ok ? "✓" : "✕"} ${x.name}`).join("\n") }, `需求评分 ${q.score}`),
@@ -920,6 +1030,11 @@ async function renderDrawer() {
   if (refocus) {
     const el = $(`#drawer [data-focus-id="${refocus}"]`);
     if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+  }
+  if (keepScroll) $("#drawer").scrollTop = keepScroll;
+  } finally {
+    drawerBusy = false;
+    if (drawerDirty) { drawerDirty = false; void renderDrawer(); }
   }
 }
 
@@ -1135,7 +1250,8 @@ function renderStudioSide() {
       h("div", { class: "meta" }, h("div", { class: "t" }, a.name, h("span", { class: "model-chip" }, (a.runtime ?? "builtin") === "builtin" ? modelShort(a.model) : rtDef(a.runtime).short)),
         h("div", { class: "s" }, a.description || "—")))),
     h("div", { class: "side-head" }, h("span", {}, `技能 ${studio.skills().length}`),
-      h("button", { onclick: () => selectStudio("skill", null) }, "+ 新建")),
+      h("button", { onclick: () => selectStudio("skill", null), title: "从空白开始写" }, "+ 新建"),
+      h("button", { onclick: () => openSkillImporter(), title: "粘贴一段技能说明或给一个地址，由 AI 整理成技能" }, "✦ AI 新建")),
     studio.skills().map((s) => h("div", { class: "side-item" + (sel("skill", s.id) ? " sel" : ""), onclick: () => selectStudio("skill", s.id) },
       h("span", { class: "skill-icon" }, "✦"),
       h("div", { class: "meta" }, h("div", { class: "t" }, s.name), h("div", { class: "s" }, `${studio.usage(s.id).length} 个智能体在用 · ${s.description || "—"}`)))),
@@ -1325,6 +1441,42 @@ function skillEditor() {
         : h("div", { class: "muted", style: "font-size:13px" }, "还没有智能体使用这个技能")) : null,
     savebar(isNew ? "新技能尚未创建" : "有未保存的修改", save, cancel),
   ];
+}
+
+/**
+ * 用一段现成的技能素材建技能：粘贴 prompt 正文，或给一个地址由服务器抓取。
+ * 整理结果先进编辑器，用户确认后再保存——AI 起草的东西不该直接进库。
+ */
+function openSkillImporter() {
+  const text = h("textarea", { class: "prompt-area", style: "min-height:160px", placeholder: "把技能说明粘进来。可以是一段 prompt、一份规范、一个检查清单……" });
+  const url = h("input", { placeholder: "或者填一个 https 地址，如 https://…/skill.md（可选）" });
+  const note = h("span", { class: "muted", style: "font-size:12.5px" });
+  const go = async (btn) => {
+    if (!text.value.trim() && !url.value.trim()) return note.textContent && toast("先粘贴内容或填地址", "err");
+    btn.disabled = true; note.textContent = "正在整理…";
+    try {
+      const d = await rpc("assistant.draftSkill", { text: text.value, url: url.value.trim() });
+      closeModal(true);
+      selectStudio("skill", null);
+      // 已经存在同名标识时加后缀，避免直接覆盖别人的技能
+      let id = d.id;
+      while (studio.skill(id)) id = `${d.id}-${Math.random().toString(36).slice(2, 6)}`;
+      st.draft = { id, name: d.name, description: d.description, instructions: d.instructions, createdBy: ME };
+      renderStudio();
+      toast(`已整理成技能「${d.name}」，确认后保存`, "ok");
+    } catch (e) { note.textContent = ""; fail(e); } finally { btn.disabled = false; }
+  };
+  const submit = h("button", { class: "primary", onclick: (e) => go(e.currentTarget) }, "交给 AI 整理");
+  fill($("#modal"), h("div", { class: "modal", onclick: (e) => e.stopPropagation() },
+    h("div", { class: "dr-head" }, h("span", {}, "用 AI 新建技能")),
+    h("div", { class: "fields" },
+      text,
+      h("div", { class: "row", style: "gap:10px;align-items:center" }, url),
+      h("div", { class: "help" }, "地址只支持 https，由 Hub 服务器抓取后整理；整理结果先进编辑器，不会直接入库。")),
+    h("div", { class: "modal-foot" }, note, h("span", { style: "margin-left:auto" }),
+      h("button", { onclick: () => closeModal() }, "取消"), submit)));
+  $("#modal").classList.add("open"); $("#modal").setAttribute("aria-hidden", "false");
+  setTimeout(() => text.focus());
 }
 
 // ---------- 工具 / MCP（真实数据，只读） ----------
@@ -1848,6 +2000,136 @@ function mdHtml(src) {
 /** 渲染成 Markdown 的气泡：内容由 mdHtml 产出，样式靠 .md 关掉 pre-wrap */
 const mdEl = (text, cls = "bubble ai md") => { const el = h("div", { class: cls }); el.innerHTML = mdHtml(text); return el; };
 
+/**
+ * 后台事件（运行进度、同步）会频繁触发整页重绘，重绘会把正在展开的下拉框、正在输入的框直接拆掉。
+ * 焦点在容器里的表单控件上时先不重绘，失焦后补一次。返回 true 表示这次被挂起了。
+ */
+const editHold = new Map();
+/** 正处于展开状态的下拉框：选完（change）或失焦就算收起。选完后用户操作触发的重绘不能被拦 */
+let openSelect = null;
+document.addEventListener("mousedown", (e) => { if (e.target instanceof HTMLSelectElement) openSelect = e.target; }, true);
+document.addEventListener("keydown", (e) => { if (e.target instanceof HTMLSelectElement && [" ", "Enter", "ArrowDown", "ArrowUp"].includes(e.key)) openSelect = e.target; }, true);
+document.addEventListener("change", (e) => { if (e.target === openSelect) openSelect = null; }, true);
+document.addEventListener("blur", (e) => { if (e.target === openSelect) openSelect = null; }, true);
+function holdWhileEditing(container, rerender) {
+  const a = document.activeElement;
+  const box = typeof container === "string" ? $(container) : container;
+  if (!a || !box || !box.contains(a)) return false;
+  const editing = a.tagName === "SELECT" ? a === openSelect : ["INPUT", "TEXTAREA"].includes(a.tagName) && !["checkbox", "radio", "button"].includes(a.type);
+  if (!editing) return false;
+  if (!editHold.get(box)) {
+    editHold.set(box, true);
+    a.addEventListener("blur", () => { editHold.set(box, false); setTimeout(rerender, 0); }, { once: true });
+  }
+  return true;
+}
+/**
+ * 服务器目录选择器：Hub 跑在服务器上，浏览器打不开服务器的文件夹，所以由服务端列目录。
+ * onPick(path, info) 选中后回调；info 带是否 git 仓库与当前分支。
+ */
+function openDirPicker(start, onPick, opts = {}) {
+  let cur = null;
+  const body = h("div", { class: "dirpick" });
+  const go = async (path) => {
+    fill(body, h("div", { class: "muted", style: "padding:16px" }, "读取中…"));
+    try { cur = await rpc("fs.listDirs", path || ""); }
+    catch (e) { if (path) return go(""); fill(body, h("div", { class: "err-text", style: "padding:16px" }, e.message)); return; }
+    const crumbs = [];
+    let acc = cur.root;
+    crumbs.push(h("a", { class: "link", onclick: () => go(cur.root) }, "~"));
+    for (const seg of cur.path.slice(cur.root.length).split("/").filter(Boolean)) {
+      acc = `${acc}/${seg}`;
+      const p = acc;
+      crumbs.push(h("span", { class: "muted" }, " / "), h("a", { class: "link", onclick: () => go(p) }, seg));
+    }
+    fill(body,
+      h("div", { class: "dirpick-path" }, crumbs,
+        cur.git ? h("span", { class: "tag", style: "margin-left:8px" }, `git · ${cur.branch ?? "?"}`) : null),
+      h("div", { class: "dirpick-list" },
+        cur.parent ? h("div", { class: "dirpick-row", onclick: () => go(cur.parent) }, h("span", {}, "↰"), h("span", {}, "上一级")) : null,
+        cur.dirs.length ? cur.dirs.map((d) => h("div", { class: "dirpick-row", onclick: () => go(d.path), title: d.path },
+          h("span", {}, d.git ? "⑂" : "▸"), h("span", { class: "n" }, d.name),
+          d.git ? h("span", { class: "tag" }, d.branch ?? "git") : null))
+          : h("div", { class: "muted", style: "padding:12px" }, "没有子目录")));
+    pickBtn.disabled = opts.requireGit && !cur.git ? "" : null;
+    hint.textContent = opts.requireGit && !cur.git ? "当前目录不是 git 仓库" : cur.git ? `仓库当前在 ${cur.branch} 分支` : "";
+  };
+  const hint = h("span", { class: "muted", style: "font-size:12.5px" });
+  const pickBtn = h("button", { class: "primary", onclick: () => { if (!cur) return; closeModal(true); onPick(cur.path, cur); } }, "选择这个目录");
+  fill($("#modal"), h("div", { class: "modal", style: "width:min(640px,calc(100vw - 32px))", onclick: (e) => e.stopPropagation() },
+    h("div", { class: "dr-head" }, h("span", {}, opts.title ?? "选择服务器上的目录")),
+    body,
+    h("div", { class: "modal-foot" }, hint, h("span", { style: "margin-left:auto" }), h("button", { onclick: () => closeModal() }, "取消"), pickBtn)));
+  $("#modal").classList.add("open"); $("#modal").setAttribute("aria-hidden", "false");
+  go(start);
+}
+/**
+ * 流转规则：Hub 自己建的单推不推；Hub 开始做 / 做完可提测时，Linear 改成什么状态、指派给谁。
+ * 状态和成员都从 Linear 团队实时读，选「自动 / 不改」就保持原来的行为。
+ */
+const flowCache = { states: {}, loading: {} };
+function flowRules(p) {
+  const F = { agentPush: { linear: !!p.linear?.pushNew, github: false, ...(p.flow?.agentPush ?? {}) }, start: { stateId: null, assignee: null, ...(p.flow?.start ?? {}) }, deliver: { stateId: null, assignee: null, ...(p.flow?.deliver ?? {}) } };
+  const save = (patch) => issuesApi.saveProject({ name: p.name, key: p.key, flow: patch }, p.id).then(() => { renderProjectPage(); toast("流转规则已保存", "ok"); }).catch(fail);
+  if (!flowCache.states[p.id] && !flowCache.loading[p.id]) {
+    flowCache.loading[p.id] = true;
+    rpc("work.linearTeamStates", p.id).then((x) => { flowCache.states[p.id] = x ?? []; }).catch(() => { flowCache.states[p.id] = []; }).finally(() => { flowCache.loading[p.id] = false; renderProjectPage(); });
+  }
+  if (!lg.members[p.id] && !lg.loading[p.id]) {
+    lg.loading[p.id] = true;
+    issuesApi.linearMembers(p.id).then((m) => { lg.members[p.id] = m ?? []; }).catch(() => { lg.members[p.id] = []; }).finally(() => { lg.loading[p.id] = false; renderProjectPage(); });
+  }
+  const states = flowCache.states[p.id] ?? [];
+  const members = lg.members[p.id] ?? [];
+  const stateSel = (stage, auto) => select([["", `自动（${auto}）`], ...states.map((x) => [x.id, x.name])], F[stage].stateId ?? "",
+    (v) => save({ [stage]: { stateId: v || null } }), { style: "max-width:220px" });
+  const whoSel = (stage) => {
+    const cur = F[stage].assignee;
+    const opts = [["", "不改指派人"], ...members.map((m) => [m.id, m.name])];
+    if (cur && !members.some((m) => m.id === cur.id)) opts.push([cur.id, cur.name]);
+    return select(opts, cur?.id ?? "", (v) => save({ [stage]: { assignee: v ? (members.find((m) => m.id === v) ?? cur) : null } }), { style: "max-width:260px" });
+  };
+  return field("流转规则", h("div", { class: "fields", style: "gap:12px" },
+    h("div", { class: "checks" },
+      checkboxP(F.agentPush.linear, (on) => save({ agentPush: { linear: on } }), "智能体自己建的单推到 Linear", "比如拆出来的子单，会挂在父单下面、指派人跟父单一致"),
+      p.repo ? checkboxP(F.agentPush.github, (on) => save({ agentPush: { github: on } }), "智能体自己建的单也推到 GitHub issue") : null),
+    h("table", { class: "map-table" },
+      h("tr", {}, h("th", {}, "时机"), h("th", {}, "Linear 状态"), h("th", {}, "指派给")),
+      h("tr", {}, h("td", {}, "Hub 开始做"), h("td", {}, stateSel("start", "In Progress 类")), h("td", {}, whoSel("start"))),
+      h("tr", {}, h("td", {}, "Hub 做完，可以提测"), h("td", {}, stateSel("deliver", "名称含 Review 的状态")), h("td", {}, whoSel("deliver")))),
+    h("div", { class: "help" }, (p.delivery?.mode ?? "pr") === "local"
+      ? "「做完」= 已合并到本地开发分支且页面验收通过。指派给测试同学时，对方会在 Linear 收到通知。提测通过在 Linear 改 Done 即完成；打回请改回进行中并写评论，Hub 会带着评论退回给智能体。"
+      : "「做完」= 交付并通过审核。指派给测试同学时，对方会在 Linear 收到通知。"),
+    !states.length && !flowCache.loading[p.id] ? h("div", { class: "muted", style: "font-size:12.5px" }, "没有读到 Linear 团队的状态，先检查 Linear 连接") : null),
+    "同一阶段同一轮只改一次，不会反复改指派人。");
+}
+/** 「只导入指派给指定成员的」的成员勾选：成员列表来自 Linear 团队 */
+function importAssigneePicker(p, cfg, save) {
+  const list = lg.members[p.id];
+  if (!list && !lg.loading[p.id]) {
+    lg.loading[p.id] = true;
+    issuesApi.linearMembers(p.id).then((m) => { lg.members[p.id] = m ?? []; }).catch(() => { lg.members[p.id] = []; }).finally(() => { lg.loading[p.id] = false; renderProjectPage(); });
+  }
+  const cur = cfg.importAssignees ?? [];
+  const chosen = new Set(cur.map((x) => x.id));
+  const pool = [...cur, ...(list ?? []).filter((m) => !chosen.has(m.id))];
+  if (!pool.length) return h("div", { class: "muted", style: "font-size:12.5px" }, list ? "没有读到团队成员" : "正在读取团队成员…");
+  return h("div", { class: "checks" }, ...pool.map((m) => checkboxP(chosen.has(m.id),
+    (on) => save({ importAssignees: on ? [...cur.filter((x) => x.id !== m.id), m] : cur.filter((x) => x.id !== m.id) }), m.name)));
+}
+/** 已用时间：12 秒 / 3 分钟 / 1 小时 5 分 */
+function elapsed(iso) {
+  const sec = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
+  if (sec < 60) return `${sec} 秒`;
+  const m = Math.floor(sec / 60);
+  return m < 60 ? `${m} 分钟` : `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+}
+setInterval(() => document.querySelectorAll("[data-since]").forEach((el) => {
+  const t = elapsed(el.dataset.since);
+  el.textContent = el.classList.contains("el") ? t : ` · ${t}`;
+}), 1000);
+/** PR 的显示名：本地交付 / 只推分支时没有 PR 编号，显示分支 */
+const prName = (pr) => !pr ? "" : pr.local === "local" ? `本地分支 ${pr.branch}` : pr.local === "branch" ? `分支 ${pr.branch}` : `PR #${pr.number}`;
 const linearTag = (l) => l ? h("span", { class: "gh lin" + (l.state === "closed" ? " closed" : ""), title: `Linear ${l.identifier}` }, h("span", { class: "lin-mark", "aria-hidden": "true" }), l.identifier) : null;
 const linearPushable = (p) => !!p?.linear && ["two_way", "push"].includes(p.linear.mode);
 const pbadge = (p) => h("span", { class: "pbadge", style: `--hue:${hue(p?.key ?? "?")}` }, (p?.key ?? "?").slice(0, 3));
@@ -1888,18 +2170,49 @@ $("#settingsBtn").addEventListener("click", () => showView("settings"));
 function renderProjBar() {
   const p = curProject();
   if (!p) return fill($("#projBar"));
-  const syncBtn = h("button", { onclick: async (e) => {
-    e.target.disabled = true;
-    e.target.textContent = "同步中…";
-    try { toast(await issuesApi.sync(p.id), "ok"); } catch (err) { fail(err); }
-  } }, "立即同步");
-  fill($("#projBar"), p.repo
-    ? [h("span", { class: "gh" }, ghIcon(), p.repo.fullName), h("span", {}, "·"), h("span", {}, SYNC_MODES.find((m) => m[0] === p.sync.mode)?.[1]),
-       p.lastSyncAt ? h("span", {}, `· ${ago(p.lastSyncAt)}同步`) : null,
-       p.pendingRemote && p.sync.mode !== "push" && p.sync.mode !== "off" ? h("span", { class: "tag", title: "GitHub 上有尚未导入的 issue" }, `${p.pendingRemote} 个待导入`) : null,
-       p.linear ? h("span", { class: "gh lin", title: `Linear 团队 ${p.linear.teamName}` }, h("span", { class: "lin-mark", "aria-hidden": "true" }), p.linear.teamKey) : null,
-       p.sync.mode !== "off" ? syncBtn : null]
-    : [h("span", {}, "未绑定 GitHub 仓库"), h("a", { class: "link", onclick: () => showView("project") }, "去绑定 →")]);
+  // 工作项只有一个权威来源，所以同步按钮也只有一个：按来源喊对应的同步
+  const src = p.sync?.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
+  const ghOn = !!p.repo && p.sync.mode !== "off";
+  const lnOn = !!p.linear && p.linear.mode !== "off";
+  const jobs = [];
+  if (src === "linear" && lnOn) jobs.push(["Linear", () => issuesApi.syncLinear(p.id)]);
+  else if (src === "github" && ghOn) jobs.push(["GitHub", () => issuesApi.sync(p.id)]);
+  else if (src === "manual") {
+    // 手动来源没有可导入的，但绑定了系统且开了推送的话，可以把本地改动推出去
+    if (ghOn && ["two_way", "push"].includes(p.sync.mode)) jobs.push(["GitHub", () => issuesApi.sync(p.id)]);
+    if (lnOn && ["two_way", "push"].includes(p.linear.mode)) jobs.push(["Linear", () => issuesApi.syncLinear(p.id)]);
+  }
+  const syncBtn = jobs.length
+    ? h("button", { title: `从${jobs.map((j) => j[0]).join("、")}拉取最新变更并写回本地改动`, onclick: async (e) => {
+        const btn = e.currentTarget;
+        const label = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "同步中…";
+        const out = [];
+        try {
+          for (const [name, fn] of jobs) {
+            try { out.push(await fn()); } catch (err) { out.push(`${name}：${err.message}`); }
+          }
+          toast(out.join("；"), "ok");
+          await refreshState();
+          renderIssuesView();
+        } catch (err) { fail(err); }
+        finally { btn.disabled = false; btn.textContent = label; }
+      } }, `⟳ 同步 ${jobs.map((j) => j[0]).join(" / ")}`)
+    : null;
+  const lastSync = src === "linear" ? p.linear?.lastSyncAt : p.lastSyncAt;
+  const modeLabel = src === "linear"
+    ? LINEAR_MODES.find((m) => m[0] === p.linear?.mode)?.[1]
+    : SYNC_MODES.find((m) => m[0] === p.sync.mode)?.[1];
+  fill($("#projBar"),
+    h("span", { class: "gh" }, ghIcon(), p.repo ? p.repo.fullName : "未绑定仓库"),
+    h("span", {}, "·"),
+    h("span", {}, src === "linear" ? "issue 来自 Linear" : src === "github" ? "issue 来自 GitHub" : "仅手动创建"),
+    modeLabel && (src === "linear" ? lnOn : ghOn) ? h("span", {}, `· ${modeLabel}`) : null,
+    lastSync ? h("span", {}, `· ${ago(lastSync)}同步`) : null,
+    src === "github" && p.pendingRemote && p.sync.mode !== "push" && ghOn ? h("span", { class: "tag", title: "GitHub 上有尚未导入的 issue" }, `${p.pendingRemote} 个待导入`) : null,
+    p.linear ? h("span", { class: "gh lin", title: `Linear 团队 ${p.linear.teamName}` }, h("span", { class: "lin-mark", "aria-hidden": "true" }), p.linear.teamKey) : null,
+    syncBtn);
 }
 
 // ======================= 新建 GitHub 仓库（新建项目弹窗与项目设置页共用） =======================
@@ -2025,10 +2338,11 @@ function openNewProject() {
 // ======================= 项目设置页 =======================
 const pg = { draft: null, orig: null, pid: null, repoPick: "", newRepo: null };
 function renderProjectPage() {
+  if (holdWhileEditing("#projectPage", renderProjectPage)) return;
   const p = curProject();
   if (!p) return fill($("#projectPage"), h("div", { class: "empty" }, "还没有项目"), h("div", { style: "text-align:center" }, h("button", { class: "primary", onclick: openNewProject }, "新建项目")));
   if (pg.pid !== p.id) pg.newRepo = null;
-  if (pg.pid !== p.id || !pg.draft) { pg.pid = p.id; pg.draft = { name: p.name, key: p.key, description: p.description, sync: { ...p.sync } }; pg.orig = JSON.stringify(pg.draft); }
+  if (pg.pid !== p.id || !pg.draft) { pg.pid = p.id; pg.draft = { name: p.name, key: p.key, description: p.description, sync: { ...p.sync }, delivery: { baseBranch: "", mode: "pr", localPath: "", afterMerge: "", ...(p.delivery ?? {}) } }; pg.orig = JSON.stringify(pg.draft); }
   const d = pg.draft;
   const dirty = () => JSON.stringify(d) !== pg.orig;
   const bar = h("div", { class: "savebar" + (dirty() ? "" : " clean"), id: "pgSave" }, h("span", { class: "hint" }, "有未保存的修改"),
@@ -2104,34 +2418,62 @@ function renderProjectPage() {
       field("名称", inp(d, "name")),
       field("编号前缀", inp(d, "key", { upper: 1, style: "max-width:180px;text-transform:uppercase" }), "2–6 位大写字母或数字"),
       field("描述", inp(d, "description"))),
-    section("GitHub 仓库", "一个项目对应一个仓库（一个仓库也只能绑定一个项目）。工作项与 issue 同步，智能体在这个仓库里改代码、提 PR。", repoBlock),
-    section("工作项来源", "工作项从哪个系统导入。可以只接一个，也可以两边都接；不导入时也可以纯手动创建。", (() => {
-        const cur = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
+    section("GitHub 仓库", "一个项目对应一个仓库（一个仓库也只能绑定一个项目）。绑定是为了让智能体在这里改代码、推分支、提 PR；issue 是否从 GitHub 导入，由下面的「工作项来源」单独决定。", repoBlock),
+    section("交付策略", "智能体改完的代码合到哪、怎么合。不同项目流程不同：有的开 PR 进主干，有的只合本地开发分支、再由人提测。提测与发版始终由人完成，Hub 不会触发。", (() => {
+      const dv = d.delivery;
+      const base = dv.baseBranch || p.repo?.defaultBranch || "main";
+      const modes = [
+        ["local", "合并到本机仓库（不推远端）"],
+        ["pr", "推分支并开 PR"],
+        ["branch", "只推分支，不开 PR"],
+      ];
+      const mainWarn = dv.mode === "pr" && /^(main|master)$/.test(base)
+        ? h("div", { class: "callout warn", style: "margin-top:8px" }, h("div", {}, h("b", {}, `PR 会开向 ${base}。`),
+            h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "很多仓库合进主干就会触发发版流水线。如果你的流程是先进开发分支，把基线分支改成 dev。")))
+        : null;
+      return h("div", { class: "fields" },
+        field("基线分支", inp(dv, "baseBranch", { placeholder: p.repo?.defaultBranch || "main", style: "max-width:220px" }),
+          `智能体从这个分支拉代码，改完合回这个分支。留空用仓库默认分支（${p.repo?.defaultBranch || "main"}）`),
+        field("交付方式", select(modes, dv.mode, (v) => { dv.mode = v; touchP(); renderProjectPage(); }, { style: "max-width:320px" })),
+        dv.mode === "local" ? field("本机仓库目录", h("div", { class: "row", style: "gap:8px;flex-wrap:nowrap" },
+            inp(dv, "localPath", { placeholder: "点右边「选择…」浏览服务器目录，或直接粘贴路径" }),
+            h("button", { onclick: () => openDirPicker(dv.localPath, (path, info) => {
+              dv.localPath = path; touchP(); renderProjectPage();
+              if (info.branch && info.branch !== base) toast(`这个仓库当前在 ${info.branch} 分支，合并时要求停在 ${base} 上`, "err");
+              else toast(`已选择 ${path}（${info.branch} 分支）`, "ok");
+            }, { requireGit: true, title: "选择本机仓库目录" }) }, "选择…")),
+          `合并进这个目录当前检出的 ${base} 分支；目录必须正停在 ${base} 上，否则拒绝合并。有冲突会自动撤销，不留半合并状态`) : null,
+        dv.mode === "local" ? field("合并后执行", inp(dv, "afterMerge", { placeholder: "可选，如 pm2 restart opscenter；dev 服务热加载可留空" }), "在本机仓库目录里执行") : null,
+        field("合并方式", select([["manual", "手动：验收通过后由我确认合并"], ["auto", "自动：测试与评审通过后直接合并"]], p.lead?.mergePolicy ?? "auto",
+          (v) => issuesApi.setLead(p.id, { mergePolicy: v }).then(() => toast(v === "manual" ? "改为手动合并" : "改为自动合并", "ok")).catch(fail), { style: "max-width:360px" }),
+          "立即生效，不需要点保存"),
+        mainWarn);
+    })()),
+    section("工作项来源", "工作项只能有一个权威来源，二选一：从 Linear 导入，或从 GitHub 的 issue 导入。两者互斥——同一件活在两边各有一份，改哪边算数就说不清了。绑定 GitHub 仓库只影响代码与 PR，不改变这里的选择。", (() => {
+        const cur = d.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
         const opts = [
-          ["github", p.repo ? `GitHub 仓库 · ${p.repo.fullName} 的所有 issue` : "GitHub 仓库（还没绑定）"],
           ["linear", p.linear ? `Linear 团队 · ${p.linear.teamName}` : "Linear 团队（还没绑定）"],
-          ["both", "两边都导入"],
+          ["github", p.repo ? `GitHub 仓库 · ${p.repo.fullName} 的 issue` : "GitHub 仓库（还没绑定）"],
           ["manual", "只手动创建，不导入"],
         ];
         const el = select(opts, cur, (v) => {
-          if (v === "github" && !p.repo) return toast("先在下面绑定 GitHub 仓库", "err");
-          if (v === "linear" && !p.linear) return toast("先在下面绑定 Linear 团队", "err");
-          if (v === "both" && (!p.repo || !p.linear)) return toast("两边都导入需要同时绑定仓库和团队", "err");
+          if (v === "github" && !p.repo) return toast("先绑定 GitHub 仓库", "err");
+          if (v === "linear" && !p.linear) return toast("先绑定 Linear 团队", "err");
+          // 换来源只影响往后的导入；已经导入的工作项不会自动删，提示一下免得以为是 bug
+          const imported = issuesApi.projects().find((x) => x.id === p.id)?.counts?.total ?? 0;
           d.sync.source = v;
-          if (v === "github" || v === "both") d.sync.mode = d.sync.mode === "off" ? "two_way" : d.sync.mode;
-          if (v === "linear" || v === "both") { if (d.linear) d.linear.mode = d.linear.mode === "off" ? "two_way" : d.linear.mode; }
+          if (v === "github") d.sync.mode = d.sync.mode === "off" ? "two_way" : d.sync.mode;
+          if (v === "linear" && d.linear) d.linear.mode = d.linear.mode === "off" ? "two_way" : d.linear.mode;
           touchP(); renderProjectPage();
-        }, { style: "max-width:380px" });
+          if (imported) toast(`来源已切换。已导入的 ${imported} 个工作项不受影响，需要清理请在工作项页批量删除`, "ok");
+        }, { style: "max-width:420px" });
         return h("div", { class: "row" }, el, h("button", {
           onclick: async (e) => {
-            const src = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
+            const src = d.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
             if (src === "manual") return toast("当前来源是「仅手动创建」，没有可导入的", "err");
             e.target.disabled = true; e.target.textContent = "导入中…";
             try {
-              const out = [];
-              if (src === "github" || src === "both") out.push(await issuesApi.sync(p.id));
-              if (src === "linear" || src === "both") out.push(await issuesApi.syncLinear(p.id));
-              toast(out.join("；"), "ok");
+              toast(await (src === "github" ? issuesApi.sync(p.id) : issuesApi.syncLinear(p.id)), "ok");
               renderProjectPage(); renderBoard();
             } catch (err) { fail(err); }
             finally { e.target.disabled = false; e.target.textContent = "立即导入"; }
@@ -2140,17 +2482,19 @@ function renderProjectPage() {
       })()),
     section("GitHub 同步", p.repo ? `工作项与 ${p.repo.fullName} 的 issue 如何互相同步。` : "绑定仓库后才能开启同步。下面的设置只影响 GitHub，Linear 有自己的一组。",
       (() => {
-        const src = d.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
-        if (src === "github" || src === "both") return null;
-        return h("div", { class: "callout warn" },
-          h("div", {}, h("b", {}, "当前工作项来源不含 GitHub，下面这些设置不会执行。"),
-            h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "要启用，把上面的「工作项来源」改成 GitHub 仓库或两边都导入。")));
+        const src = d.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
+        if (src === "github") return null;
+        return h("div", { class: "callout" },
+          h("div", {}, h("b", {}, "当前来源是「" + (src === "linear" ? "Linear 团队" : "仅手动创建") + "」，不会从 GitHub 导入 issue。"),
+            h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "但下面的推送设置仍然有效：本地新建或改动的、已关联 GitHub 的工作项，照样会把状态写回 GitHub；智能体也在这里改代码、提 PR。要让 issue 也来自 GitHub，把上面的来源改过来（Linear 那边会停止导入）。")));
       })(),
       field("同步方向", select(SYNC_MODES, d.sync.mode, (v) => { d.sync.mode = v; touchP(); renderProjectPage(); }, { style: "max-width:320px", disabled: p.repo ? null : "" }),
         p.repo ? "" : "绑定仓库后可开启"),
-      ["two_way", "import"].includes(d.sync.mode) ? field("导入范围", h("div", { class: "row" },
-        select([["all", "所有 open 的 issue"], ["label", "只导入带指定标签的 issue"]], d.sync.importScope, (v) => { d.sync.importScope = v; touchP(); renderProjectPage(); }, { style: "max-width:260px" }),
-        d.sync.importScope === "label" ? inp(d.sync, "importLabel", { placeholder: "标签，如 agent", style: "max-width:160px" }) : null), "导入后进入「待规划」，指派智能体后才会执行") : null,
+      (d.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual")) === "github" && ["two_way", "import"].includes(d.sync.mode)
+        ? field("导入范围", h("div", { class: "row" },
+            select([["all", "所有 open 的 issue"], ["label", "只导入带指定标签的 issue"]], d.sync.importScope, (v) => { d.sync.importScope = v; touchP(); renderProjectPage(); }, { style: "max-width:260px" }),
+            d.sync.importScope === "label" ? inp(d.sync, "importLabel", { placeholder: "标签，如 agent", style: "max-width:160px" }) : null), "导入后进入「待规划」，指派智能体后才会执行")
+        : null,
       ["two_way", "push"].includes(d.sync.mode) ? h("div", { class: "checks" },
         checkboxP(d.sync.pushNew, (on) => { d.sync.pushNew = on; touchP(); }, "新建工作项时默认同时创建 GitHub issue", "新建时可单独取消勾选"),
         checkboxP(d.sync.postDeliverable, (on) => { d.sync.postDeliverable = on; touchP(); }, "智能体的交付结果回写为 GitHub 评论")) : null,
@@ -2238,20 +2582,33 @@ function linearSection(p) {
       } }, "同步 Linear"),
       h("button", { class: "danger", onclick: async () => { if (confirm(`解绑 Linear 团队 ${cfg.teamName}？已关联的工作项会保留 Linear 编号，但不再同步。`)) { await issuesApi.disconnectLinear(p.id); renderProjectPage(); } } }, "解绑")),
     (() => {
-      const src = p.sync.source ?? (p.repo && p.linear ? "both" : p.repo ? "github" : p.linear ? "linear" : "manual");
-      if (src === "linear" || src === "both") return null;
-      return h("div", { class: "callout warn" },
-        h("div", {}, h("b", {}, "当前工作项来源不含 Linear，下面这些设置不会执行。"),
-          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "要启用，把上面的「工作项来源」改成 Linear 团队或两边都导入。")));
+      const src = p.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual");
+      if (src === "linear") return null;
+      return h("div", { class: "callout" },
+        h("div", {}, h("b", {}, "当前来源是「" + (src === "github" ? "GitHub 仓库" : "仅手动创建") + "」，不会从 Linear 导入 issue。"),
+          h("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" }, "但下面的推送设置仍然有效：本地新建或改动的、已关联 Linear 的工作项，会把状态写回 Linear。要让 issue 来自 Linear，把上面的来源改过来。")));
     })(),
     field("同步方向", select(LINEAR_MODES, cfg.mode, (v) => save({ mode: v }), { style: "max-width:320px" })),
-    ["two_way", "import"].includes(cfg.mode) ? field("导入范围", h("div", { class: "row" },
-      select([["all", "所有未完成的 issue"], ["label", "只导入带指定标签的 issue"]], cfg.importScope, (v) => save({ importScope: v }), { style: "max-width:260px" }),
-      cfg.importScope === "label" ? label : null), "导入后进入「待规划」，保留 Linear 优先级") : null,
+    (p.sync.source ?? (p.linear ? "linear" : p.repo ? "github" : "manual")) === "linear" && ["two_way", "import"].includes(cfg.mode)
+      ? field("导入范围", h("div", { class: "fields", style: "gap:8px" },
+          h("div", { class: "row" },
+            select([["all", "所有未完成的 issue"], ["label", "只导入带指定标签的 issue"], ["assignee", "只导入指派给指定成员的 issue"]], cfg.importScope, async (v) => {
+              // 切到「按指派人」且还没选人时，默认选当前连接 Linear 的账号（也就是「我」）
+              if (v === "assignee" && !(cfg.importAssignees ?? []).length) {
+                const me = await issuesApi.linearMe().catch(() => null);
+                return save({ importScope: v, importAssignees: me ? [{ id: me.id, name: me.name }] : [] });
+              }
+              save({ importScope: v });
+            }, { style: "max-width:280px" }),
+            cfg.importScope === "label" ? label : null),
+          cfg.importScope === "assignee" ? importAssigneePicker(p, cfg, save) : null),
+          cfg.importScope === "assignee" ? "按 Linear 上的指派人筛选；只影响以后的新导入，已经导入的工作项不会删除" : "导入后进入「待规划」，保留 Linear 优先级")
+      : null,
     ["two_way", "import"].includes(cfg.mode) ? linearAutoField(p, cfg, save) : null,
     ["two_way", "push"].includes(cfg.mode) ? h("div", { class: "checks" },
       checkboxP(cfg.pushNew, (on) => save({ pushNew: on }), "新建工作项时默认同时创建 Linear issue", "新建时可单独取消勾选"),
       checkboxP(cfg.postDeliverable, (on) => save({ postDeliverable: on }), "智能体的交付结果回写为 Linear 评论")) : null,
+    ["two_way", "push"].includes(cfg.mode) ? flowRules(p) : null,
     field("状态映射", h("table", { class: "map-table" },
       h("tr", {}, h("th", {}, "工作项状态"), h("th", {}, "Linear 状态类型")),
       h("tr", {}, h("td", {}, "待规划"), h("td", {}, "Backlog")),
@@ -2270,6 +2627,7 @@ function checkboxP(checked, onchange, label, small) {
 // ======================= 设置页：模型服务 / 模型 / GitHub =======================
 const sg = { editing: null, modelForm: null, toolForm: null, mcpForm: null };
 function renderSettings() {
+  if (holdWhileEditing("#settingsPage", renderSettings)) return;
   const S = settings.get();
   const usage = (mid) => studio.agents().filter((a) => a.model === mid).map((a) => a.name);
   const provStatus = (p) => simulateMode()
@@ -2706,7 +3064,7 @@ async function uploadFiles(files) {
   if (!list.length) return;
   const fd = new FormData();
   for (const f of list.slice(0, 10)) fd.append("file", f, f.name || "截图.png");
-  const res = await fetch("/api/upload", { method: "POST", headers: token ? { authorization: `Bearer ${token}` } : {}, body: fd });
+  const res = await fetch("/api/upload", { method: "POST", body: fd });
   let data = null;
   try { data = await res.json(); } catch { /* 非 JSON */ }
   if (!res.ok) throw new Error(data?.error || `上传失败（HTTP ${res.status}）`);
@@ -2714,7 +3072,8 @@ async function uploadFiles(files) {
   renderHome();
 }
 /** 待发送的附件：图片显示缩略图，文件显示名称 */
-const attUrl = (u) => (token && u?.startsWith("/uploads/") ? u + (u.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : u);
+// 登录改成了会话 Cookie：同源的图片请求会自动带上，不需要再拼令牌（旧的全局 token 已不存在，引用它会直接报错）
+const attUrl = (u) => u;
 function attachChips(list, onRemove) {
   if (!list?.length) return null;
   return h("div", { class: "att-chips" }, list.map((a, n) => h("span", { class: "att-chip", title: `${a.name} · ${Math.max(1, Math.round((a.size ?? 0) / 1024))} KB` },
@@ -2723,6 +3082,39 @@ function attachChips(list, onRemove) {
 }
 
 let butlerDraft = "";
+/**
+ * 管家输入框只创建一次、每次重绘复用同一个节点：首页会随运行进度频繁重绘，
+ * 每次新建输入框会清掉正在打的字、打断中文输入法组字、丢掉光标。
+ */
+let homeInputNode = null;
+let homeInputWrap = null, homeAttachBtn = null, homeSendBtn = null;
+/**
+ * 按顺序更新子节点，但已经在位的常驻节点原地不动：只删除不再需要的、在常驻节点前后插入新的。
+ * 与 fill 不同，它不会把常驻节点摘下再放回（摘下会失去焦点、打断输入法）。
+ */
+function patchChildren(parent, ...nodes) {
+  const list = nodes.flat(Infinity).filter((c) => c != null && c !== false).map((c) => (c instanceof Node ? c : document.createTextNode(String(c))));
+  const keep = new Set(list);
+  for (const c of [...parent.childNodes]) if (!keep.has(c)) c.remove();
+  let ref = parent.firstChild;
+  for (const n of list) {
+    if (n === ref) { ref = ref.nextSibling; continue; }
+    parent.insertBefore(n, ref);
+  }
+  return parent;
+}
+function homeInputEl() {
+  if (homeInputNode) return homeInputNode;
+  homeInputNode = h("textarea", { id: "homeInput", placeholder: "和管家说说你的想法…（Enter 发送，Shift+Enter 换行；可以直接粘贴截图或文件）",
+    oninput: (e) => (butlerDraft = e.target.value),
+    onpaste: (e) => { const fs = [...(e.clipboardData?.files ?? [])]; if (fs.length) { e.preventDefault(); uploadFiles(fs).catch(fail); } },
+    ondragover: (e) => { e.preventDefault(); e.currentTarget.classList.add("drop"); },
+    ondragleave: (e) => e.currentTarget.classList.remove("drop"),
+    ondrop: (e) => { e.preventDefault(); e.currentTarget.classList.remove("drop"); const fs = [...(e.dataTransfer?.files ?? [])]; if (fs.length) uploadFiles(fs).catch(fail); },
+    onkeydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendButler(e.target.value); } } });
+  homeInputNode.value = butlerDraft;
+  return homeInputNode;
+}
 /** 管家对话默认只渲染最近 20 条，更早的折叠在顶部，滚到顶或点按钮再往前加载 */
 let butlerShown = 20;
 /** 上次渲染时的消息总数：用来判断「有没有新消息」和「对话是否被清空」 */
@@ -2767,6 +3159,7 @@ function warmButler() {
 
 async function renderHome() {
   if (!viewActive("home")) return;
+  if (document.activeElement === openSelect && holdWhileEditing("#homeChat", renderHome)) return;
   warmButler();
   // 注意：这里拿到的还是上一轮的节点。fill 之后会换成新节点，
   // 所以「是否贴底」必须现在算，不能等替换完成后再读新节点的 scrollTop（永远是 0）
@@ -2793,7 +3186,7 @@ async function renderHome() {
       ? `我是管家，能看到全部 ${projects.length} 个项目的工作项和执行情况。和我说说需求，我来拆成工作项放进对应项目；也可以让我调整任务、汇总进展，或开关项目负责人的持续迭代。`
       : "我是管家。现在还没有项目——先创建一个项目（工作项、看板和仓库绑定都在项目下面），然后把想法告诉我，我来拆成工作项。",
       projects.length ? null : h("div", { style: "margin-top:12px" }, h("button", { class: "primary", onclick: () => openNewProject() }, "创建第一个项目"))));
-  const fileInput = h("input", { type: "file", multiple: "true", style: "display:none", onchange: (e) => { uploadFiles(e.target.files).catch(fail); e.target.value = ""; } });
+  const fileInput = h("input", { id: "homeFile", type: "file", multiple: "true", style: "display:none", onchange: (e) => { uploadFiles(e.target.files).catch(fail); e.target.value = ""; } });
   const msgs = visible.map((m) => m.role === "me"
     ? h("div", { class: "bubble me" }, m.text, attachChips(m.attachments))
     : h("div", { class: "ai-row" }, h("span", { class: "ai-mark" }, "✦"), h("div", { class: "ai-col" },
@@ -2805,7 +3198,7 @@ async function renderHome() {
         // 标注回复来自哪个通道：规则回复不能让人误以为是 AI
         m.via ? h("div", { class: "muted", style: "font-size:11.5px;margin-top:4px" }, { api: "模型 API", "claude-code": "本机 Claude Code", rules: "规则回复（未连接模型）" }[m.via] ?? "") : null)));
 
-  fill($("#homeChat"),
+  patchChildren($("#homeChat"),
     h("div", { class: "home-chat-head" }, h("span", { class: "ai-mark" }, "✦"), h("b", {}, "管家"), h("span", { class: "muted" }, "讨论需求 · 拆分任务 · 调整计划"),
       h("span", { style: "margin-left:auto" }),
       (() => {
@@ -2836,18 +3229,18 @@ async function renderHome() {
         h("button", { onclick: () => { pend.forEach((c) => (c.dismissed = true)); saveButler(); renderHome(); } }, "全部取消"),
         h("button", { class: "primary", onclick: runAllActions }, `全部执行（${pend.length}）`));
     })(),
-    h("div", { class: "b-input" },
-      fileInput,
-      attachChips(homeAtt.pending, (n) => { homeAtt.pending.splice(n, 1); renderHome(); }),
-      h("textarea", { id: "homeInput", placeholder: "和管家说说你的想法…（Enter 发送，Shift+Enter 换行；可以直接粘贴截图或文件）",
-        oninput: (e) => (butlerDraft = e.target.value),
-        onpaste: (e) => { const fs = [...(e.clipboardData?.files ?? [])]; if (fs.length) { e.preventDefault(); uploadFiles(fs).catch(fail); } },
-        ondragover: (e) => { e.preventDefault(); e.currentTarget.classList.add("drop"); },
-        ondragleave: (e) => e.currentTarget.classList.remove("drop"),
-        ondrop: (e) => { e.preventDefault(); e.currentTarget.classList.remove("drop"); const fs = [...(e.dataTransfer?.files ?? [])]; if (fs.length) uploadFiles(fs).catch(fail); },
-        onkeydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendButler(e.target.value); } } }),
-      h("button", { title: "添加图片或文件（也可以直接粘贴、拖进来）", onclick: () => fileInput.click(), style: "padding:0 12px" }, "📎"),
-      h("button", { class: "primary", onclick: () => sendButler($("#homeInput").value) }, "发送")));
+    (() => {
+      // 输入区是常驻节点：只替换附件条，输入框与按钮原地不动（不会丢焦点、不会打断输入法）
+      homeInputWrap ??= h("div", { class: "b-input" });
+      patchChildren(homeInputWrap, [
+        fileInput,
+        attachChips(homeAtt.pending, (n) => { homeAtt.pending.splice(n, 1); renderHome(); }),
+        homeInputEl(),
+        homeAttachBtn ??= h("button", { title: "添加图片或文件（也可以直接粘贴、拖进来）", onclick: () => $("#homeFile")?.click(), style: "padding:0 12px" }, "📎"),
+        homeSendBtn ??= h("button", { class: "primary", onclick: () => sendButler($("#homeInput").value) }, "发送"),
+      ]);
+      return homeInputWrap;
+    })());
 
   const box = $("#homeMsgs");
   if (butlerRestore) {
@@ -2909,7 +3302,7 @@ function leadSection(p) {
         checkboxP(L.duties.review, (on) => set({ duties: { review: on } }), "审核交付", "智能体交付后先由负责人审核，再交给你验收"),
         checkboxP(L.duties.bugs, (on) => set({ duties: { bugs: on } }), "bug 修复", "带 bug 标签且未指派的工作项，自动指派给 developer 修复"),
         checkboxP(L.duties.testing, (on) => set({ duties: { testing: on } }), "测试分发", "有代码改动时分发给 tester 验证，结果写到 PR 上"))),
-      field("PR 合并", select([["auto", "测试与 AI 审核通过后自动合并（推荐）"], ["manual", "等我验收后再合并"]], L.mergePolicy, (v) => set({ mergePolicy: v }), { style: "max-width:360px" }), "默认全流程由 AI 驱动，你只做最终验收；Hotfix 始终由 AI 验收后直接合并上线"),
+      field("合并方式", h("span", { class: "muted", style: "font-size:13px" }, `${L.mergePolicy === "manual" ? "手动：验收通过后由你确认合并" : "自动：测试与评审通过后直接合并"}（在上面「交付策略」里修改）`)),
       field("每日运行上限", h("div", { class: "row" }, lim, h("span", { class: "muted", style: "font-size:12.5px" }, `今天已用 ${L.runsToday} 次`)), "负责人发起的运行（修 bug、改进项）超过上限后暂停，次日恢复"),
     ] : null,
     field("最近动作", log.length ? h("div", {}, log.slice(0, 8).map((l) => h("div", { class: "log-row" }, h("span", { class: "time", style: "margin-left:0;min-width:80px" }, ago(l.at)), h("span", {}, l.text))))
@@ -2929,7 +3322,7 @@ function prSection(d) {
     : pr.ci.state === "unknown" ? h("span", { class: "warn", style: "font-size:12.5px", title: pr.ci.error }, "⚠ 无法读取 CI")
     : h("span", { class: "muted", style: "font-size:12.5px" }, `CI 进行中：${pr.ci.pending.join("、")}`);
   return [h("div", { class: "section-title" }, "代码变更"),
-    h("div", { class: "callout" }, ghIcon(), h("b", {}, `PR #${pr.number}`), state, h("code", { class: "muted" }, pr.branch),
+    h("div", { class: "callout" }, ghIcon(), h("b", {}, prName(pr)), state, h("code", { class: "muted" }, pr.branch),
       h("span", { class: "muted", style: "font-size:12.5px" }, h("span", { class: "ok-text" }, `+${pr.additions}`), " ", h("span", { class: "err-text" }, `−${pr.deletions}`), ` · ${pr.files} 个文件`),
       checks, ci, h("span", { style: "margin-left:auto" }),
       pr.url ? h("a", { class: "link", style: "font-size:12.5px", href: pr.url, target: "_blank", rel: "noopener" }, "在 GitHub 查看") : null,
@@ -2995,6 +3388,7 @@ const runDur = (a, b) => { if (!a) return "—"; const s = Math.round(((b ? new 
 
 async function renderTesting() {
   if (!viewActive("testing")) return;
+  if (holdWhileEditing("#testingPage", renderTesting)) return;
   const S = qa.settings();
   const runs = qa.runs(tq.project || undefined);
   const queued = runs.filter((r) => r.status === "queued").sort((a, b) => prioOrder(a.priority) - prioOrder(b.priority) || Number(b.hotfix) - Number(a.hotfix) || a.queuedAt.localeCompare(b.queuedAt));
@@ -3155,6 +3549,7 @@ function envView(S) {
 let qaOpen = null;
 function openRun(id) {
   qaOpen = id;
+  runSig = "";
   ui.focusReturn = document.activeElement;
   $("#qaDrawer").classList.add("open");
   $("#qaDrawer").setAttribute("aria-hidden", "false");
@@ -3163,9 +3558,17 @@ function openRun(id) {
   $("#qaDrawer").focus({ preventScroll: true });
 }
 function closeRun() { qaOpen = null; $("#qaDrawer").classList.remove("open"); $("#qaDrawer").setAttribute("aria-hidden", "true"); if (!ui.openKey) $("#scrim").classList.remove("open"); restoreFocus(); }
+/** 验收详情里人手动展开 / 收起的用例（按验收 id + 用例 id 记），重绘后保持 */
+const runOpen = new Map();
+let runSig = "";
 function renderRun() {
   const r = qaOpen && qa.run(qaOpen);
   if (!r) return;
+  // 内容没变就不重绘：结束的验收不会再变；进行中的只在步骤推进时重绘
+  const sig = JSON.stringify([r.id, r.status, r.wait, r.cursor, r.cases.map((c) => [c.status, c.steps.length, c.steps.filter((x) => x.status).length])]);
+  if (sig === runSig && $("#qaDrawer").children.length) return;
+  runSig = sig;
+  const keepScroll = $("#qaDrawer").scrollTop;
   const bad = r.cases.filter((c) => c.status === "failed").length;
   fill($("#qaDrawer"),
     h("div", { class: "dr-head" }, h("a", { onclick: () => { closeRun(); location.hash = "#issue=" + r.issueKey; } }, r.issueKey), h("span", {}, "/ 验收"), runBadge2(r.status),
@@ -3173,14 +3576,16 @@ function renderRun() {
       ["queued", "running"].includes(r.status) ? h("button", { class: "danger", onclick: () => { qa.cancel(r.id); } }, "取消") : h("button", { onclick: () => qa.rerun(r.id).then((nid) => { openRun(nid); toast("已重新加入验收队列"); }).catch(fail) }, "重新运行"),
       h("button", { onclick: closeRun }, "✕")),
     h("h2", { style: "margin:10px 0 6px;font-size:19px" }, r.title),
-    kv(["触发", { lifecycle: "生命周期「测试」阶段", manual: "手动重跑", hotfix: "Hotfix" }[r.trigger] ?? r.trigger,
+    kv(["触发", { lifecycle: "生命周期「测试」阶段", manual: "手动重跑", hotfix: "Hotfix", "post-merge": "合并到本地后的页面验收" }[r.trigger] ?? r.trigger,
       "浏览器", r.browser === "local" ? "远程 Chrome（你的浏览器经 DevEye 扩展连接）" : r.browser ? `内置浏览器 ${r.browser}` : r.env === "CI" ? "CI（不占浏览器）" : "待分配",
       "环境", h("code", {}, r.env ?? "—"), "测试账号", r.account ?? "—", "会修改", r.mutates.join("、") || "无",
       "用时", `${runDur(r.startedAt, r.endedAt)}${r.queuedAt && r.startedAt ? `（排队 ${runDur(r.queuedAt, r.startedAt)}）` : ""}`,
       "结果", ["passed", "failed"].includes(r.status) ? `用例 ${caseCount(r)} 通过${bad ? `，${bad} 个未通过` : ""}` : r.wait ?? "执行中…"]),
     r.status === "failed" ? h("div", { class: "callout warn", style: "margin-top:12px" }, "未通过的用例和复现步骤已写回工作项，智能体会回到「执行」阶段修复后重新验收。") : null,
     h("div", { class: "section-title" }, "用例"),
-    r.cases.map((c, n) => h("details", { class: "case " + (c.status ?? "pending"), open: c.status === "failed" || (r.cursor && r.cursor.c === n) || null },
+    r.cases.map((c, n) => h("details", { class: "case " + (c.status ?? "pending"),
+      open: (runOpen.has(`${r.id}/${c.id}`) ? runOpen.get(`${r.id}/${c.id}`) : c.status === "failed" || (r.cursor && r.cursor.c === n)) || null,
+      ontoggle: (e) => runOpen.set(`${r.id}/${c.id}`, e.currentTarget.open) },
       h("summary", {}, h("span", { class: "cst" }, { passed: "✓", failed: "✕", running: "●", skipped: "–" }[c.status] ?? "○"),
         h("span", { class: "ctitle" }, c.title), h("span", { class: "tag" }, { browser: "浏览器验收", unit: "自动化测试", check: "检查清单", health: "健康检查" }[c.kind]),
         c.criterion != null ? h("span", { class: "muted", style: "font-size:11.5px" }, `标准 ${c.criterion + 1}`) : null),
@@ -3190,7 +3595,9 @@ function renderRun() {
             h("code", { class: "scmd" }, "$ ", s.cmd.replace("{url}", r.env ?? "").replace("{uid}", 12 + n * 3).replace("{run}", r.id).replace("{case}", c.id)),
             s.found ? h("div", { class: "muted", style: "font-size:12px" }, `定位到：${s.found}`) : null,
             s.error ? h("div", { class: "err-text", style: "font-size:12.5px;margin-top:2px" }, s.error) : null),
-          r.simulated && c.kind === "browser" && s.status && s.status !== "skipped" && (s.assert || s.locate) ? h("img", { class: "sshot", src: shotSvg(r, c, s, n), alt: "截图", onclick: (e) => zoomShot(e.target.src) }) : null)))))));
+          s.shot ? h("img", { class: "sshot", src: `/qa-shots/${s.shot}`, alt: "验收截图", loading: "lazy", onclick: (e) => zoomShot(e.target.src) })
+            : r.simulated && c.kind === "browser" && s.status && s.status !== "skipped" && (s.assert || s.locate) ? h("img", { class: "sshot", src: shotSvg(r, c, s, n), alt: "截图", onclick: (e) => zoomShot(e.target.src) }) : null)))))));
+  if (keepScroll) $("#qaDrawer").scrollTop = keepScroll;
 }
 function zoomShot(src) {
   fill($("#modal"), h("div", { class: "modal", style: "width:min(900px,calc(100vw - 32px))", onclick: (e) => e.stopPropagation() },
@@ -3208,7 +3615,7 @@ qa.onChange(() => {
 const RUNTIME_DEFS = [
   { id: "builtin", name: "内置（Claude API）", short: "内置", desc: "Hub 自己的执行循环，工具由 Hub 提供，适合调研、写作、调度类任务", auth: "使用「模型服务」里的连接", verified: true },
   { id: "claude-code", name: "Claude Code", short: "Claude Code", desc: "成熟的编码智能体，读写代码、运行命令、提交 PR", auth: "使用服务器上 claude 的登录状态，或设置 ANTHROPIC_API_KEY", verified: true,
-    template: 'claude -p "{prompt}" --output-format stream-json --verbose --model {model} --append-system-prompt "{system}" --mcp-config {mcp_config} --permission-mode bypassPermissions',
+    template: 'claude -p "{prompt}" --output-format stream-json --verbose --model {model} --append-system-prompt "{system}" --mcp-config {mcp_config} --strict-mcp-config --permission-mode bypassPermissions',
     modelHint: "opus / sonnet / haiku，或完整模型 ID，如 claude-opus-5-5" },
   { id: "codex", name: "Codex CLI", short: "Codex", desc: "OpenAI 的编码智能体", auth: "使用服务器上 codex 的登录状态，或设置 OPENAI_API_KEY", verified: false,
     template: 'codex exec --json -m {model} "{prompt}"', modelHint: "填写 Codex 支持的模型名，留空用默认" },
@@ -3231,6 +3638,8 @@ async function loadRuntimeModels(id, force = false) {
   return rtModels.cache[id];
 }
 /** 模型芯片：点一下就把该模型设为这个智能体使用的模型 */
+/** 每个底座记住「展开更多」的状态：模型可能几十个，默认只铺一行，其余按需展开 */
+const modelChipsOpen = {};
 function modelChips(d, id, onPick) {
   const data = rtModels.cache[id];
   if (!data) {
@@ -3238,13 +3647,24 @@ function modelChips(d, id, onPick) {
     return h("div", { class: "muted", style: "font-size:12px;margin-top:6px" }, "正在检测该底座可用的模型…");
   }
   const list = data.models ?? [];
+  const verify = data.verify ?? {};
+  // 验证失败的排在后面并标红：它们能列出来但实际调不通，混在一起会让人误选
+  const bad = (m) => verify[m.id]?.ok === false;
+  const sorted = [...list].sort((a, b) => Number(bad(a)) - Number(bad(b)));
+  const open = !!modelChipsOpen[id];
+  const shown = open ? sorted : sorted.slice(0, 14);
+  const rest = sorted.length - shown.length;
+  const chip = (m) => h("button", {
+    class: "chip" + ((d.cliModel ?? "") === m.id ? " on" : "") + (bad(m) ? " bad" : ""),
+    style: "padding:0 8px",
+    title: [m.name, m.note, bad(m) ? `不可用：${verify[m.id].note}` : ""].filter(Boolean).join(" · "),
+    onclick: () => { d.cliModel = m.id; onPick?.(m.id); touch(); renderStudio(); },
+  }, m.name && m.name !== m.id ? m.name : m.id);
   return h("div", {},
-    h("div", { class: "row", style: "gap:6px;margin-top:6px" },
-      h("span", { class: "muted", style: "font-size:12px" }, list.length ? `检测到 ${list.length} 个模型：` : "没有检测到模型"),
-      ...list.slice(0, 14).map((m) => h("button", {
-        class: "chip" + ((d.cliModel ?? "") === m.id ? " on" : ""), style: "padding:0 8px", title: [m.name, m.note].filter(Boolean).join(" · "),
-        onclick: () => { d.cliModel = m.id; onPick?.(m.id); touch(); renderStudio(); },
-      }, m.name && m.name !== m.id ? m.name : m.id)),
+    h("div", { class: "row", style: "gap:6px;margin-top:6px;flex-wrap:wrap" },
+      h("span", { class: "muted", style: "font-size:12px" }, list.length ? `检测到 ${list.length} 个模型${list.filter(bad).length ? `（${list.filter(bad).length} 个不可用）` : ""}：` : "没有检测到模型"),
+      ...shown.map(chip),
+      rest > 0 ? h("a", { class: "link", style: "font-size:12px", onclick: () => { modelChipsOpen[id] = true; renderStudio(); } }, `展开其余 ${rest} 个`) : (open && sorted.length > 14 ? h("a", { class: "link", style: "font-size:12px", onclick: () => { modelChipsOpen[id] = false; renderStudio(); } }, "收起") : null),
       h("a", { class: "link", style: "font-size:12px;margin-left:4px", onclick: async (e) => { e.target.textContent = "检测中…"; await loadRuntimeModels(id, true); renderStudio(); } }, "重新检测")),
     h("div", { class: "help", style: "margin-top:4px" }, data.source ?? ""));
 }
@@ -3471,6 +3891,7 @@ const au = { tab: "sentinel", edit: null };
 const ACTIONS = [["create", "创建工作项"], ["regression", "回归测试（测试板块）"], ["sync", "同步 GitHub / Linear"], ["report", "管家汇总进展"], ["sentinel", "哨兵巡检"], ["lead", "项目负责人巡检"]];
 const CRON_PRESETS = [["*/5 * * * *", "每 5 分钟"], ["0 * * * *", "每小时"], ["0 9 * * *", "每天 09:00"], ["0 18 * * 1-5".replace("1-5", "1,2,3,4,5"), "工作日 18:00"], ["0 10 * * 1", "每周一 10:00"]];
 function renderAutomation() {
+  if (holdWhileEditing("#automationPage", renderAutomation)) return;
   if (!viewActive("automation")) return;
   const A = auto.get();
   const health = issuesApi.health();
@@ -3714,7 +4135,7 @@ function acceptancePanel(d) {
     h("div", { class: "ac-facts" },
       fact("测试", last ? `${last.cases.filter((c) => c.status === "passed").length}/${last.cases.length} 通过` : "未运行", last?.status === "passed" ? "ok-text" : "err-text"),
       fact("AI 审核", d.pr?.guard ? "已拦截" : "通过", d.pr?.guard ? "err-text" : "ok-text"),
-      fact("代码", d.pr ? `PR #${d.pr.number} ${{ merged: "已合并", open: "待合并", reverted: "已回滚" }[d.pr.state] ?? ""}` : "无代码改动"),
+      fact("代码", d.pr ? `${prName(d.pr)} ${{ merged: "已合并", open: "待合并", reverted: "已回滚" }[d.pr.state] ?? ""}` : "无代码改动"),
       fact("返工", `${d.cycle} 轮`), fact("花费", usd(d.cost))),
     d.pr?.guard ? h("div", { class: "callout warn" }, `🛡 安全护栏：${d.pr.guard}。未自动合并，确认无误后点上方按钮合并。`) : null,
     preview ? h("div", { class: "row" }, h("span", { class: "muted", style: "font-size:12.5px" }, "预览"), h("a", { class: "link", href: preview, target: "_blank", rel: "noopener" }, preview)) : null,
@@ -3744,6 +4165,7 @@ renderDrawer = async function () {
 // ======================= 洞察：度量与复盘 / 成本 =======================
 const ins = { tab: "metrics" };
 async function renderInsights() {
+  if (holdWhileEditing("#insightsPage", renderInsights)) return;
   if (!viewActive("insights")) return;
   const all = await issuesApi.list();
   const tile = (cls, k, v, d) => h("div", { class: "tile " + cls }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), d ? h("div", { class: "d" }, d) : null);

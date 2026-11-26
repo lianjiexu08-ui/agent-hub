@@ -2,12 +2,16 @@
  * 工作目录：每个工作项在仓库的独立 git worktree（分支 agent/<编号>）中执行，互不干扰。
  * 只在「项目绑定了仓库 + 已配置 GitHub Token + 智能体使用 CLI 底座」时启用。
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { GitHub } from "./github.ts";
 
-interface Proj { id: string; repo: { fullName: string; defaultBranch?: string } | null }
+interface Proj { id: string; repo: { fullName: string; defaultBranch?: string } | null; delivery?: { baseBranch?: string; mode?: string; localPath?: string } }
+/** 基线分支：项目交付策略里填的优先 */
+const baseOfP = (p: Proj) => p.delivery?.baseBranch || p.repo!.defaultBranch || "main";
+/** 本地交付：基线从本机仓库取（它可能有还没推上去的提交），否则从远端取 */
+const isLocal = (p: Proj) => p.delivery?.mode === "local" && !!p.delivery?.localPath;
 
 /** Hub 运行时写进工作目录的配置文件（含任务令牌）：提交时排除 */
 export const HUB_FILES = [".gemini/settings.json", ".pi/mcp.json"];
@@ -95,11 +99,13 @@ export class Workspace {
   prepare(p: Proj, key: string): Promise<string> { return this.withRepo(p, () => this.prepareUnlocked(p, key)); }
   private async prepareUnlocked(p: Proj, key: string): Promise<string> {
     const repo = this.repoDir(p);
-    const base = p.repo!.defaultBranch ?? "main";
+    const base = baseOfP(p);
     if (!existsSync(join(repo, ".git"))) {
       mkdirSync(join(this.root, "repos"), { recursive: true });
       await git(["clone", "--no-tags", this.url(p), repo], this.root);
-    } else await git(["fetch", this.url(p), `+refs/heads/${base}:refs/remotes/origin/${base}`], repo);
+    }
+    // 基线来源：本地交付从本机仓库取（含未推送的提交），否则取远端
+    await git(["fetch", this.baseSrc(p), `+refs/heads/${base}:refs/remotes/origin/${base}`], repo);
     const dir = this.dir(p, key);
     if (!existsSync(dir)) {
       mkdirSync(join(dir, ".."), { recursive: true });
@@ -123,9 +129,9 @@ export class Workspace {
     // 只看暂存区：未跟踪的 Hub 配置（.pi/、.gemini/）不算；智能体自己已经提交过时暂存区为空，直接跳过
     const staged = await git(["diff", "--cached", "--name-only"], dir);
     if (staged) await git(["-c", "user.name=agent-hub", "-c", "user.email=agent-hub@users.noreply.github.com", "commit", "-m", message], dir);
-    const base = p.repo!.defaultBranch ?? "main";
+    const base = baseOfP(p);
     // 先把最新的主干合进来：并行开发时主干可能已经前进了。测试与评审要基于合并后的代码，PR 也不会带着冲突提上去
-    await git(["fetch", this.url(p), `+refs/heads/${base}:refs/remotes/origin/${base}`], dir);
+    await git(["fetch", this.baseSrc(p), `+refs/heads/${base}:refs/remotes/origin/${base}`], dir);
     const upToDate = await git(["merge-base", "--is-ancestor", `origin/${base}`, "HEAD"], dir).then(() => true, () => false);
     if (!upToDate) {
       try {
@@ -139,8 +145,49 @@ export class Workspace {
     }
     const ahead = await git(["rev-list", "--count", `origin/${base}..HEAD`], dir);
     if (ahead === "0") return null;
-    await git(["push", "--force-with-lease", this.url(p), `HEAD:refs/heads/${branch}`], dir);
+    // 本地交付不碰远端：分支只留在 Hub 的工作区里，合并时由 mergeLocal 拉进本机仓库
+    if (!isLocal(p)) await git(["push", "--force-with-lease", this.url(p), `HEAD:refs/heads/${branch}`], dir);
     return { branch, ...diffStat(await git(["diff", "--numstat", `origin/${base}...HEAD`], dir)) };
+  }
+
+  private baseSrc(p: Proj) { return isLocal(p) ? p.delivery!.localPath! : this.url(p); }
+
+  /**
+   * 本地交付：把工作项分支合进本机仓库的基线分支（例如本地起着 nuxt dev 的那份代码，合进去即热加载）。
+   * 安全约束：本机仓库当前必须正检出在基线分支上；有冲突立即 abort，不留半合并状态；不推远端。
+   * 本机仓库里与本次改动无关的未提交修改，git 自己会保留；会被覆盖时 git 会拒绝合并。
+   */
+  mergeLocal(p: Proj, key: string, localPath: string, base: string, message: string): Promise<{ commit: string | null }> {
+    return this.withRepo(p, async () => {
+      if (!existsSync(join(localPath, ".git"))) throw new Error(`${localPath} 不是 git 仓库`);
+      const cur = await git(["rev-parse", "--abbrev-ref", "HEAD"], localPath);
+      if (cur !== base) throw new Error(`本机仓库当前在 ${cur} 分支，不是 ${base}。为避免合错地方，请先切到 ${base} 再合并`);
+      const branch = `agent/${key.toLowerCase()}`;
+      const ref = `refs/hub/${key.toLowerCase()}`;
+      await git(["fetch", this.dir(p, key), `+refs/heads/${branch}:${ref}`], localPath);
+      try {
+        await git(["-c", "user.name=agent-hub", "-c", "user.email=agent-hub@users.noreply.github.com", "merge", "--no-ff", "-m", message, ref], localPath);
+      } catch (e) {
+        await git(["merge", "--abort"], localPath).catch(() => {});
+        throw new Error(`合并到本地 ${base} 失败（已撤销，本机仓库保持原样）：${(e as Error).message.slice(0, 300)}`);
+      } finally {
+        await git(["update-ref", "-d", ref], localPath).catch(() => {});
+      }
+      return { commit: await git(["rev-parse", "HEAD"], localPath).catch(() => null) };
+    });
+  }
+
+  /** 在指定目录执行一条 shell 命令（合并后的收尾动作），10 分钟超时 */
+  runIn(cwd: string, cmd: string): Promise<{ ok: boolean; output: string }> {
+    return new Promise((res) => {
+      const ch = spawn("bash", ["-lc", cmd], { cwd, env: process.env });
+      let out = "";
+      const t = setTimeout(() => { ch.kill("SIGKILL"); out += "\n（超时 10 分钟，已终止）"; }, 10 * 60_000);
+      ch.stdout.on("data", (b) => { out = (out + b).slice(-20_000); });
+      ch.stderr.on("data", (b) => { out = (out + b).slice(-20_000); });
+      ch.on("close", (code) => { clearTimeout(t); res({ ok: code === 0, output: out }); });
+      ch.on("error", (e) => { clearTimeout(t); res({ ok: false, output: e.message }); });
+    });
   }
 
   /** 回滚已合并的 PR：基于合并提交创建 revert PR 并合并，返回新 PR 编号 */

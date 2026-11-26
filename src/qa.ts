@@ -14,7 +14,7 @@ import { z } from "zod";
 import { priorityRank } from "./priority.ts";
 import type { Previews } from "./preview.ts";
 
-interface Step { desc: string; cmd: string; status: "passed" | "failed" | "skipped" | null; ms?: number; error?: string | null; found?: string; at?: string; locate?: boolean; assert?: boolean }
+interface Step { desc: string; cmd: string; status: "passed" | "failed" | "skipped" | null; ms?: number; error?: string | null; found?: string; at?: string; locate?: boolean; assert?: boolean; /** 截图文件名（在截图目录下），作为这一步的证据 */ shot?: string }
 interface Case { id: string; criterion: number | null; kind: "browser" | "unit" | "check" | "health"; title: string; mutates: string[]; status: "passed" | "failed" | "running" | "skipped" | null; steps: Step[]; note?: string }
 export interface QARun {
   id: string; issueKey: string; title: string; projectId: string; pr: number | null; hotfix: boolean; priority: number;
@@ -23,12 +23,13 @@ export interface QARun {
   simulated: boolean; taskId?: string; failAt?: number; boosted?: boolean;
   /** 本次验收的预览环境（工作项分支）与无头浏览器 */
   previewUrl?: string | null; previewError?: string | null; browserId?: string | null;
+  /** false = 只做代码层验收（不开浏览器）；true = 页面验收。缺省按环境自动判断 */
+  web?: boolean;
 }
 type IssueLike = { key: string; title: string; description: string; labels: string[]; projectId: string; pr: { number: number } | null; priority: number; quality: { criteria: string[] } };
 
 const WEB = /页面|首页|导航|按钮|登录|博客|表单|移动端|样式|展示|定价|seo|前端|UI/i;
 const now = () => new Date().toISOString();
-const MUT_LABEL: Record<string, string> = { orders: "订单", session: "登录会话", content: "内容" };
 
 export function detectDevEye(): Promise<boolean> {
   return new Promise((r) => execFile("/bin/sh", ["-c", "command -v deveye"], (e, out) => r(!e && !!out.trim())));
@@ -90,17 +91,27 @@ export class QA implements QAPort {
   private emit() { this.runtime.events.emit("event", { type: "work", kind: "qa" } as unknown as HubEvent); }
   runs(): QARun[] { return this.store.docList<QARun>("qa_runs"); }
   run(id: string) { return this.store.docGet<QARun>("qa_runs", id); }
-  private save(r: QARun) { this.store.docPut("qa_runs", r.id, r); }
+  private save(r: QARun) { this.store.docPut("qa_runs", r.id, r); this.byIssue = null; }
+  /** 按工作项分组的验收记录（只读缓存，任何写入都会让它失效）。看板每次刷新要给每张卡片查一遍，不能每次都整表解析 */
+  private byIssue: Map<string, QARun[]> | null = null;
   /** 测试任务属于哪张工作项（CLI 底座据此在该工作项的 worktree 里跑验收） */
   issueKeyOfTask(taskId: string): string | null { return this.runs().find((r) => r.taskId === taskId)?.issueKey ?? null; }
-  runsFor(key: string) { return this.runs().filter((r) => r.issueKey === key).reverse(); }
+  runsFor(key: string) {
+    if (!this.byIssue) {
+      this.byIssue = new Map();
+      for (const r of this.runs()) { const l = this.byIssue.get(r.issueKey); if (l) l.push(r); else this.byIssue.set(r.issueKey, [r]); }
+    }
+    return (this.byIssue.get(key) ?? []).slice().reverse();
+  }
   state() { return { runs: this.runs().slice(-200), settings: this.settings.get().qa, browsers: this.browsers, browserReady: this.browserOn, engine: this.previews?.engine() ?? (this.cliDevEye ? "deveye" : null), deveyeInstalled: this.cliDevEye }; }
 
-  private buildCases(i: IssueLike): Case[] {
+  private buildCases(i: IssueLike, webOverride?: boolean): Case[] {
     // 浏览器用例要有地方可打开、有工具可用：真实模式下必须配置了测试地址且装有 DevEye。
     // 只凭描述里出现「页面」「前端」就生成浏览器用例，会让项目骨架这类任务全是跑不了的浏览器验收。
     const env = this.proj(i.projectId)?.env;
-    const web = this.simulate ? WEB.test(`${i.title}${i.description}`) || !!env?.baseUrl : this.browserOn && !!(env?.baseUrl || env?.preview || (env?.previewCmd && this.previews));
+    const auto = this.simulate ? WEB.test(`${i.title}${i.description}`) || !!env?.baseUrl : this.browserOn && !!(env?.baseUrl || env?.preview || (env?.previewCmd && this.previews));
+    // 显式要求不开浏览器（例如合并前的代码层验收）时一律不开；要求开时还得真有浏览器和地址
+    const web = webOverride === false ? false : webOverride === true ? auto : auto;
     const mut = (t: string) => (/提交|创建|删除|支付|订单|登录|注册/.test(t) ? [/支付|订单/.test(t) ? "orders" : /登录|注册/.test(t) ? "session" : "content"] : []);
     const cases: Case[] = i.quality.criteria.map((c, n) => web ? {
       id: `c${n + 1}`, criterion: n, kind: "browser", title: c, mutates: mut(c), status: null,
@@ -128,14 +139,15 @@ export class QA implements QAPort {
   /** 本地预览（每个工作项单独起一份）：开始验收时才有地址，先记为 preview */
   private localPreview(r: QARun) { return !this.simulate && !!this.previews && !!this.proj(r.projectId)?.env.previewCmd; }
   private envFor(r: QARun) {
+    if (r.web === false) return "CI";
     if (this.localPreview(r)) return "preview";
     const e = this.proj(r.projectId)?.env;
     return r.pr && e?.preview ? e.preview.replace("{pr}", String(r.pr)) : e?.baseUrl || "CI";
   }
 
-  enqueue(i: IssueLike, trigger: string): string {
-    const cases = this.buildCases(i);
-    const r: QARun = { id: "qr_" + this.store.nextSeq("qa"), issueKey: i.key, title: i.title, projectId: i.projectId, pr: i.pr?.number ?? null, hotfix: i.labels.includes("hotfix"), priority: i.priority ?? 0, status: "queued", trigger, browser: null, env: "", account: null, mutates: [...new Set(cases.flatMap((c) => c.mutates))], cases, queuedAt: now(), wait: "等待调度", cursor: null, simulated: this.simulate };
+  enqueue(i: IssueLike, trigger: string, opts: { web?: boolean } = {}): string {
+    const cases = this.buildCases(i, opts.web);
+    const r: QARun = { web: opts.web, id: "qr_" + this.store.nextSeq("qa"), issueKey: i.key, title: i.title, projectId: i.projectId, pr: i.pr?.number ?? null, hotfix: i.labels.includes("hotfix"), priority: i.priority ?? 0, status: "queued", trigger, browser: null, env: "", account: null, mutates: [...new Set(cases.flatMap((c) => c.mutates))], cases, queuedAt: now(), wait: "等待调度", cursor: null, simulated: this.simulate };
     r.env = this.envFor(r);
     this.save(r);
     this.emit();
@@ -159,6 +171,28 @@ export class QA implements QAPort {
       signal?.addEventListener("abort", () => { this.cancel(id); reject(new Error("已取消")); }, { once: true });
     });
   }
+  /**
+   * 一次验收的完整失败报告，交给开发智能体返工用：每条用例的结论、tester 的说明与复现、失败步骤的命令与报错、截图文件。
+   * 只给一句「x/y 通过」的话，智能体只能猜，常常修错地方。
+   */
+  failureReport(id: string, shotDir?: string): string {
+    const r = this.run(id);
+    if (!r) return "";
+    const ok = r.cases.filter((c) => c.status === "passed").length;
+    const lines = [`### 验收 ${r.id}（${r.trigger === "post-merge" ? "合并后的页面验收" : "交付后的验收"}）：${ok}/${r.cases.length} 通过`,
+      `环境：${r.env}${r.browser ? `，浏览器 ${r.browser}` : ""}${r.account ? `，测试账号 ${r.account}` : ""}${r.previewError ? `\n预览环境问题：${r.previewError.slice(0, 500)}` : ""}`];
+    for (const c of r.cases) {
+      if (c.status === "passed") { lines.push(`- ✓ ${c.id} ${c.title}`); continue; }
+      lines.push("", `#### ✕ ${c.id} ${c.title}（${c.status ?? "未执行"}）`);
+      if (c.note) lines.push(`tester 的结论与复现：\n${c.note.slice(0, 2500)}`);
+      const bad = c.steps.filter((st) => st.status === "failed");
+      if (bad.length) lines.push("失败的步骤：", ...bad.slice(0, 6).map((st) => `- \`${st.cmd.slice(0, 200)}\`${st.error ? `\n  报错：${st.error.slice(0, 600)}` : ""}`));
+      const shots = c.steps.filter((st) => st.shot).map((st) => st.shot!);
+      if (shots.length) lines.push(`截图：${shots.map((f) => (shotDir ? `${shotDir}/${f}` : f)).join("、")}`);
+    }
+    return lines.join("\n");
+  }
+
   private result(r: QARun) {
     const ok = r.cases.filter((c) => c.status === "passed").length;
     const bad = r.cases.find((c) => c.status === "failed");
@@ -180,10 +214,8 @@ export class QA implements QAPort {
   private conflict(a: QARun, b: QARun): string | null {
     // 本地预览每个工作项独立（端口、数据库都隔离），互不冲突
     if (a.env !== b.env || a.env === "CI" || a.env === "preview") return null;
-    const m = a.mutates.find((x) => b.mutates.includes(x));
-    if (m) return `都会修改${MUT_LABEL[m] ?? m}数据`;
-    if (a.account && a.account === b.account) return `测试账号 ${a.account} 正在被使用`;
-    return null;
+    // 共用的测试环境（如本机 8100）：页面验收一个一个来，避免互相改数据、互相截到对方的页面
+    return `测试环境 ${a.env} 一次只跑一个页面验收`;
   }
   tick() {
     const s = this.settings.get().qa;
@@ -278,7 +310,7 @@ export class QA implements QAPort {
     if (r.previewError) parts.push(`⚠ 本分支的预览环境没有启动成功：${r.previewError}\n请先判断原因：如果是这个分支的代码问题（构建失败、启动报错），把相关浏览器用例判为失败并写清原因；如果是环境问题，在结论里说明，并尽量用检查型方式（读代码、跑测试）验证。`);
     parts.push(`用例（逐条执行，每条完成后调用 report_case 汇报）：\n${r.cases.map((c) => `- ${c.id}：${c.title}`).join("\n")}`);
     if (this.browserOn && (r.browserId || (r.env !== "CI" && r.env !== "preview")))
-      parts.push(`用 browser 工具操作浏览器（已为你准备好一个独立的无头浏览器）：先 navigate goto <测试环境地址>，再 snapshot --interactive-only 拿到元素编号（e1、e2…），用 click --uid eN / type --uid eN "文本" --enter / select --uid eN "选项" / wait --text "文字" 操作与断言；点击、输入后会直接返回新的元素快照，编号以最新一次为准。console --level error 看控制台报错，network --status 5xx 看失败的接口，screenshot 截图。每条浏览器用例都要真的在页面上操作，并把看到的结果写进汇报。`);
+      parts.push(`用 browser 工具操作浏览器（已为你准备好一个独立的无头浏览器）：先 navigate goto <测试环境地址>，再 snapshot --interactive-only 拿到元素编号（e1、e2…），用 click --uid eN / type --uid eN "文本" --enter / select --uid eN "选项" / wait --text "文字" 操作与断言；点击、输入后会直接返回新的元素快照，编号以最新一次为准。console --level error 看控制台报错，network --status 5xx 看失败的接口，screenshot 截图。每条浏览器用例都要真的在页面上操作，并把看到的结果写进汇报。\n**每条浏览器用例在汇报 passed 之前，必须对验证点所在的页面 screenshot 至少一张**（停在能看到被验证内容的位置；需要整页时加 --full）。没有截图的浏览器用例只能报 failed 并说明原因。截图会作为验收证据展示给人看。`);
     else parts.push("当前没有可用的浏览器，请根据交付内容和代码做检查型验收。");
     parts.push("当前工作目录就是这个工作项的代码（开发分支）。可以阅读代码、安装依赖、运行测试和构建命令来验证；**不要修改、新增或提交任何文件**，发现问题如实汇报即可，修复由开发智能体负责。\n全部用例汇报完后，用一句话给出总体结论。");
     return parts.join("\n\n");
@@ -342,6 +374,8 @@ export class QA implements QAPort {
       if (!r) return { content: "当前不在验收任务中", isError: true };
       const c = r.cases.find((x) => x.id === p.data.case_id);
       if (!c) return { content: `用例 ${p.data.case_id} 不存在，可用：${r.cases.map((x) => x.id).join("、")}`, isError: true };
+      if (c.kind === "browser" && p.data.status === "passed" && !c.steps.some((s) => s.shot))
+        return { content: `${c.id} 是浏览器用例，报 passed 前先用 browser screenshot 在验证点截一张图作为证据，然后再汇报。`, isError: true };
       c.status = p.data.status;
       c.note = p.data.note;
       if (!c.steps.some((s) => s.status)) c.steps = [{ desc: p.data.note, cmd: "report_case", status: p.data.status, error: p.data.status === "failed" ? p.data.note : null, at: now() }];
@@ -375,7 +409,8 @@ export class QA implements QAPort {
         const c = r.cases[r.cursor.c];
         if (c.steps.every((s) => s.cmd !== "report_case")) {
           if (!c.steps.some((s) => s.at)) c.steps = [];
-          c.steps.push({ desc: args[0], cmd: `browser ${cmd}`, status: out.ok ? "passed" : "failed", ms: Date.now() - started, error: out.ok ? null : out.text.slice(0, 300), at: now() });
+          const shot = args[0] === "screenshot" && out.ok ? out.text.match(/截图已保存：(.+)$/m)?.[1]?.split("/").pop() : undefined;
+          c.steps.push({ desc: args[0], cmd: `browser ${cmd}`, status: out.ok ? "passed" : "failed", ms: Date.now() - started, error: out.ok ? null : out.text.slice(0, 300), at: now(), ...(shot ? { shot } : {}) });
           this.save(r);
           this.emit();
         }

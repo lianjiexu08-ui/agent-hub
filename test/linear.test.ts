@@ -33,6 +33,9 @@ const remote: Remote[] = [
   { id: "lin-3", identifier: "ENG-3", title: "不带标签", description: "", priority: 4, url: "https://linear.app/x/issue/ENG-3", updatedAt: new Date().toISOString(), stateId: "s-backlog", labels: ["docs"] },
 ];
 const updates: { id: string; input: Record<string, unknown> }[] = [];
+/** 远端 issue 上人写的评论（提测反馈） */
+const remoteComments: Record<string, string[]> = {};
+const creates: Record<string, unknown>[] = [];
 const comments: { issueId: string; body: string }[] = [];
 /** 下一次 issueUpdate 返回失败，用来验证失败会被记录下来 */
 let failUpdate = false;
@@ -60,6 +63,7 @@ const server = createServer(async (req, res) => {
     return ok({ team: { issues: { nodes: page.map(toIssue), pageInfo: { hasNextPage: more, endCursor: more ? String(start + 100) : null } } } });
   }
   if (query.includes("issueCreate")) {
+    creates.push(variables.input);
     const n = ++seq;
     const r: Remote = { id: `lin-${n}`, identifier: `ENG-${n}`, title: variables.input.title, description: variables.input.description ?? "", priority: variables.input.priority ?? 0, url: `https://linear.app/x/issue/ENG-${n}`, updatedAt: new Date().toISOString(), stateId: "s-todo", labels: [] };
     remote.push(r);
@@ -73,6 +77,7 @@ const server = createServer(async (req, res) => {
     return ok({ issueUpdate: { success: true, issue: { id: r.id, identifier: r.identifier, url: r.url, state: state(r.stateId) } } });
   }
   if (query.includes("commentCreate")) { comments.push(variables.input); return ok({ commentCreate: { success: true } }); }
+  if (query.includes("IssueComments")) return ok({ issue: { comments: { nodes: (remoteComments[variables.id] ?? []).map((c) => ({ body: c, createdAt: new Date().toISOString(), user: { name: "QA" } })) } } });
   res.statusCode = 400;
   res.end(JSON.stringify({ errors: [{ message: "unknown query" }] }));
 });
@@ -378,4 +383,100 @@ test("创建人与指派人：导入记真名、为 null 不覆盖、远端变�
   await work.syncLinear(p.id);
   assert.equal(work.list(p.id).find((i) => i.linear!.identifier === "ENG-1")!.linear!.assignee, null);
   assert.equal(updates.length, 0);
+});
+
+test("导入范围按指派人：只导入指派给选中成员的 issue", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "lin_…test", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+  const r1 = remote.find((r) => r.id === "lin-1")!;
+  const r3 = remote.find((r) => r.id === "lin-3")!;
+  r1.stateId = "s-todo"; r3.stateId = "s-backlog";
+  r1.assignee = { id: "u-me", name: "me" };
+  r3.assignee = { id: "u-other", name: "other" };
+
+  const p = work.saveProject({ name: "按人导入", key: "MINE" });
+  await work.connectLinear(p.id, "team-1");
+  work.saveProject({ name: "按人导入", key: "MINE", linear: { importScope: "assignee", importAssignees: [{ id: "u-me", name: "me" }] } }, p.id);
+  await work.syncLinear(p.id);
+  const ids = work.list(p.id).map((i) => i.linear!.identifier).sort();
+  assert.deepEqual(ids, ["ENG-1"], "只导入指派给 me 的");
+});
+
+test("提测打回：Hub 交付过的单在 Linear 上被改回 In Progress，带着评论里的反馈退回给智能体；待审核时不进「需要你处理」", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "lin_…test", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+  const r1 = remote.find((r) => r.id === "lin-1")!;
+  r1.stateId = "s-review";
+  const p = work.saveProject({ name: "提测打回", key: "BNCE" });
+  await work.connectLinear(p.id, "team-1");
+  await work.syncLinear(p.id);
+  const imported = work.list(p.id).find((i) => i.linear!.identifier === "ENG-1")!;
+  assert.equal(imported.status, "in_review");
+  assert.ok(!work.attention(p.id).some((a) => a.issue.key === imported.key), "Linear 里的待审核单在 Linear 上提测，不在 Hub 里催");
+
+  // 模拟 Hub 交付过：有智能体、走完生命周期
+  const raw = store.docGet<Record<string, unknown>>("issues", imported.id)!;
+  store.docPut("issues", imported.id, { ...raw, assignee: "developer", lifecycleDone: true });
+  (work as unknown as { invalidate(): void }).invalidate();
+  remoteComments["lin-1"] = ["登录页还是白屏，Chrome 120 必现"];
+  r1.stateId = "s-prog";
+  r1.updatedAt = new Date().toISOString();
+  updates.length = 0;
+  await work.syncLinear(p.id);
+  await until(() => work.detail(imported.key).activity.some((c) => c.kind === "lead" && /提测未通过/.test(c.body)));
+  const body = work.detail(imported.key).activity.find((c) => /提测未通过/.test(c.body))!.body;
+  assert.match(body, /Chrome 120 必现/, "提测反馈带给了智能体");
+  assert.notEqual(work.list(p.id).find((i) => i.key === imported.key)!.status, "in_review");
+});
+
+test("智能体拆出的子单自动推到 Linear，挂在父单下、指派人跟父单一致；人建的单仍按勾选", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "lin_…test", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+  const r1 = remote.find((r) => r.id === "lin-1")!;
+  r1.stateId = "s-todo";
+  r1.assignee = { id: "u-me", name: "me" };
+  const p = work.saveProject({ name: "子单推送", key: "SUBS" });
+  await work.connectLinear(p.id, "team-1");
+  await work.syncLinear(p.id);
+  const parent = work.list(p.id).find((i) => i.linear!.identifier === "ENG-1")!;
+  creates.length = 0;
+  const kid = await work.create({ projectId: p.id, title: "拆分出的子任务", description: "做 A", parent: parent.key, status: "backlog" }, "architect");
+  const k = work.list(p.id).find((i) => i.key === kid.key)!;
+  assert.ok(k.linear, "子单已关联 Linear");
+  assert.equal(creates.length, 1);
+  assert.equal(creates[0].parentId, "lin-1", "挂在父单下");
+  assert.equal(creates[0].assigneeId, "u-me", "指派人跟父单一致");
+  assert.match(String(creates[0].description), /由 Hub 智能体 architect 从/);
+  creates.length = 0;
+  await work.create({ projectId: p.id, title: "人建的不勾选", linear: false });
+  assert.equal(creates.length, 0, "人建单不勾选就不推");
+});
+
+test("流转规则：做完可提测时按配置改 Linear 状态并指派给测试同学，只改一次", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "lin_…test", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+  const p = work.saveProject({ name: "流转", key: "FLOW" });
+  await work.connectLinear(p.id, "team-1");
+  work.saveProject({ name: "流转", key: "FLOW", flow: { deliver: { stateId: "s-review", assignee: { id: "u-qa", name: "QA" } } } }, p.id);
+  updates.length = 0;
+  const v = await work.create({ projectId: p.id, title: "做完转测试", description: "验收标准：\n- 支持四列\n- 错误行给出行号\n- 最多 500 行", assignee: "developer", linear: true });
+  await until(() => work.list(p.id).find((i) => i.key === v.key)!.status === "in_review");
+  await until(() => updates.some((u) => u.input.assigneeId === "u-qa"));
+  const lin = work.list(p.id).find((i) => i.key === v.key)!.linear!;
+  assert.equal(lin.assignee?.name, "QA");
+  assert.ok(updates.some((u) => u.input.stateId === "s-review"), "做完时改成配置的 In Review");
+  assert.equal(updates.filter((u) => u.input.assigneeId).length, 1, "只改一次指派人");
+  assert.ok(work.detail(v.key).activity.some((c) => /已指派给 QA（可以提测）/.test(c.body)));
 });

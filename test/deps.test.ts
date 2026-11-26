@@ -122,7 +122,7 @@ test("运行失败后重试：从中断的阶段继续，不新开一轮；人�
   assert.equal(raw().resumeFrom, phase);
   await work.run(a.key);
   assert.equal(raw().cycle, 1, "仍是第 1 轮");
-  assert.match(work.detail(a.key).activity.map((c) => c.body).join("\n"), new RegExp(`从「.+」继续.*仍是第 1 轮`));
+  assert.match(work.detail(a.key).activity.map((c) => c.body).join("\n"), /从「.+」继续.*仍是第 1 轮|接着上次的进度继续「.+」.*第 1 轮/);
   assert.equal(raw().resumeFrom, null);
   // 人主动停止：不记续跑点
   const r2 = work.detail(a.key).runList[0];

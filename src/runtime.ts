@@ -17,6 +17,7 @@ import { costOf } from "./pricing.ts";
 import { priorityRank } from "./priority.ts";
 import { PrioritySlots } from "./slots.ts";
 import { builtinReceipt, recordReceipt } from "./receipt.ts";
+import { backoffMs, isTransientError, sleep } from "./transient.ts";
 
 /** 非内置运行底座（Claude Code 等 CLI）的执行器 */
 export interface CliExecutor {
@@ -84,6 +85,9 @@ export class Runtime {
   }
 
   // ======================= 对外 API =======================
+
+  /** 续跑时提供之前的对话（由 Work 注入）；返回 null 表示从头开始 */
+  resumeMessagesFor: ((task: Task) => BetaMessageParam[] | null) | null = null;
 
   /** 注册一个对所有智能体可用的内置工具 */
   addTool(def: BetaToolUnion & { name: string }, run: ToolHandler, when?: (task: Task, agent: Agent) => boolean) {
@@ -194,6 +198,20 @@ export class Runtime {
     const done = await this.waitFor(task.id, opts.timeoutMs ?? 120_000);
     const timedOut = !TERMINAL.has(done.status);
     return { taskId: task.id, status: done.status, result: done.result ?? null, error: done.error ?? null, timedOut };
+  }
+
+  /** 模型调用遇到网络抖动时退避重试，最多约 7 分钟；其他错误原样抛出 */
+  private async createWithRetry<T>(taskId: string, fn: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    for (let n = 0; ; n++) {
+      try { return await fn(); }
+      catch (e) {
+        if (signal.aborted || n >= 6 || !isTransientError(e)) throw e;
+        const wait = backoffMs(n) * 1000;
+        console.warn(`[task] ${taskId.slice(0, 8)} 模型调用网络异常（${String((e as Error).message ?? e).slice(0, 80)}），${wait / 1000} 秒后第 ${n + 1} 次重试`);
+        this.touch(taskId);
+        await sleep(wait, signal);
+      }
+    }
   }
 
   /** 等待任务结束（completed / failed / cancelled） */
@@ -337,7 +355,9 @@ export class Runtime {
       const input = external.warnings.length
         ? `${task.input}\n\n[系统提示] 以下配置的工具当前不可用：\n- ${external.warnings.join("\n- ")}`
         : task.input;
-      const messages: BetaMessageParam[] = [{ role: "user", content: input }];
+      // 被中断的运行续跑：把之前的对话装回去接着跑，不从头再来
+      const prior = this.resumeMessagesFor?.(task) ?? null;
+      const messages: BetaMessageParam[] = prior ?? [{ role: "user", content: input }];
       this.store.saveMessages(id, messages);
       recordReceipt(
         this.store,
@@ -353,7 +373,8 @@ export class Runtime {
 
         // 排队等模型槽位、以及长时间的模型调用期间每 30 秒更新心跳，避免被哨兵误判为卡住
         const beat = setInterval(() => this.touch(id), 30_000);
-        const response = await this.sem.run(() =>
+        // 网络抖动（连接超时、5xx、限流、过载）就地重试，不让整次运行失败——对话进度都在内存里，失败就白跑了
+        const response = await this.sem.run(() => this.createWithRetry(id, () =>
           this.llm.create(
             {
               model: agent.model,
@@ -368,7 +389,7 @@ export class Runtime {
               fallbacks: "default",
             },
             { signal: controller.signal },
-          ), task.priority, controller.signal).finally(() => clearInterval(beat));
+          ), controller.signal), task.priority, controller.signal).finally(() => clearInterval(beat));
 
         inputTokens +=
           response.usage.input_tokens +

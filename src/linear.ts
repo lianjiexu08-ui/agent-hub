@@ -185,7 +185,7 @@ export class Linear {
     return out;
   }
 
-  async createIssue(input: { teamId: string; title: string; description?: string; priority?: number; stateId?: string }): Promise<LinearIssueRef> {
+  async createIssue(input: { teamId: string; title: string; description?: string; priority?: number; stateId?: string; parentId?: string; assigneeId?: string }): Promise<LinearIssueRef> {
     const d = await this.gql<{ issueCreate: { success: boolean; issue: LinearIssueRef | null } }>(
       `mutation IssueCreate($input: IssueCreateInput!) {
         issueCreate(input: $input) { success issue { id identifier url state { id name type position } } }
@@ -196,7 +196,7 @@ export class Linear {
     return d.issueCreate.issue;
   }
 
-  async updateIssue(id: string, input: { stateId?: string; priority?: number; title?: string; description?: string }): Promise<LinearIssueRef> {
+  async updateIssue(id: string, input: { stateId?: string; priority?: number; title?: string; description?: string; assigneeId?: string | null }): Promise<LinearIssueRef> {
     const d = await this.gql<{ issueUpdate: { success: boolean; issue: LinearIssueRef | null } }>(
       `mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
         issueUpdate(id: $id, input: $input) { success issue { id identifier url state { id name type position } } }
@@ -205,6 +205,15 @@ export class Linear {
     );
     if (!d.issueUpdate.success || !d.issueUpdate.issue) throw new Error("Linear 更新 issue 失败");
     return d.issueUpdate.issue;
+  }
+
+  /** 最近的评论（最新在后），用来把提测反馈带给智能体 */
+  async recentComments(issueId: string, n = 8): Promise<{ body: string; user: string; createdAt: string }[]> {
+    const d = await this.gql<{ issue: { comments: { nodes: { body: string; createdAt: string; user: { name: string } | null }[] } } | null }>(
+      `query IssueComments($id: String!, $n: Int) { issue(id: $id) { comments(last: $n) { nodes { body createdAt user { name } } } } }`,
+      { id: issueId, n },
+    );
+    return (d.issue?.comments.nodes ?? []).map((c) => ({ body: c.body, user: c.user?.name ?? "?", createdAt: c.createdAt })).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async comment(issueId: string, body: string): Promise<void> {

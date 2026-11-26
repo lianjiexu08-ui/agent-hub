@@ -108,8 +108,9 @@ export class Automation {
       if (j.action === "sentinel") { const n = await this.sentinel(); result = n ? `处理 ${n} 项` : "一切正常"; }
       if (j.action === "lead") { await this.work.leadTick(); result = "已巡检"; }
       if (j.action === "sync") {
-        const gh = this.work.projectsRaw().filter((p) => p.repo && p.sync.mode !== "off");
-        const ln = this.work.projectsRaw().filter((p) => p.linear && p.linear.mode !== "off");
+        // 按来源挑项目：只接了 Linear 的项目不该每 5 分钟尝试一次 GitHub 同步再被拒绝
+        const gh = this.work.projectsRaw().filter((p) => this.work.githubSyncable(p));
+        const ln = this.work.projectsRaw().filter((p) => this.work.linearSyncable(p));
         const errs: string[] = [];
         // 单个项目失败不影响其他项目；定时同步走增量
         for (const p of gh) await this.work.sync(p.id, { incremental: !manual }).catch((e) => errs.push(`${p.name}（GitHub）：${e.message}`));

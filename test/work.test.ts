@@ -178,3 +178,35 @@ test("工作项执行：任务继承工作项优先级", async () => {
   const run = store.listTasks({ issueId: issue.id, rootsOnly: true })[0];
   assert.equal(run.priority, 1);
 });
+
+test("需求门禁：项目负责人能定的直接代为确认，开发继续，不打扰人", async () => {
+  const { work, notify, runtime } = setup();
+  const p = work.saveProject({ name: "演示", key: "DEMO" });
+  work.setLead(p.id, { mode: "on_demand", duties: { bugs: false } as never });
+  (runtime as unknown as { callAgent: unknown }).callAgent = async () => ({ taskId: "x", status: "completed", error: null, timedOut: false,
+    result: '好的。{"answer":"验收标准：\\n- 三档套餐对比表\\n- 常见问题 6 条","ask":[]}' });
+  const v = await work.create({ projectId: p.id, title: "定价页改版", description: "三档套餐对比表 + 常见问题。", assignee: "writer" });
+  await until(() => work.list().find((i) => i.key === v.key)!.status === "in_review");
+  const i = work.list().find((x) => x.key === v.key)!;
+  assert.match(i.description, /常见问题 6 条/);
+  assert.ok(!notify.list().some((n) => n.kind === "confirm"), "没有通知人确认需求");
+  assert.ok(work.detail(v.key).activity.some((c) => c.kind === "lead" && /代为确认/.test(c.body)));
+});
+
+test("需求门禁：项目负责人拿不准的只把剩下的问题转给人，人回答后与负责人的结论合并", async () => {
+  const { work, notify, runtime } = setup();
+  const p = work.saveProject({ name: "演示", key: "DEMO" });
+  work.setLead(p.id, { mode: "on_demand", duties: { bugs: false } as never });
+  (runtime as unknown as { callAgent: unknown }).callAgent = async () => ({ taskId: "x", status: "completed", error: null, timedOut: false,
+    result: '{"answer":"- 三档套餐对比表","ask":["常见问题要几条，由谁提供内容？"]}' });
+  const v = await work.create({ projectId: p.id, title: "定价页改版", description: "三档套餐对比表 + 常见问题。", assignee: "writer" });
+  await until(() => { const i = work.list().find((x) => x.key === v.key)!; return !!i.blocked && !i.leadDeciding && i.blocked.length === 1; });
+  assert.deepEqual(work.list().find((x) => x.key === v.key)!.blocked, ["常见问题要几条，由谁提供内容？"]);
+  assert.ok(notify.list().some((n) => n.kind === "confirm"));
+  assert.ok(work.attention().some((a) => a.kind === "confirm" && a.issue.key === v.key));
+  work.confirmRequirement(v.key, "常见问题 6 条，运营提供");
+  await until(() => work.list().find((i) => i.key === v.key)!.status === "in_review");
+  const d = work.list().find((x) => x.key === v.key)!.description;
+  assert.match(d, /三档套餐对比表/);
+  assert.match(d, /运营提供/);
+});

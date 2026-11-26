@@ -79,6 +79,13 @@ export class CliRunner implements CliExecutor {
   private store: Store | null = null;
   /** 任务所属工作项的编号（测试任务取被测工作项）：注入 HUB_ISSUE_KEY，方便项目按工作项隔离测试库、端口等 */
   private issueKeyFor: (task: Task) => string | null;
+  /**
+   * 这次运行用哪个会话：同一张单同一轮固定一个会话 ID。resume = 之前用这个会话跑过（被中断了），
+   * 这次带着原来的对话接着跑，而不是从头再来。返回 null 表示不管理会话。
+   */
+  sessionFor: ((task: Task) => { id: string; resume: boolean } | null) | null = null;
+  /** 会话里已经有内容了（之后中断可以恢复） */
+  onSessionStarted: ((task: Task, id: string) => void) | null = null;
   constructor(settings: Settings, opts: { tmpDir: string; hubUrl: () => string; cwdFor: (task: Task) => string | null; store?: Store; taskToken?: (taskId: string) => string; issueKeyFor?: (task: Task) => string | null }) {
     this.issueKeyFor = opts.issueKeyFor ?? (() => null);
     this.taskToken = opts.taskToken ?? null;
@@ -167,7 +174,15 @@ export class CliRunner implements CliExecutor {
     if (agent.runtime === "gemini") restoreFiles.push(placeHubFile(cwd, ".gemini/settings.json", mcp));
     // pi：读项目里的 .pi/mcp.json，需要 -a（信任本次运行的项目文件）才会加载。
     // 注意 pi 的 timeout 单位是秒（默认 60 秒，report_phase 等测试会超时）；按毫秒填会让定时器溢出、连接立刻失败
-    if (agent.runtime === "pi") restoreFiles.push(placeHubFile(cwd, ".pi/mcp.json", { mcpServers: { hub: { ...mcp.mcpServers.hub, timeout: Math.floor(HUB_TOOL_TIMEOUT_MS / 1000) } } }));
+    if (agent.runtime === "pi") {
+      // .pi/ 里的文件含任务令牌、只为这次运行存在：从 git 排除，免得智能体自己 git add -A 时提交进去
+      this.excludeFromGit(cwd, ".pi/");
+      restoreFiles.push(placeHubFile(cwd, ".pi/mcp.json", { mcpServers: { hub: { ...mcp.mcpServers.hub, timeout: Math.floor(HUB_TOOL_TIMEOUT_MS / 1000) } } }));
+      // 模型网关会一阵一阵地连不上（几十秒），pi 默认重试 3 次、约 14 秒内就用完了。
+      // 这次运行把重试放宽到 8 次、退避 3 秒起（最长等约 4 分钟），与工作目录原有的 pi 项目设置合并
+      const own = (() => { try { return JSON.parse(readFileSync(join(cwd, ".pi/settings.json"), "utf8")); } catch { return {}; } })();
+      restoreFiles.push(placeHubFile(cwd, ".pi/settings.json", { ...own, retry: { ...(own.retry ?? {}), enabled: true, maxRetries: 8, baseDelayMs: 3000, provider: { ...(own.retry?.provider ?? {}), maxRetryDelayMs: 60_000 } } }));
+    }
     // Claude Code 原生技能：写进工作目录的 .claude/skills，并从 git 排除，运行结束再清理
     const skillsDir = agent.runtime === "claude-code" ? this.writeSkills(agent, cwd) : null;
 
@@ -190,19 +205,32 @@ export class CliRunner implements CliExecutor {
     // 模型留空时去掉 --model / -m 参数
     if (!agent.cliModel) args = args.filter((a, i) => !(a === "{model}" || (["--model", "-m"].includes(a) && args[i + 1] === "{model}")));
     args = args.map((a) => a.replace(/\{(prompt|system|model|mcp_config)\}/g, (_, k) => vars[k] ?? ""));
+    // 会话：pi 用 --session-id（有就续、没有就建）；Claude Code 首次 --session-id、续跑 --resume
+    const sess = this.sessionFor?.(task) ?? null;
+    let sessMarked = false;
+    if (sess && !args.some((a) => ["--session-id", "--resume", "-r", "--session", "--continue", "-c", "--no-session-persistence", "--no-session"].includes(a))) {
+      if (agent.runtime === "pi") args.push("--session-id", sess.id);
+      else if (agent.runtime === "claude-code") args.push(...(sess.resume ? ["--resume", sess.id] : ["--session-id", sess.id]));
+    }
     // pi 不信任项目文件时不会读 .pi/mcp.json，Hub 工具就接不上：老模板里没有 -a 的补上
     if (agent.runtime === "pi" && !args.some((a) => a === "-a" || a === "--approve")) args.splice(1, 0, "-a");
     const [cmd, ...rest] = args;
 
     const transcript: BetaMessageParam[] = [{ role: "user", content: task.input }];
     let result = "", cost: number | undefined, inTok = 0, outTok = 0, lastText = "", raw = "", stderr = "";
+    /** pi 最近一次模型请求的错误；后续有成功的回复就清掉 */
+    let piError: string | null = null;
     const onLine = (line: string) => {
       ctx.heartbeat();
       raw = (raw + line + "\n").slice(-20000);
       let ev: any;
       try { ev = JSON.parse(line); } catch { return; }
       const before = transcript.length;
-      try { handle(ev); } finally { if (transcript.length !== before) ctx.progress?.(transcript); }
+      try { handle(ev); } finally {
+        if (transcript.length !== before) ctx.progress?.(transcript);
+        // 智能体说过话了，会话里就有内容可恢复
+        if (sess && !sessMarked && transcript.some((m) => m.role === "assistant")) { sessMarked = true; this.onSessionStarted?.(task, sess.id); }
+      }
     };
     const handle = (ev: any) => {
       // Claude Code stream-json
@@ -233,12 +261,19 @@ export class CliRunner implements CliExecutor {
           inTok += (u.input ?? 0) + (u.cacheRead ?? 0);
           outTok += u.output ?? 0;
           if (typeof u.cost?.total === "number") cost = (cost ?? 0) + u.cost.total;
-          if (m.stopReason === "error" || m.errorMessage) throw new Error(String(m.errorMessage ?? "pi 返回错误"));
+          // pi 在一次模型请求失败后会自动重试（auto_retry_start / auto_retry_end，默认 3 次）。
+          // 这里不能一看到失败就中止，否则会抢在 pi 自己的重试之前把进程杀掉：只记下来，等最终结果再判
+          if (m.stopReason === "error" || m.errorMessage) piError = String(m.errorMessage ?? "pi 返回错误");
+          else piError = null;
         } else {
           const text = (Array.isArray(m.content) ? m.content : []).map((b: any) => b.text ?? "").join("\n");
           transcript.push({ role: "user", content: [{ type: "tool_result", tool_use_id: String(m.toolCallId), content: text.slice(0, 4000) }] as never });
         }
+      } else if (ev.type === "auto_retry_end") {
+        // 重试用尽仍失败才算失败
+        if (ev.success === false) throw new Error(String(ev.finalError ?? piError ?? "pi 重试后仍失败"));
       } else if (ev.type === "agent_end") {
+        if (piError) throw new Error(piError);
         result = lastText;
       } else {
         // 其他 CLI：尽量提取文本
@@ -276,6 +311,8 @@ export class CliRunner implements CliExecutor {
       if (skillsDir) this.cleanSkills(agent, cwd); // 技能目录只在那次运行期间存在
       for (const r of restoreFiles) r();
     }
+    // pi 正常退出但最后一次请求仍是失败（没走到 agent_end）：按失败处理，交给 Hub 的网络重试
+    if (piError && !result) throw new Error(piError);
     const final = result || lastText || raw.trim().split("\n").slice(-20).join("\n");
     if (transcript.length === 1) transcript.push({ role: "assistant", content: [{ type: "text", text: final }] });
     return { result: final, cost, inputTokens: inTok, outputTokens: outTok, transcript };
