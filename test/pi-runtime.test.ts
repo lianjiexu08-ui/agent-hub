@@ -80,3 +80,32 @@ test("工作目录里原本就有 .pi/mcp.json：运行期间替换，结束后�
   restore();
   assert.equal(readFileSync(join(cwd, ".pi/mcp.json"), "utf8"), '{"mcpServers":{"mine":{}}}');
 });
+
+/** 用假 pi 跑一次，返回结果或错误 */
+async function runFakePi(lines: object[]) {
+  const root = mkdtempSync(join(tmpdir(), "hub-pi-retry-"));
+  const bin = join(root, "bin"); const cwd = join(root, "wt");
+  mkdirSync(bin); mkdirSync(cwd);
+  writeFileSync(join(bin, "pi"), `#!/usr/bin/env node\nfor (const e of ${JSON.stringify(lines)}) console.log(JSON.stringify(e));\n`);
+  chmodSync(join(bin, "pi"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  try {
+    const runner = new CliRunner(new Settings(new Store(":memory:")), { tmpDir: join(root, "tmp"), hubUrl: () => "http://127.0.0.1:1", cwdFor: () => cwd, taskToken: (id) => `tok-${id}` });
+    const agent = AgentSchema.parse({ name: "backend-dev", description: "d", runtime: "pi", cliModel: "x/y" });
+    return await runner.run({ id: "t-retry", agent: "backend-dev", input: "做" } as unknown as Task, agent, { system: "s", signal: new AbortController().signal, heartbeat: () => {} });
+  } finally { process.env.PATH = oldPath; }
+}
+const TIMEOUT = "Request timed out.: Connect Timeout Error (attempted address: console.cloudrouter.online:443, timeout: 10000ms) (UND_ERR_CONNECT_TIMEOUT)";
+const failed = { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: TIMEOUT, usage: {} } };
+const ok = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "完成" }], stopReason: "stop", usage: { input: 1, output: 1 } } };
+
+test("pi 一次请求超时后自己重试成功：Hub 不能抢先中止，运行照常完成", async () => {
+  const out = await runFakePi([failed, { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: TIMEOUT }, ok, { type: "auto_retry_end", success: true, attempt: 1 }, { type: "agent_end", messages: [] }]);
+  assert.equal(out.result, "完成");
+});
+
+test("pi 重试用尽仍失败：按失败处理，错误原样带出（交给 Hub 的网络重试）", async () => {
+  await assert.rejects(runFakePi([failed, { type: "auto_retry_start", attempt: 1 }, failed, { type: "auto_retry_end", success: false, attempt: 3, finalError: TIMEOUT }]), /Connect Timeout/);
+  await assert.rejects(runFakePi([failed, { type: "agent_end", messages: [] }]), /Connect Timeout/);
+});

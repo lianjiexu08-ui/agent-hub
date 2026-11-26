@@ -5,7 +5,8 @@ import type { Store } from "./db.ts";
 import type { Uploads } from "./uploads.ts";
 import { authRequired, checkPassword, clearedCookie, cookieOf, isCrossSite, issueSession, LoginThrottle, loginEnabled, loginUser, sessionCookie, sessionSecret, TASK_TOKEN_HEADER, verifySession, verifyTaskToken, type Security } from "./auth.ts";
 import type { Runtime } from "./runtime.ts";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { virtualSessions } from "./assistant-cli.ts";
 import { detectRuntimeModels, detectRuntimes, verifyRuntimeModels } from "./runtimes.ts";
 import { AgentSchema, McpServerSchema, ToolSchema, type HubEvent } from "./types.ts";
@@ -26,7 +27,7 @@ const SubmitTask = z.object({
 
 const Publish = z.object({ content: z.string().min(1), sender: z.string().default("user") });
 
-export interface AppExtras { state(): Promise<unknown>; rpc(method: string, args: unknown[]): Promise<unknown>; uploads?: Uploads }
+export interface AppExtras { state(): Promise<unknown>; rpc(method: string, args: unknown[]): Promise<unknown>; uploads?: Uploads; /** 验收截图目录 */ shotDir?: string }
 
 export function createApp(store: Store, runtime: Runtime, security?: Security, extras?: AppExtras) {
   const app = new Hono();
@@ -137,6 +138,14 @@ export function createApp(store: Store, runtime: Runtime, security?: Security, e
     return c.json({ attachments: saved }, 201);
   });
   /** 读取附件（图片按原 mime 返回，其它按下载） */
+  // 验收截图：文件名只允许截图命名规则里的字符，防止路径穿越
+  app.get("/qa-shots/:file", (c) => {
+    const f = c.req.param("file");
+    if (!extras?.shotDir || !/^[\w.-]+\.png$/.test(f)) return c.notFound();
+    const path = join(extras.shotDir, f);
+    if (!existsSync(path)) return c.notFound();
+    return c.newResponse(new Uint8Array(readFileSync(path)), 200, { "content-type": "image/png", "cache-control": "private, max-age=86400" });
+  });
   app.get("/uploads/:id", (c) => {
     if (!extras) return c.notFound();
     const got = extras.uploads!.read(c.req.param("id"));

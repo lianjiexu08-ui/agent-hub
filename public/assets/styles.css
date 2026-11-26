@@ -766,3 +766,12 @@ select, textarea, input { border-radius: 8px; padding: 7px 10px; }
 /* 验证不通过的模型：仍然可选，但要一眼看出来调不通 */
 .chip.bad { border-color: color-mix(in srgb, var(--failed) 45%, var(--border)); color: var(--failed); opacity: .85; }
 .chip.bad.on { background: color-mix(in srgb, var(--failed) 12%, transparent); }
+
+/* 服务器目录选择器 */
+.dirpick { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.dirpick-path { font-size: 13px; padding: 6px 2px; word-break: break-all; }
+.dirpick-list { max-height: 360px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }
+.dirpick-row { display: flex; align-items: center; gap: 8px; padding: 7px 12px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--border); }
+.dirpick-row:last-child { border-bottom: none; }
+.dirpick-row:hover { background: var(--hover); }
+.dirpick-row .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -16,6 +16,7 @@ import { detectRuntimes } from "./runtimes.ts";
 import { PRESETS } from "./providers.ts";
 
 import type { Uploads } from "./uploads.ts";
+import { listDirs } from "./fsbrowse.ts";
 export interface Services {
   uploads?: Uploads;
   store: Store; runtime: Runtime; settings: Settings; notifier: Notifier; work: Work; qa: QA; automation: Automation; assistant: Assistant; simulate: boolean; /** 热重载：重新读配置并重新检测运行底座 */ reload?: () => Promise<unknown>; /** 进程级重启：拉起新进程后退出；idle = 等运行中的工作项结束再重启 */ restart?: (mode?: "now" | "idle") => unknown; cancelRestart?: () => unknown; restartState?: () => unknown }
@@ -93,6 +94,7 @@ export function buildApi(s: Services) {
     "work.disconnectLinear": (id) => work.disconnectLinear(id),
     "work.syncLinear": (id) => work.syncLinear(id),
     "work.linearMembers": (id) => work.linearMembers(id),
+    "work.linearMe": () => work.linearMe(),
     "work.diskUsage": () => work.diskUsage(),
     "work.cleanWorkspaces": () => work.cleanWorkspaces(),
     "work.receipt": (id) => store.docGet("receipts", id),
@@ -119,6 +121,7 @@ export function buildApi(s: Services) {
     "settings.listProviderModels": (id) => settings.listProviderModels(id),
     "settings.setAssistantModel": (m) => settings.patch({ assistantModel: m ?? "" }),
     "assistant.draftProject": (brief) => assistant.draftProject(String(brief ?? "")),
+    "fs.listDirs": (path) => listDirs(typeof path === "string" ? path : undefined),
     "assistant.draftSkill": (input) => assistant.draftSkill((input ?? {}) as { text?: string; url?: string }),
     "settings.removeProvider": (id) => settings.removeProvider(id),
     "settings.saveModel": (m) => settings.saveModel(m),

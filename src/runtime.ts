@@ -17,6 +17,7 @@ import { costOf } from "./pricing.ts";
 import { priorityRank } from "./priority.ts";
 import { PrioritySlots } from "./slots.ts";
 import { builtinReceipt, recordReceipt } from "./receipt.ts";
+import { backoffMs, isTransientError, sleep } from "./transient.ts";
 
 /** 非内置运行底座（Claude Code 等 CLI）的执行器 */
 export interface CliExecutor {
@@ -196,6 +197,20 @@ export class Runtime {
     return { taskId: task.id, status: done.status, result: done.result ?? null, error: done.error ?? null, timedOut };
   }
 
+  /** 模型调用遇到网络抖动时退避重试，最多约 7 分钟；其他错误原样抛出 */
+  private async createWithRetry<T>(taskId: string, fn: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    for (let n = 0; ; n++) {
+      try { return await fn(); }
+      catch (e) {
+        if (signal.aborted || n >= 6 || !isTransientError(e)) throw e;
+        const wait = backoffMs(n) * 1000;
+        console.warn(`[task] ${taskId.slice(0, 8)} 模型调用网络异常（${String((e as Error).message ?? e).slice(0, 80)}），${wait / 1000} 秒后第 ${n + 1} 次重试`);
+        this.touch(taskId);
+        await sleep(wait, signal);
+      }
+    }
+  }
+
   /** 等待任务结束（completed / failed / cancelled） */
   waitFor(id: string, timeoutMs?: number): Promise<Task> {
     const current = this.store.getTask(id);
@@ -353,7 +368,8 @@ export class Runtime {
 
         // 排队等模型槽位、以及长时间的模型调用期间每 30 秒更新心跳，避免被哨兵误判为卡住
         const beat = setInterval(() => this.touch(id), 30_000);
-        const response = await this.sem.run(() =>
+        // 网络抖动（连接超时、5xx、限流、过载）就地重试，不让整次运行失败——对话进度都在内存里，失败就白跑了
+        const response = await this.sem.run(() => this.createWithRetry(id, () =>
           this.llm.create(
             {
               model: agent.model,
@@ -368,7 +384,7 @@ export class Runtime {
               fallbacks: "default",
             },
             { signal: controller.signal },
-          ), task.priority, controller.signal).finally(() => clearInterval(beat));
+          ), controller.signal), task.priority, controller.signal).finally(() => clearInterval(beat));
 
         inputTokens +=
           response.usage.input_tokens +

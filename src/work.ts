@@ -20,6 +20,7 @@ import type { Settings } from "./settings.ts";
 import type { CiStatus, GitHub } from "./github.ts";
 import { pickState, statusForStateType, type Linear, type LinearState } from "./linear.ts";
 import type { Workspace } from "./workspace.ts";
+import { backoffMs, isTransientError } from "./transient.ts";
 
 export const PHASES = ["understand", "plan", "do", "test", "review"] as const;
 export type Phase = (typeof PHASES)[number];
@@ -33,7 +34,7 @@ const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 const now = () => new Date().toISOString();
 
 export interface PhaseRec { cycle: number; phase: Phase; result: "active" | "pass" | "fail" | "blocked" | "cancelled"; note: string; startedAt: string; endedAt: string | null; qaRun?: string }
-export interface PR { number: number; branch: string; state: "open" | "merged" | "closed" | "reverted"; checks: "pending" | "passing" | "failing"; tests: string | null; additions: number; deletions: number; /** GitHub 上的真实 CI 结果（PR 最新提交） */ ci?: CiStatus | null; /** 锁文件等生成文件的改动（不计入 additions / deletions） */ generated?: { files: number; lines: number }; files: number; reviewed?: boolean; guard?: string | null; mergedAt?: string; revert?: number; simulated?: boolean }
+export interface PR { number: number; branch: string; state: "open" | "merged" | "closed" | "reverted"; checks: "pending" | "passing" | "failing"; tests: string | null; additions: number; deletions: number; /** GitHub 上的真实 CI 结果（PR 最新提交） */ ci?: CiStatus | null; /** 锁文件等生成文件的改动（不计入 additions / deletions） */ generated?: { files: number; lines: number }; files: number; reviewed?: boolean; guard?: string | null; mergedAt?: string; revert?: number; simulated?: boolean; /** 交付方式为 local / branch 时没有 GitHub PR，number 为 0 */ local?: "local" | "branch" }
 export interface Issue {
   id: number; projectId: string; number: number; title: string; description: string; status: string; priority: number;
   assignee: string | null; labels: string[]; parentId: number | null; createdBy: string; createdAt: string; updatedAt: string;
@@ -43,6 +44,9 @@ export interface Issue {
     /** 自动执行记录：claimed = 当前的智能体指派来自自动执行；fired = 本次进入范围已触发过（离开范围后清零）；warned = 运行中离开范围已提示过 */
     auto?: { claimed?: boolean; fired?: boolean; warned?: boolean } } | null;
   pr: PR | null; phases: PhaseRec[]; cycle: number; phase: Phase | null;
+  /** 因网络抖动自动续跑的次数（成功一次即清零） */ netRetries?: number;
+  /** 项目负责人正在代为确认需求（此时还不需要人处理） */ leadDeciding?: boolean;
+  /** 项目负责人已确定的部分需求，人回答剩余问题时合并进去 */ leadDraft?: string | null;
   blocked: string[] | null; reqConfirmed?: boolean; budgetHold?: boolean; lifecycleDone?: boolean;
   /** 依赖的工作项 id：全部完成（或 PR 已合并）后才会开始执行 */
   dependsOn?: number[];
@@ -64,7 +68,9 @@ export interface Lead { agent: string; mode: "off" | "on_demand" | "autopilot"; 
 export interface LinearBinding {
   teamId: string; teamKey: string; teamName: string;
   mode: "two_way" | "import" | "push" | "off";
-  importScope: "all" | "label"; importLabel: string;
+  /** assignee = 只导入指派给 importAssignees 里任一成员的 issue（Linear 侧的指派人） */
+  importScope: "all" | "label" | "assignee"; importLabel: string;
+  importAssignees?: { id: string; name: string }[];
   pushNew: boolean; postDeliverable: boolean;
   lastSyncAt: string | null; pendingRemote: number;
   /** 自动执行范围：哪些 Linear issue 不用人指派就交给智能体。缺省 = 不自动 */
@@ -77,6 +83,15 @@ export interface LinearBinding {
    */
   localStatus?: string;
 }
+/**
+ * 交付策略。
+ * - baseBranch：开发基线，也是合并目标。worktree 从它拉分支，冲突时与它合并。留空用仓库默认分支
+ * - mode：pr = 推分支并开 PR 到 baseBranch；branch = 只推分支不开 PR；local = 不碰远端，合并进本机仓库 localPath 的 baseBranch
+ * - localPath：mode=local 时本机仓库目录（例如本地起着 nuxt dev 的那份代码，合进去即热加载）
+ * - afterMerge：本地合并后在 localPath 执行的命令（可选，例如重启服务）
+ * 提测与发版永远由人完成，Hub 不触发。
+ */
+export interface Delivery { baseBranch: string; mode: "pr" | "branch" | "local"; localPath: string; afterMerge: string }
 export interface Project {
   id: string; name: string; key: string; description: string; createdAt: string; nextNumber: number;
   repo: { fullName: string; defaultBranch?: string } | null;
@@ -89,6 +104,8 @@ export interface Project {
   lastSyncAt: string | null; pendingRemote: number; lead: Lead;
   /** previewCmd：在工作项 worktree 里启动本分支预览的命令（拿到 PREVIEW_PORT / PREVIEW_API_PORT / HUB_ISSUE_SLUG），用于浏览器验收 */
   env: { baseUrl: string; preview: string; accounts: string[]; previewCmd?: string };
+  /** 交付策略：改完的代码合到哪、怎么合。不同项目流程不同（有的开 PR 进主干，有的只合本地 dev 再人工提测） */
+  delivery?: Delivery;
   /** 演示模式下模拟的远端 issue */
   simRemote?: { number: number; title: string; body: string; labels: string[] }[];
   simGhNext?: number;
@@ -132,10 +149,18 @@ export function remoteStatusOf(st?: { type?: string; name?: string } | null): "b
 }
 
 const sinceFor = (iso: string | null | undefined) => (iso ? new Date(new Date(iso).getTime() - 120_000).toISOString() : null);
+/** 项目的交付策略（老项目没有这个字段：等同于开 PR 到仓库默认分支） */
+export function deliveryOf(p: Pick<Project, "repo" | "delivery">): Delivery {
+  return { baseBranch: "", mode: "pr", localPath: "", afterMerge: "", ...(p.delivery ?? {}) };
+}
+/** 基线分支：交付策略里填的优先，否则仓库默认分支 */
+export function baseOf(p: Pick<Project, "repo" | "delivery"> | undefined): string {
+  return (p && deliveryOf(p).baseBranch) || p?.repo?.defaultBranch || "main";
+}
 const defaultLead = (mode: Lead["mode"] = "off"): Lead => ({ agent: "project-lead", mode, duties: { flow: true, review: true, bugs: true, testing: true }, mergePolicy: "auto", dailyRuns: 20, runsToday: 0, activity: [] });
 
 export interface QAPort {
-  enqueue(issue: ReturnType<Work["view"]>, trigger: string): string;
+  enqueue(issue: ReturnType<Work["view"]>, trigger: string, opts?: { web?: boolean }): string;
   wait(runId: string, signal?: AbortSignal): Promise<{ passed: boolean; note: string; cases: number }>;
   runsFor(key: string): { id: string; status: string; cases: { status: string | null }[] }[];
 }
@@ -256,7 +281,7 @@ export class Work {
       descriptionTruncated: !full && body.length > 600,
       descriptionLength: body.length,
       github: i.github && p?.repo ? { ...i.github, url: `https://github.com/${p.repo.fullName}/issues/${i.github.number}`, repo: p.repo.fullName } : null,
-      pr: i.pr && p?.repo ? { ...i.pr, url: `https://github.com/${p.repo.fullName}/pull/${i.pr.number}` } : i.pr,
+      pr: i.pr && p?.repo && !i.pr.local ? { ...i.pr, url: `https://github.com/${p.repo.fullName}/pull/${i.pr.number}` } : i.pr,
       comments: this.comments(i.id).filter((c) => c.kind !== "system").length,
       runs: runs.length, activeRuns: runs.filter((r) => !TERMINAL.has(r.status)).length, failStreak: this.failStreak(i, runs),
       /** 运行已提交但还在等并发槽位 */
@@ -278,7 +303,7 @@ export class Work {
       return { ...p, simRemote: undefined, counts: { total: its.length, open: its.filter((i) => !["done", "canceled"].includes(i.status)).length, inProgress: its.filter((i) => i.status === "in_progress").length, review: its.filter((i) => i.status === "in_review").length } };
     });
   }
-  saveProject(input: { name: string; key: string; description?: string; sync?: Partial<Project["sync"]>; linear?: Partial<LinearBinding> | null; env?: Partial<Project["env"]> }, origId?: string): Project {
+  saveProject(input: { name: string; key: string; description?: string; sync?: Partial<Project["sync"]>; linear?: Partial<LinearBinding> | null; env?: Partial<Project["env"]>; delivery?: Partial<Delivery> }, origId?: string): Project {
     const key = String(input.key ?? "").trim().toUpperCase();
     if (!input.name?.trim()) throw new WorkError("项目名称不能为空");
     if (!/^[A-Z][A-Z0-9]{1,5}$/.test(key)) throw new WorkError("前缀为 2–6 位大写字母或数字，且以字母开头");
@@ -290,6 +315,14 @@ export class Work {
     p.description = input.description ?? p.description;
     if (input.sync) p.sync = { ...p.sync, ...input.sync };
     if (input.env) p.env = { ...p.env, ...input.env };
+    if (input.delivery) {
+      const d = { ...deliveryOf(p), ...input.delivery };
+      d.baseBranch = String(d.baseBranch ?? "").trim();
+      if (d.baseBranch && !/^[\w./-]+$/.test(d.baseBranch)) throw new WorkError("基线分支名不合法");
+      d.localPath = String(d.localPath ?? "").trim();
+      if (d.mode === "local" && !d.localPath) throw new WorkError("本地合并需要填写本机仓库目录");
+      p.delivery = d;
+    }
     if (input.linear !== undefined) {
       p.linear = input.linear === null ? null : { ...(p.linear ?? defaultLinear({ id: "", key: "", name: "" })), ...input.linear };
       if (p.linear?.autoRun) p.linear.autoRun = normalizeAutoRun(p.linear.autoRun);
@@ -533,6 +566,42 @@ export class Work {
    * 远端（GitHub / Linear）改了状态时更新工作项：不回推、不触发合并；
    * 离开「进行中」会停止当前运行，回到「待办」且已指派时会重新开始执行。
    */
+  /**
+   * 待审核但不需要人在 Hub 里处理：等的是人工提测，结果以 Linear 为准（Done = 完成，打回 = 退回智能体）。
+   * - 本地交付、已合并到本地开发分支的（页面验收由 Hub 自动排队）
+   * - 来源是 Linear、并非经 Hub 交付的单（本来就在 Linear 的 In Review 里）
+   */
+  private waitsForTesting(i: Issue): boolean {
+    const p = this.proj(i.projectId);
+    if (!p) return false;
+    if (i.pr?.local === "local" && i.pr.state === "merged") return true;
+    return this.sourceOf(p) === "linear" && !!i.linear && !i.pr;
+  }
+
+  /** 提测不通过被打回：带上 Linear 上的最新反馈，退回给原智能体在原分支上修，修完照常重新交付 */
+  private async bounceBack(id: number, why: string) {
+    const i = this.getIssue(id);
+    if (!i?.assignee) return;
+    let feedback = "";
+    if (i.linear && this.linear.available()) {
+      const since = i.linear.syncedAt ? Date.parse(i.linear.syncedAt) - 7 * 86400_000 : 0;
+      const cs = await this.linear.recentComments(i.linear.id).catch(() => []);
+      // 只要人写的反馈：Hub 自己回写的交付评论不算
+      const human = cs.filter((c) => Date.parse(c.createdAt) >= since && !/交付：\*\*|^\*\*\S+ 交付/.test(c.body)).slice(-5);
+      feedback = human.map((c) => `[${c.user}] ${c.body.slice(0, 1500)}`).join("\n\n");
+    }
+    const cur = this.getIssue(id)!;
+    if (cur.pr?.state === "merged") cur.pr.state = "open"; // 修复的新提交会再合一次
+    cur.status = "todo";
+    cur.lifecycleDone = false;
+    cur.resumeFrom = "do";
+    cur.linear = cur.linear ? { ...cur.linear, localStatus: "todo" } : cur.linear;
+    this.save(cur);
+    this.addComment(cur.id, "lead", "lead", `提测未通过（${why}）。${feedback ? `提测反馈：\n${feedback}` : "Linear 上没有找到文字反馈，请先复查验收标准与截图，必要时在讨论里问清楚。"}\n\n请在原分支上修复，修好后照常提交，会重新测试、合并并做页面验收。`);
+    this.emit("issue");
+    void this.startRun(this.getIssue(id)!, "提测打回");
+  }
+
   private applyRemoteStatus(i: Issue, to: string, why: string) {
     const before = i.status;
     if (before === to) { this.save(i); return; }
@@ -719,6 +788,10 @@ export class Work {
   }
 
   /** 可选的 Linear 成员：团队成员 + 已导入 issue 上出现过的指派人（API 不可用时只返回后者） */
+  /** 当前连接 Linear 用的账号，用于「只导入指派给我的」 */
+  async linearMe(): Promise<{ id: string; name: string; email: string } | null> {
+    return this.linear.available() ? this.linear.viewer().catch(() => null) : null;
+  }
   async linearMembers(id: string): Promise<{ id: string; name: string }[]> {
     const p = this.proj(id);
     if (!p?.linear) return [];
@@ -776,6 +849,15 @@ export class Work {
         const closed = r.state?.type === "completed" || r.state?.type === "canceled";
         i.linear = { ...i.linear, stateId: r.state?.id, priority: r.priority ?? 0, state: closed ? "closed" : "open", localStatus: i.status, syncedAt: now(), creator: remoteCreator, assignee: remoteAssignee };
         let to = stateChanged ? remoteStatus : null;
+        // 提测打回：Hub 交付过（有智能体、走完了生命周期）的单在待审核，Linear 上被改回 Todo / In Progress
+        // → 按提测反馈退回给原智能体修，而不是只改个状态
+        if (to && ["todo", "in_progress"].includes(to) && i.status === "in_review" && i.assignee && i.lifecycleDone) {
+          this.save(i);
+          void this.bounceBack(i.id, `Linear ${r.identifier} 被改回「${r.state.name}」`);
+          touched.add(i.id);
+          pulled++;
+          continue;
+        }
         // 远端回到未开始，但本地正在执行 / 待审核：保留本地进度，不打断
         if (to && ["backlog", "todo"].includes(to) && ["in_progress", "in_review"].includes(i.status)) to = null;
         if (to && to !== i.status) this.applyRemoteStatus(i, to, `Linear ${r.identifier} 变为「${r.state.name}」${notes.length ? `，${notes.join("，")}` : ""}`);
@@ -790,6 +872,7 @@ export class Work {
         if (r.state?.type === "completed" || r.state?.type === "canceled") continue;
         if (mine.some((i) => i.linear?.id === r.id)) continue;
         if (cfg.importScope === "label" && !r.labels.includes(cfg.importLabel)) { skipped++; continue; }
+        if (cfg.importScope === "assignee" && !(cfg.importAssignees ?? []).some((a) => a.id === r.assignee?.id)) { skipped++; continue; }
         // 导入时必须按远端状态映射本地状态：否则本地默认「待规划」，
         // 紧接着的回推会把 Linear 上原本 Todo / In Progress 的 issue 覆盖成 Backlog。
         const mapped = remoteStatusOf(r.state) ?? "backlog";
@@ -877,8 +960,11 @@ export class Work {
   setLead(id: string, patch: Partial<Lead>) {
     const p = this.proj(id)!;
     const before = p.lead.mode;
+    const beforeMerge = p.lead.mergePolicy;
     p.lead = { ...p.lead, ...patch, duties: { ...p.lead.duties, ...(patch.duties ?? {}) } };
     if (patch.mode && patch.mode !== before) this.leadLog(p, `工作模式：${{ off: "关闭", on_demand: "按需", autopilot: "持续迭代" }[patch.mode]}`);
+    // 合并方式决定改动会不会不经人确认就进开发分支，改动必须留痕
+    if (patch.mergePolicy && patch.mergePolicy !== beforeMerge) this.leadLog(p, `合并方式：${patch.mergePolicy === "manual" ? "手动" : "自动"}`);
     this.saveProj(p);
     this.emit("project");
   }
@@ -1069,18 +1155,83 @@ export class Work {
     for (const i of this.issues().filter((x) => !projectId || x.projectId === projectId)) {
       const v = this.view(i);
       const leadOff = this.proj(i.projectId)?.lead.mode === "off";
+      if (i.blocked && i.leadDeciding) continue; // 项目负责人正在代为确认
       if (i.blocked) out.push({ kind: "confirm", issue: v, text: `需求待确认：${i.blocked.length} 个问题` });
       else if (this.waitingCi.has(i.id)) continue; // Hub 在等 CI，结果出来后自动审核、合并或拦下，不需要人操作
-      else if (i.status === "in_review") out.push({ kind: "review", issue: v, text: i.pr?.guard && i.pr.state === "open" ? `安全护栏拦截：${i.pr.guard}` : i.pr?.state === "merged" ? `最终验收（PR #${i.pr.number} 已由 AI 合并）` : i.pr?.state === "open" ? `验收并合并 PR #${i.pr.number}` : "最终验收" });
+      else if (i.status === "in_review" && this.waitsForTesting(i)) continue;
+      else if (i.status === "in_review") out.push({ kind: "review", issue: v, text: i.pr?.local === "local" ? (i.pr.state === "merged" ? "已合并到本地，等你提测" : "验收后合并到本地") : i.pr?.local === "branch" ? `分支 ${i.pr.branch} 已推送，最终验收` : i.pr?.guard && i.pr.state === "open" ? `安全护栏拦截：${i.pr.guard}` : i.pr?.state === "merged" ? `最终验收（PR #${i.pr.number} 已由 AI 合并）` : i.pr?.state === "open" ? `验收并合并 PR #${i.pr.number}` : "最终验收" });
       else if (leadOff && i.status === "todo" && v.lastRun?.status === "failed") out.push({ kind: "failed", issue: v, text: "运行失败（项目负责人已关闭，需要你处理）" });
     }
     return out.sort((a, b) => priorityRank(a.issue.priority) - priorityRank(b.issue.priority));
   }
 
-  confirmRequirement(ref: string | number, answer: string) {
+  /**
+   * 需求待确认时先问项目负责人：给它需求描述、项目知识、已有讨论，让它逐条回答。
+   * 有把握的直接代为确认、开发继续；拿不准的整理成更具体的问题再交给人。负责人关闭或调用失败时直接交给人。
+   */
+  private async leadConfirm(id: number, questions: string[], asker: string) {
+    const i = this.getIssue(id);
+    if (!i) return;
+    const p = this.proj(i.projectId)!;
+    const L = p.lead;
+    const key = this.key(i);
+    const toHuman = (qs: string[], why?: string) => {
+      const cur = this.getIssue(id);
+      if (!cur?.blocked) return;
+      cur.blocked = qs;
+      cur.leadDeciding = false;
+      this.save(cur);
+      if (why) this.addComment(cur.id, L.agent, "lead", why);
+      this.notify.push("confirm", `${key} 需求待确认`, `${cur.title}：${qs.length} 个问题需要你回答，回答后才会继续。`, key);
+      this.emit("issue");
+    };
+    if (L.mode === "off" || !this.store.getAgent(L.agent)) return toHuman(questions);
+    i.leadDeciding = true;
+    this.save(i);
+    this.addComment(i.id, L.agent, "lead", "项目负责人正在根据需求描述和项目知识回答这些问题，拿不准的再转给你。");
+    this.emit("issue");
+    const knowledge = this.settings.knowledge(p.id).filter((k) => k.on).map((k) => `- [${k.kind}] ${k.text}`).join("\n");
+    const talk = this.comments(i.id).filter((c) => c.kind === "user" || c.kind === "lead").slice(-10).map((c) => `[${c.author}] ${c.body.slice(0, 1500)}`).join("\n\n");
+    const prompt = [
+      `你是项目「${p.name}」的负责人。开发智能体 ${asker} 在开始做 ${key} 之前，认为需求不够具体，提了几个问题。`,
+      "请你代替需求方回答：能根据需求描述、项目知识、已有讨论和项目常识定下来的，直接给出明确的决定；只有涉及业务取舍、产品口径、外部系统账号或你确实无法判断的，才留给人。",
+      "不要为了让开发继续而编造需求方没表达过的业务规则。拿不准就留给人。",
+      `## 工作项\n${key}：${i.title}\n\n${i.description.slice(0, 6000)}`,
+      knowledge ? `## 项目知识（必须遵守）\n${knowledge}` : "",
+      talk ? `## 已有讨论\n${talk}` : "",
+      `## 开发提的问题\n${questions.map((x, n) => `${n + 1}. ${x}`).join("\n")}`,
+      '最后只输出一个 JSON（不要别的文字）：{"answer":"你能确定的部分，写成补充需求，含可验证的验收标准","ask":["仍需人回答的问题，写具体，不要泛泛而问"]}。全部能定时 ask 为空数组；一条都定不了时 answer 为空字符串。',
+    ].filter(Boolean).join("\n\n");
+    let out: { answer?: string; ask?: string[] } | null = null;
+    try {
+      const r = await this.runtime.callAgent(L.agent, prompt, { timeoutMs: 6 * 60_000, priority: 1 });
+      const m = (r.result ?? "").match(/\{[\s\S]*\}/);
+      out = m ? JSON.parse(m[0]) : null;
+    } catch { out = null; }
+    const cur = this.getIssue(id);
+    if (cur && !cur.blocked) { cur.leadDeciding = false; this.save(cur); }
+    if (!cur?.blocked) return; // 期间人已经回答了
+    if (!out) return toHuman(questions, "项目负责人没能给出结论，转给你确认。");
+    const answer = String(out.answer ?? "").trim();
+    const ask = (Array.isArray(out.ask) ? out.ask : []).map((x) => String(x).trim()).filter(Boolean);
+    if (answer && !ask.length) {
+      this.leadLog(p, `代为确认 ${key} 的需求，开发继续`);
+      this.confirmRequirement(cur.id, answer, L.agent);
+      return;
+    }
+    // 能定的先写进讨论，剩下的交给人；人回答时会和负责人的结论一起补进需求
+    if (answer) { this.addComment(cur.id, L.agent, "lead", `项目负责人已确定的部分：\n${answer}`); cur.leadDraft = answer; this.save(cur); }
+    toHuman(ask.length ? ask : questions, `以下 ${ask.length || questions.length} 个问题项目负责人拿不准，需要你确认。`);
+    this.leadLog(p, `${key} 的需求有 ${ask.length || questions.length} 个问题拿不准，已转给你`);
+  }
+
+  confirmRequirement(ref: string | number, answer: string, by: string = ME) {
     const i = this.find(ref);
     if (!i.blocked) return;
-    this.addComment(i.id, ME, "user", answer);
+    this.addComment(i.id, by, by === ME ? "user" : "lead", by === ME ? answer : `项目负责人代为确认需求：\n${answer}`);
+    if (by === ME && i.leadDraft) answer = `${i.leadDraft}\n\n${answer}`;
+    i.leadDraft = null;
+    i.leadDeciding = false;
     i.description = `${i.description}\n\n## 需求确认（补充）\n${answer}`.trim();
     i.blocked = null;
     i.reqConfirmed = true;
@@ -1091,7 +1242,7 @@ export class Work {
     const w = this.confirmWaiters.get(i.id);
     this.confirmWaiters.delete(i.id);
     if (w) w(answer);
-    else if (i.assignee && !this.activeRun(i.id)) void this.startRun(i, ME, { resume: true });
+    else if (i.assignee && !this.activeRun(i.id)) void this.startRun(i, by, { resume: true });
     this.emit("issue");
   }
 
@@ -1317,8 +1468,9 @@ export class Work {
         i.blocked = q.questions;
         this.save(i);
         this.addComment(i.id, task.agent, "agent", `⏸ 需求还不够具体（${q.score} 分），先确认几个问题：\n${q.questions.map((x, n) => `${n + 1}. ${x}`).join("\n")}`, task.id);
-        this.notify.push("confirm", `${key} 需求待确认`, `${i.title}：${task.agent} 提了 ${q.questions.length} 个问题，回答后才会继续。`, key);
         this.emit("issue");
+        // 先交给项目负责人：它能定的直接定，拿不准的才问人
+        void this.leadConfirm(i.id, q.questions, task.agent);
         const answer = await this.runtime.waiting(task.id, () => new Promise<string>((resolve, reject) => {
           this.confirmWaiters.set(i.id, resolve);
           signal.addEventListener("abort", () => { this.confirmWaiters.delete(i.id); reject(new Error("已取消")); }, { once: true });
@@ -1341,7 +1493,7 @@ export class Work {
         this.save(i);
         this.addComment(i.id, "system", "system", `⚠ 提交前合并最新主干时有冲突（${out.conflict.join("、")}），已退回执行阶段，由 ${task.agent} 解决`, task.id);
         this.emit("issue");
-        const base = this.proj(i.projectId)?.repo?.defaultBranch ?? "main";
+        const base = baseOf(this.proj(i.projectId));
         return `你的改动已提交到本地分支，但主干（origin/${base}）在你开发期间有了新提交，合并时这些文件冲突：\n${out.conflict.map((f) => `- ${f}`).join("\n")}\n\n请在当前工作目录执行 \`git fetch origin ${base} && git merge origin/${base}\`，逐个解决冲突（保留双方都需要的改动），提交合并结果，确认测试仍然通过后，再调用 report_phase(phase="do") 重新汇报。不要用 rebase 或强推改写主干历史。`;
       }
       const prMsg = out;
@@ -1350,7 +1502,9 @@ export class Work {
       this.emit("issue");
       if (!this.qa) { const t = i.phases.at(-1)!; t.result = "pass"; t.endedAt = now(); t.note = "未配置测试队列，跳过"; this.enterPhase(i, "review"); this.save(i); return `${prMsg ?? ""}测试队列未启用，直接进入「评审」。${PHASE_HINT.review}`; }
       const t = i.phases.at(-1)!;
-      t.qaRun = this.qa.enqueue(this.view(i), i.labels.includes("hotfix") ? "hotfix" : "lifecycle");
+      // 本地交付：测试环境就是本机开发服务，合并前它跑的还是旧代码，所以合并前只做代码层验收，页面验收放到合并之后
+      const localDelivery = deliveryOf(this.proj(i.projectId)!).mode === "local";
+      t.qaRun = this.qa.enqueue(this.view(i), i.labels.includes("hotfix") ? "hotfix" : "lifecycle", localDelivery ? { web: false } : {});
       this.save(i);
       this.emit("issue");
       const res = await this.runtime.waiting(task.id, () => this.qa!.wait(t.qaRun!, signal));
@@ -1411,10 +1565,21 @@ export class Work {
       const res = await this.workspace.commitAndPush(p, this.key(i), `${this.key(i)}: ${i.title}`);
       if (!res) return null;
       if ("conflict" in res && res.conflict) return { conflict: res.conflict };
-      const pr = i.pr?.state === "open" ? i.pr : await this.github.createPR(p.repo!.fullName, { title: `${this.key(i)}: ${i.title}`, head: res.branch, base: p.repo!.defaultBranch ?? "main", body: `${i.description}\n\n${i.github ? `Closes #${i.github.number}` : ""}` }).then((r) => ({ number: r.number, branch: res.branch, state: "open" as const, checks: "pending" as const, tests: null, additions: res.additions, deletions: res.deletions, files: res.files }));
+      const dv = deliveryOf(p);
+      const gen = res.generated.lines ? `（其中 ${res.generated.files} 个锁文件 / 生成文件共 ${res.generated.lines} 行，不计入改动行数）` : "";
+      if (dv.mode !== "pr") {
+        // 不开 PR：本地合并或只推分支。用 number=0 的占位记录，后续测试、评审、合并照常走
+        i.pr = { number: 0, branch: res.branch, state: "open", checks: "pending", tests: null, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated, local: dv.mode };
+        this.save(i);
+        this.addComment(i.id, "system", "system", dv.mode === "local"
+          ? `✓ 已提交到本地分支 ${res.branch}，+${res.additions} −${res.deletions}，${res.files} 个文件${gen}。评审通过后合并进 ${dv.localPath} 的 ${baseOf(p)}，不推远端`
+          : `↗ 已推送分支 ${res.branch}（未开 PR），+${res.additions} −${res.deletions}，${res.files} 个文件${gen}`);
+        return dv.mode === "local" ? `改动已提交到本地分支 ${res.branch}。` : `已推送分支 ${res.branch}。`;
+      }
+      const pr = i.pr?.state === "open" && !i.pr.local ? i.pr : await this.github.createPR(p.repo!.fullName, { title: `${this.key(i)}: ${i.title}`, head: res.branch, base: baseOf(p), body: `${i.description}\n\n${i.github ? `Closes #${i.github.number}` : ""}` }).then((r) => ({ number: r.number, branch: res.branch, state: "open" as const, checks: "pending" as const, tests: null, additions: res.additions, deletions: res.deletions, files: res.files }));
       i.pr = { ...pr, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated };
       this.save(i);
-      this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch}），+${res.additions} −${res.deletions}，${res.files} 个文件${res.generated.lines ? `（其中 ${res.generated.files} 个锁文件 / 生成文件共 ${res.generated.lines} 行，不计入改动行数）` : ""}`);
+      this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch} → ${baseOf(p)}），+${res.additions} −${res.deletions}，${res.files} 个文件${gen}`);
       return `已提交 PR #${i.pr.number}。`;
     }
     if (this.simulate && p.repo && (["developer", "frontend-dev", "backend-dev", "devops"].includes(task.agent) || i.labels.includes("bug")) && !i.pr) {
@@ -1435,6 +1600,7 @@ export class Work {
     this.nudges.delete(task.id);
     this.confirmWaiters.delete(i.id);
     const key = this.key(i);
+    if (task.status !== "failed") i.netRetries = 0;
     if (task.status === "completed" && i.lifecycleDone) {
       this.addComment(i.id, task.agent, "agent", task.result || "(无输出)", task.id);
       const p = this.proj(i.projectId);
@@ -1450,6 +1616,23 @@ export class Work {
       this.save(i);
       await this.syncStatusRemote(i);
       await this.afterDeliver(i);
+    } else if (task.status === "failed" && isTransientError(task.error) && (i.netRetries ?? 0) < 6 && i.assignee) {
+      // 网络抖动（连不上模型服务、5xx、限流）：不算失败，工作目录与阶段进度都保留，退避后从中断的阶段接着跑。
+      // 不改状态、不同步到 Linear / GitHub、不写「运行失败」，避免一次抖动把整张单打回待办。
+      const n = i.netRetries ?? 0;
+      const act = i.phases.findLast((r) => r.result === "active" || r.result === "blocked");
+      if (act) { act.result = "cancelled"; act.endedAt = now(); act.note = `网络异常中断：${task.error}`; i.resumeFrom = resumePoint(act.phase); }
+      i.netRetries = n + 1;
+      i.phase = null;
+      this.save(i);
+      const wait = backoffMs(n);
+      this.addComment(i.id, "system", "system", `⟳ 网络异常（${(task.error ?? "").slice(0, 80)}），${wait} 秒后从「${act ? PHASE_LABEL[act.phase] : "中断处"}」继续（第 ${n + 1} 次，进度不丢）`, task.id);
+      this.emit("issue");
+      setTimeout(() => {
+        const cur = this.getIssue(i.id);
+        if (cur && cur.status === "in_progress" && !this.activeRun(cur.id)) void this.startRun(cur, "网络重试", { resume: true }).catch(() => {});
+      }, wait * 1000);
+      return;
     } else {
       const act = i.phases.findLast((r) => r.result === "active" || r.result === "blocked");
       if (act) { act.result = task.status === "cancelled" ? "cancelled" : "fail"; act.endedAt = now(); act.note ||= task.status === "cancelled" ? "已停止" : task.error ?? ""; }
@@ -1556,7 +1739,7 @@ export class Work {
     if (by === ME) i.mergeApproved = { by, at: now() };
     if (i.pr) i.pr.guard = null; // 旧的护栏结论作废，重新交付时重新判断
     this.save(i);
-    const base = this.proj(i.projectId)?.repo?.defaultBranch ?? "main";
+    const base = baseOf(this.proj(i.projectId));
     this.addComment(i.id, by, "lead", `PR #${i.pr?.number} 与主干冲突，无法合并。请先 git merge origin/${base} 并解决冲突（保留双方需要的改动），确认测试通过后照常提交；其余工作已完成，不必重做。`);
     await this.syncStatusRemote(i).catch(() => []);
     this.emit("issue");
@@ -1569,7 +1752,8 @@ export class Work {
   /** 等 PR 最新提交的 CI 跑完（最多 timeoutMs），返回最终 / 最新的结果；查不到时返回 null（不阻塞流程） */
   private async waitCi(i: Issue, timeoutMs = 15 * 60_000, everyMs = 30_000): Promise<CiStatus | null> {
     const p = this.proj(i.projectId);
-    if (!i.pr || !p?.repo || !this.github.available()) return null;
+    // 没有 GitHub PR（本地合并 / 只推分支）就没有 PR 维度的 CI 可等
+    if (!i.pr || i.pr.local || !p?.repo || !this.github.available()) return null;
     const t0 = Date.now();
     let last: CiStatus | null = null;
     // 等待期间：不进「需要你处理」（Hub 会自己处理），每次查到的进度写进 PR 给界面看
@@ -1614,7 +1798,7 @@ export class Work {
     if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行，超过自动合并上限 ${G.maxDiff} 行`;
     const p = this.proj(i.projectId)!;
     let files: string[] = [];
-    if (!i.pr.simulated && this.github.available() && p.repo) files = await this.github.prFiles(p.repo.fullName, i.pr.number).catch(() => []);
+    if (!i.pr.simulated && !i.pr.local && this.github.available() && p.repo) files = await this.github.prFiles(p.repo.fullName, i.pr.number).catch(() => []);
     const hit = files.length ? G.protectedPaths.find((g) => files.some((f) => globMatch(g, f))) : null;
     if (hit) return `改动涉及受保护路径 ${hit}`;
     if (!files.length) {
@@ -1628,7 +1812,18 @@ export class Work {
   private async merge(i: Issue, by: string) {
     if (!i.pr || i.pr.state !== "open") return;
     const p = this.proj(i.projectId)!;
-    if (!i.pr.simulated) {
+    let postMerge = false;
+    if (i.pr.local === "branch") throw new WorkError(`交付方式是「只推分支」，Hub 不负责合并：请在 GitHub 上处理分支 ${i.pr.branch}`);
+    if (i.pr.local === "local") {
+      const dv = deliveryOf(p);
+      const out = await this.workspace.mergeLocal(p, this.key(i), dv.localPath, baseOf(p), `${this.key(i)}: ${i.title}`);
+      this.addComment(i.id, "system", "system", `↘ 已合并到本地 ${dv.localPath}（${baseOf(p)}）${out.commit ? `，提交 ${out.commit.slice(0, 9)}` : ""}`);
+      postMerge = true;
+      if (dv.afterMerge.trim()) {
+        const r = await this.workspace.runIn(dv.localPath, dv.afterMerge).catch((e) => ({ ok: false, output: (e as Error).message }));
+        this.addComment(i.id, "system", "system", `${r.ok ? "✓" : "✕"} 合并后命令「${dv.afterMerge}」${r.ok ? "已执行" : `失败：${r.output.slice(-300)}`}`);
+      }
+    } else if (!i.pr.simulated) {
       if (!this.github.available() || !p.repo) throw new Error("未配置 GitHub Token，无法合并");
       await this.github.mergePR(p.repo.fullName, i.pr.number);
     }
@@ -1636,8 +1831,43 @@ export class Work {
     i.pr.mergedAt = now();
     i.mergeApproved = null;
     this.save(i);
-    this.addComment(i.id, "system", "system", `↗ ${by} 合并了 PR #${i.pr.number}（${i.pr.branch}）`);
+    if (!i.pr.local) this.addComment(i.id, "system", "system", `↗ ${by} 合并了 PR #${i.pr.number}（${i.pr.branch}）`);
     this.releaseDependents(i.id);
+    if (postMerge) this.postMergeQa(i.id);
+  }
+
+  /**
+   * 合并到本地后的页面验收：本机开发服务已热加载新代码，在它上面逐条操作并截图。
+   * 共用一个测试环境，多张单排队一个一个来（见 QA 的冲突规则）。
+   * 通过：停在待审核，等人看截图后提测；不通过：退回开发智能体在原分支上修，修好后再合一次、再验一次。
+   */
+  postMergeQa(id: number) {
+    const i = this.getIssue(id);
+    if (!i || !this.qa) return;
+    const runId = this.qa.enqueue(this.view(i), "post-merge", { web: true });
+    this.addComment(i.id, "system", "system", "🧪 已排队页面验收：在本机开发服务上逐条操作并截图（多张单时一个一个来）");
+    this.emit("issue");
+    void this.qa.wait(runId).then(async (res) => {
+      const cur = this.getIssue(id);
+      if (!cur) return;
+      const key = this.key(cur);
+      if (res.passed) {
+        this.addComment(cur.id, "system", "system", `✓ 页面验收通过：${res.note}。截图在「测试」里这次验收的记录中。等人工提测：提测通过在 Linear 上改为 Done 即完成；不通过在 Linear 上打回并写明问题，会自动退回修复`);
+        this.notify.push("review", `${key} 已合并本地 dev，页面验收通过，可以提测`, cur.title, key);
+        this.emit("issue");
+        return;
+      }
+      if (/已取消/.test(res.note)) return;
+      // 退回修复：分支已经合过一次，修好的新提交会再合进来，所以把合并状态放回「未合并」
+      if (cur.pr) { cur.pr.state = "open"; cur.pr.mergedAt = undefined; }
+      cur.status = "todo";
+      cur.lifecycleDone = false;
+      cur.resumeFrom = "do";
+      this.save(cur);
+      this.addComment(cur.id, "lead", "lead", `页面验收未通过（代码已在本地开发分支上）：${res.note}\n请在原分支上修复，修好后照常提交；修复会再合并一次并重新做页面验收。`);
+      this.emit("issue");
+      if (cur.assignee) void this.startRun(this.getIssue(cur.id)!, "页面验收");
+    }).catch(() => {});
   }
   async mergePR(ref: string | number, force = false) {
     const i = this.find(ref);
@@ -1646,7 +1876,7 @@ export class Work {
     // 人点合并时再查一次 CI（PR 可能刚推了新提交）；失败时提示但由人决定（人可能判断是 CI 自身的问题）
     if (!i.pr.simulated) {
       const p = this.proj(i.projectId);
-      const ci = p?.repo && this.github.available() ? await this.github.ciStatus(p.repo.fullName, i.pr.number).catch(() => null) : null;
+      const ci = p?.repo && !i.pr.local && this.github.available() ? await this.github.ciStatus(p.repo.fullName, i.pr.number).catch(() => null) : null;
       if (ci) { i.pr.ci = ci; this.save(i); }
       if (ci?.state === "failing" && this.settings.guard().requireTests && !force) throw new WorkError(`CI 未通过（${ci.failed.join("、")}）。确认是 CI 自身的问题、仍要合并，请选择「仍然合并」`, 409);
     }
@@ -1659,6 +1889,14 @@ export class Work {
       throw e;
     }
     i.pr.guard = null;
+    if (i.pr.local === "local") {
+      // 本地合并只是进了本地开发分支，还要人工提测：停在待审核，不改远端状态，不回收工作区
+      if (i.status !== "in_review") i.status = "in_review";
+      this.save(i);
+      this.addComment(i.id, "system", "system", "已合并到本地，等待人工提测。提测通过后把状态改为「完成」");
+      this.emit("issue");
+      return;
+    }
     const before = i.status;
     if (i.status !== "done") {
       i.status = "done";
@@ -1674,6 +1912,7 @@ export class Work {
     const i = this.find(ref);
     if (i.pr?.state !== "merged") throw new WorkError("没有可回滚的 PR");
     const p = this.proj(i.projectId)!;
+    if (i.pr.local) throw new WorkError("本地合并的改动请在本机仓库里用 git revert 回滚，Hub 不改你的本地历史");
     let n: number;
     if (!i.pr.simulated) n = await this.workspace.revert(p, i.pr.number, this.github);
     else { p.simGhNext = (p.simGhNext ?? 100) + 1; this.saveProj(p); n = p.simGhNext; }

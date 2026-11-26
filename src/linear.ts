@@ -207,6 +207,15 @@ export class Linear {
     return d.issueUpdate.issue;
   }
 
+  /** 最近的评论（最新在后），用来把提测反馈带给智能体 */
+  async recentComments(issueId: string, n = 8): Promise<{ body: string; user: string; createdAt: string }[]> {
+    const d = await this.gql<{ issue: { comments: { nodes: { body: string; createdAt: string; user: { name: string } | null }[] } } | null }>(
+      `query IssueComments($id: String!, $n: Int) { issue(id: $id) { comments(last: $n) { nodes { body createdAt user { name } } } } }`,
+      { id: issueId, n },
+    );
+    return (d.issue?.comments.nodes ?? []).map((c) => ({ body: c.body, user: c.user?.name ?? "?", createdAt: c.createdAt })).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
   async comment(issueId: string, body: string): Promise<void> {
     const d = await this.gql<{ commentCreate: { success: boolean } }>(
       `mutation CommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`,

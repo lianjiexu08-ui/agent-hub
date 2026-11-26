@@ -236,7 +236,7 @@ const security: Security = {
 };
 if (!["127.0.0.1", "localhost", "::1"].includes(hostname) && !security.password && !security.token && !credentials.initialized)
   console.warn("警告：服务监听在非本机地址且未设置登录密码或 HUB_TOKEN，任何人都能访问并让智能体执行命令。请设置 HUB_PASSWORD（或 HUB_TOKEN）。");
-const fetch = createApp(store, runtime, security, { ...api, uploads }).fetch;
+const fetch = createApp(store, runtime, security, { ...api, uploads, shotDir: join(dataDir, "tmp", "screenshots") }).fetch;
 /** 监听端口；作为重启拉起的新进程时旧进程可能还没释放端口，重试若干次 */
 function listen(attempt = 1) {
   const server = serve({ fetch, port, hostname }, () =>

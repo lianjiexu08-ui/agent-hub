@@ -196,6 +196,8 @@ export class CliRunner implements CliExecutor {
 
     const transcript: BetaMessageParam[] = [{ role: "user", content: task.input }];
     let result = "", cost: number | undefined, inTok = 0, outTok = 0, lastText = "", raw = "", stderr = "";
+    /** pi 最近一次模型请求的错误；后续有成功的回复就清掉 */
+    let piError: string | null = null;
     const onLine = (line: string) => {
       ctx.heartbeat();
       raw = (raw + line + "\n").slice(-20000);
@@ -233,12 +235,19 @@ export class CliRunner implements CliExecutor {
           inTok += (u.input ?? 0) + (u.cacheRead ?? 0);
           outTok += u.output ?? 0;
           if (typeof u.cost?.total === "number") cost = (cost ?? 0) + u.cost.total;
-          if (m.stopReason === "error" || m.errorMessage) throw new Error(String(m.errorMessage ?? "pi 返回错误"));
+          // pi 在一次模型请求失败后会自动重试（auto_retry_start / auto_retry_end，默认 3 次）。
+          // 这里不能一看到失败就中止，否则会抢在 pi 自己的重试之前把进程杀掉：只记下来，等最终结果再判
+          if (m.stopReason === "error" || m.errorMessage) piError = String(m.errorMessage ?? "pi 返回错误");
+          else piError = null;
         } else {
           const text = (Array.isArray(m.content) ? m.content : []).map((b: any) => b.text ?? "").join("\n");
           transcript.push({ role: "user", content: [{ type: "tool_result", tool_use_id: String(m.toolCallId), content: text.slice(0, 4000) }] as never });
         }
+      } else if (ev.type === "auto_retry_end") {
+        // 重试用尽仍失败才算失败
+        if (ev.success === false) throw new Error(String(ev.finalError ?? piError ?? "pi 重试后仍失败"));
       } else if (ev.type === "agent_end") {
+        if (piError) throw new Error(piError);
         result = lastText;
       } else {
         // 其他 CLI：尽量提取文本
@@ -276,6 +285,8 @@ export class CliRunner implements CliExecutor {
       if (skillsDir) this.cleanSkills(agent, cwd); // 技能目录只在那次运行期间存在
       for (const r of restoreFiles) r();
     }
+    // pi 正常退出但最后一次请求仍是失败（没走到 agent_end）：按失败处理，交给 Hub 的网络重试
+    if (piError && !result) throw new Error(piError);
     const final = result || lastText || raw.trim().split("\n").slice(-20).join("\n");
     if (transcript.length === 1) transcript.push({ role: "assistant", content: [{ type: "text", text: final }] });
     return { result: final, cost, inputTokens: inTok, outputTokens: outTok, transcript };
