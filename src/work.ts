@@ -45,7 +45,9 @@ export interface Issue {
   /** creator / assignee 是 Linear 侧的真名，只读镜像：Hub 的 assignee 是智能体名，两者不能互相覆盖 */
   linear: { id: string; identifier: string; url: string; state: "open" | "closed"; stateId?: string; priority?: number; syncedAt: string; localStatus?: string; creator?: { id: string; name: string } | null; assignee?: { id: string; name: string } | null;
     /** 自动执行记录：claimed = 当前的智能体指派来自自动执行；fired = 本次进入范围已触发过（离开范围后清零）；warned = 运行中离开范围已提示过 */
-    auto?: { claimed?: boolean; fired?: boolean; warned?: boolean } } | null;
+    auto?: { claimed?: boolean; fired?: boolean; warned?: boolean };
+    /** 最近一次按流转规则交接的阶段与轮次，如 "deliver:1"（同一阶段同一轮只交接一次） */
+    handedOff?: string } | null;
   pr: PR | null; phases: PhaseRec[]; cycle: number; phase: Phase | null;
   /** 因网络抖动自动续跑的次数（成功一次即清零） */ netRetries?: number;
   /**
@@ -99,6 +101,24 @@ export interface LinearBinding {
  * - afterMerge：本地合并后在 localPath 执行的命令（可选，例如重启服务）
  * 提测与发版永远由人完成，Hub 不触发。
  */
+/** 一次交接：Linear 改成哪个状态（null = 按工作项状态自动对应），指派给谁（null = 不改指派人） */
+export interface Handoff { stateId: string | null; assignee: { id: string; name: string } | null }
+export interface Flow {
+  /** 智能体自己建的单（比如拆出来的子单）是否推到 Linear / GitHub */
+  agentPush: { linear: boolean; github: boolean };
+  /** Hub 开始做这张单时 */
+  start: Handoff;
+  /** Hub 做完、可以提测时（本地交付 = 合并到本地且页面验收通过；其他 = 交付并通过审核） */
+  deliver: Handoff;
+}
+export function flowOf(p: Pick<Project, "flow" | "linear">): Flow {
+  const f = p.flow;
+  return {
+    agentPush: { linear: f?.agentPush?.linear ?? !!p.linear?.pushNew, github: f?.agentPush?.github ?? false },
+    start: { stateId: f?.start?.stateId ?? null, assignee: f?.start?.assignee ?? null },
+    deliver: { stateId: f?.deliver?.stateId ?? null, assignee: f?.deliver?.assignee ?? null },
+  };
+}
 export interface Delivery { baseBranch: string; mode: "pr" | "branch" | "local"; localPath: string; afterMerge: string }
 export interface Project {
   id: string; name: string; key: string; description: string; createdAt: string; nextNumber: number;
@@ -114,6 +134,8 @@ export interface Project {
   env: { baseUrl: string; preview: string; accounts: string[]; previewCmd?: string };
   /** 交付策略：改完的代码合到哪、怎么合。不同项目流程不同（有的开 PR 进主干，有的只合本地 dev 再人工提测） */
   delivery?: Delivery;
+  /** 与 Linear / GitHub 的流转规则：智能体建的单推不推、开始做 / 做完时远端改成什么状态、转给谁 */
+  flow?: Flow;
   /** 演示模式下模拟的远端 issue */
   simRemote?: { number: number; title: string; body: string; labels: string[] }[];
   simGhNext?: number;
@@ -314,7 +336,7 @@ export class Work {
       return { ...p, simRemote: undefined, counts: { total: its.length, open: its.filter((i) => !["done", "canceled"].includes(i.status)).length, inProgress: its.filter((i) => i.status === "in_progress").length, review: its.filter((i) => i.status === "in_review").length } };
     });
   }
-  saveProject(input: { name: string; key: string; description?: string; sync?: Partial<Project["sync"]>; linear?: Partial<LinearBinding> | null; env?: Partial<Project["env"]>; delivery?: Partial<Delivery> }, origId?: string): Project {
+  saveProject(input: { name: string; key: string; description?: string; sync?: Partial<Project["sync"]>; linear?: Partial<LinearBinding> | null; env?: Partial<Project["env"]>; delivery?: Partial<Delivery>; flow?: { agentPush?: Partial<Flow["agentPush"]>; start?: Partial<Handoff>; deliver?: Partial<Handoff> } }, origId?: string): Project {
     const key = String(input.key ?? "").trim().toUpperCase();
     if (!input.name?.trim()) throw new WorkError("项目名称不能为空");
     if (!/^[A-Z][A-Z0-9]{1,5}$/.test(key)) throw new WorkError("前缀为 2–6 位大写字母或数字，且以字母开头");
@@ -326,6 +348,10 @@ export class Work {
     p.description = input.description ?? p.description;
     if (input.sync) p.sync = { ...p.sync, ...input.sync };
     if (input.env) p.env = { ...p.env, ...input.env };
+    if (input.flow) {
+      const f = flowOf(p);
+      p.flow = { agentPush: { ...f.agentPush, ...(input.flow.agentPush ?? {}) }, start: { ...f.start, ...(input.flow.start ?? {}) }, deliver: { ...f.deliver, ...(input.flow.deliver ?? {}) } };
+    }
     if (input.delivery) {
       const d = { ...deliveryOf(p), ...input.delivery };
       d.baseBranch = String(d.baseBranch ?? "").trim();
@@ -589,6 +615,30 @@ export class Work {
     return this.sourceOf(p) === "linear" && !!i.linear && !i.pr;
   }
 
+  /**
+   * 按流转规则在 Linear 上换指派人（开始做 / 做完可提测）。只在配置了指派人时动手，
+   * 同一阶段同一轮只交接一次，避免把单反复改来改去、反复给人发通知。
+   */
+  private async linearHandoff(id: number, stage: "start" | "deliver") {
+    const i = this.getIssue(id);
+    const p = i && this.proj(i.projectId);
+    if (!i?.linear || !p || !this.canPushLinear(p) || !this.linear.available()) return;
+    const h = flowOf(p)[stage];
+    const mark = `${stage}:${i.cycle}`;
+    if (!h.assignee || i.linear.handedOff === mark) return;
+    if (i.linear.assignee?.id === h.assignee.id) { i.linear = { ...i.linear, handedOff: mark }; this.save(i); return; }
+    try {
+      await this.linear.updateIssue(i.linear.id, { assigneeId: h.assignee.id });
+      const cur = this.getIssue(id)!;
+      cur.linear = { ...cur.linear!, assignee: h.assignee, handedOff: mark };
+      this.save(cur);
+      this.addComment(cur.id, "system", "system", `↗ Linear ${cur.linear.identifier} 已指派给 ${h.assignee.name}（${stage === "start" ? "开始执行" : "可以提测"}）`);
+      this.emit("issue");
+    } catch (e) {
+      this.addComment(i.id, "system", "system", `⚠ Linear 指派给 ${h.assignee.name} 失败：${(e as Error).message}`);
+    }
+  }
+
   /** 已交付但代码没登记的单：重新登记并走一遍交付后的审核 / 合并（兜底修复用） */
   async redeliver(ref: string | number) {
     const i = this.find(ref);
@@ -807,6 +857,12 @@ export class Work {
   }
 
   /** 可选的 Linear 成员：团队成员 + 已导入 issue 上出现过的指派人（API 不可用时只返回后者） */
+  /** 项目所在 Linear 团队的工作流状态（流转规则里选「改成哪个状态」用） */
+  async linearTeamStates(id: string): Promise<{ id: string; name: string; type: string }[]> {
+    const p = this.proj(id);
+    if (!p?.linear) return [];
+    return (await this.linearStatesFor(p.linear.teamId)).slice().sort((a, b) => a.position - b.position).map((x) => ({ id: x.id, name: x.name, type: x.type }));
+  }
   /** 当前连接 Linear 用的账号，用于「只导入指派给我的」 */
   async linearMe(): Promise<{ id: string; name: string; email: string } | null> {
     return this.linear.available() ? this.linear.viewer().catch(() => null) : null;
@@ -956,7 +1012,10 @@ export class Work {
     const cfg = p?.linear;
     if (!cfg || !i.linear || !this.canPushLinear(p)) return null;
     const states = await this.linearStatesFor(cfg.teamId);
-    const target = pickState(states, i.status);
+    // 流转规则里指定了「开始做 / 做完」时用的状态，就用它；否则按工作项状态自动对应
+    const fl = flowOf(p!);
+    const want = i.status === "in_progress" ? fl.start.stateId : i.status === "in_review" ? fl.deliver.stateId : null;
+    const target = (want && states.find((x) => x.id === want)) || pickState(states, i.status);
     if (!target) return null;
     // 以「上次对齐时的本地状态」为准：本地没变就不推，避免把远端状态改回去
     const statusDirty = i.linear.localStatus !== i.status;
@@ -1105,9 +1164,10 @@ export class Work {
       i.status = "todo";
     }
     this.save(i);
-    const n = input.github ? await this.pushNew(i).catch(() => null) : null;
+    const n = (input.github ?? (actor !== ME && flowOf(this.proj(i.projectId)!).agentPush.github)) ? await this.pushNew(i).catch(() => null) : null;
     // 人建单时按勾选决定；智能体建的（比如拆出来的子单）按项目「新建工作项时同时创建 Linear issue」的设置
-    const wantLinear = input.linear ?? (actor !== ME && !!this.proj(i.projectId)?.linear?.pushNew);
+    const fl = flowOf(this.proj(i.projectId)!);
+    const wantLinear = input.linear ?? (actor !== ME && fl.agentPush.linear);
     const ln = wantLinear ? await this.pushLinearNew(i).catch((e) => { this.addComment(i.id, "system", "system", `⚠ 创建 Linear issue 失败：${(e as Error).message}`); return null; }) : null;
     this.save(i);
     const depNote = i.dependsOn?.length ? `，依赖 ${i.dependsOn.map((d) => this.key(this.getIssue(d)!)).join("、")}` : "";
@@ -1526,6 +1586,7 @@ export class Work {
     this.save(cur0);
     const input = continuing ? this.continueInput(cur0) : this.buildInput(cur0, resume);
     const task = this.runtime.submit(i.assignee!, input, { source: "issue", issueId: i.id, hops: opts.hops ?? 0, priority: i.priority });
+    if (!resume) void this.linearHandoff(i.id, "start");
     this.addComment(i.id, "system", "system", continuing ? `▶ ${i.assignee} 接着上次的进度继续「${PHASE_LABEL[cur0.phase!]}」（由 ${by} 触发，保留之前的对话，第 ${i.cycle} 轮）`
       : resume ? `▶ ${i.assignee} 从「${PHASE_LABEL[cur0.phase!]}」继续（由 ${by} 触发，仍是第 ${i.cycle} 轮）` : `▶ ${i.assignee} 开始执行（由 ${by} 触发），第 ${i.cycle} 轮`, task.id);
     this.emit("issue");
@@ -1779,6 +1840,9 @@ export class Work {
       this.save(i);
       await this.syncStatusRemote(i);
       await this.afterDeliver(i);
+      // 非本地交付：交付审核完就可以提测；本地交付要等合并后的页面验收通过（见 postMergeQa）
+      const dvp = this.proj(i.projectId);
+      if (dvp && deliveryOf(dvp).mode !== "local" && this.getIssue(i.id)?.status === "in_review") void this.linearHandoff(i.id, "deliver");
     } else if (task.status === "failed" && i.session && /No conversation found|already in use|session.{0,20}not found/i.test(task.error ?? "") && i.assignee) {
       // 会话恢复本身失败（会话丢了 / ID 被占用）：换一个新会话，从当前阶段开头接着做
       i.session = null;
@@ -2035,6 +2099,7 @@ export class Work {
       if (res.passed) {
         this.addComment(cur.id, "system", "system", `✓ 页面验收通过：${res.note}。截图在「测试」里这次验收的记录中。等人工提测：提测通过在 Linear 上改为 Done 即完成；不通过在 Linear 上打回并写明问题，会自动退回修复`);
         this.notify.push("review", `${key} 已合并本地 dev，页面验收通过，可以提测`, cur.title, key);
+        void this.linearHandoff(cur.id, "deliver");
         this.emit("issue");
         return;
       }

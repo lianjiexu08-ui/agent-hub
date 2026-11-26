@@ -96,6 +96,7 @@ export function buildApi(s: Services) {
     "work.syncLinear": (id) => work.syncLinear(id),
     "work.linearMembers": (id) => work.linearMembers(id),
     "work.linearMe": () => work.linearMe(),
+    "work.linearTeamStates": (id) => work.linearTeamStates(id),
     "work.diskUsage": () => work.diskUsage(),
     "work.cleanWorkspaces": () => work.cleanWorkspaces(),
     "work.receipt": (id) => store.docGet("receipts", id),

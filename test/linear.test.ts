@@ -460,3 +460,23 @@ test("智能体拆出的子单自动推到 Linear，挂在父单下、指派人�
   await work.create({ projectId: p.id, title: "人建的不勾选", linear: false });
   assert.equal(creates.length, 0, "人建单不勾选就不推");
 });
+
+test("流转规则：做完可提测时按配置改 Linear 状态并指派给测试同学，只改一次", async () => {
+  const { store, settings, work } = setup();
+  store.docPut("secrets", "global", { linearToken: "lin_api_test" });
+  const g = settings.get();
+  g.linear = { connected: true, viewer: "Tester", keyHint: "lin_…test", teams: [{ id: "team-1", key: "ENG", name: "Engineering" }], connectedAt: new Date().toISOString() };
+  store.docPut("settings", "global", { id: "global", ...g });
+  const p = work.saveProject({ name: "流转", key: "FLOW" });
+  await work.connectLinear(p.id, "team-1");
+  work.saveProject({ name: "流转", key: "FLOW", flow: { deliver: { stateId: "s-review", assignee: { id: "u-qa", name: "QA" } } } }, p.id);
+  updates.length = 0;
+  const v = await work.create({ projectId: p.id, title: "做完转测试", description: "验收标准：\n- 支持四列\n- 错误行给出行号\n- 最多 500 行", assignee: "developer", linear: true });
+  await until(() => work.list(p.id).find((i) => i.key === v.key)!.status === "in_review");
+  await until(() => updates.some((u) => u.input.assigneeId === "u-qa"));
+  const lin = work.list(p.id).find((i) => i.key === v.key)!.linear!;
+  assert.equal(lin.assignee?.name, "QA");
+  assert.ok(updates.some((u) => u.input.stateId === "s-review"), "做完时改成配置的 In Review");
+  assert.equal(updates.filter((u) => u.input.assigneeId).length, 1, "只改一次指派人");
+  assert.ok(work.detail(v.key).activity.some((c) => /已指派给 QA（可以提测）/.test(c.body)));
+});

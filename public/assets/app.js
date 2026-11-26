@@ -621,11 +621,24 @@ function select(options, value, onchange, attrs = {}) {
 const statusOptions = () => IS.statuses.map((s) => [s.id, `${s.icon} ${s.label}`]);
 const prioOptions = () => IS.priorities.map((l, i) => [i, l]);
 const assigneeOptions = () => [["", "未指派"], ...agentNames().map((n) => [n, n])];
-function toast(msg, kind = "") {
-  const el = h("div", { class: "toast " + kind }, msg);
+/**
+ * 右下角提示。文字里提到了某张工作项（如 OPS-470），或显式传了 key，就可以点击直接打开它。
+ * 鼠标停在上面时不自动消失。
+ */
+function toast(msg, kind = "", opts = {}) {
+  const text = String(msg ?? "");
+  const known = (k) => !!(S.issues ?? []).some((i) => i.key === k);
+  const key = opts.key ?? (text.match(/\b[A-Z][A-Z0-9]{1,5}-\d+\b/g) ?? []).find(known) ?? null;
+  const el = h("div", { class: "toast " + kind + (key ? " link" : ""), role: key ? "button" : null, tabindex: key ? "0" : null, title: key ? `点击打开 ${key}` : null,
+    onclick: key ? () => { el.remove(); openIssue(key); } : null,
+    onkeydown: key ? (e) => { if (e.key === "Enter") { el.remove(); openIssue(key); } } : null },
+    text, key ? h("span", { class: "toast-go" }, "打开 →") : null);
   $("#toasts").append(el);
   while ($("#toasts").children.length > 3) $("#toasts").firstChild.remove();
-  setTimeout(() => el.remove(), 4200);
+  let left = key ? 7000 : 4200, t0 = Date.now();
+  let timer = setTimeout(() => el.remove(), left);
+  el.addEventListener("mouseenter", () => { clearTimeout(timer); left -= Date.now() - t0; });
+  el.addEventListener("mouseleave", () => { t0 = Date.now(); timer = setTimeout(() => el.remove(), Math.max(1500, left)); });
 }
 const fail = (err) => toast(err.message || String(err), "err");
 
@@ -1997,6 +2010,46 @@ function openDirPicker(start, onPick, opts = {}) {
   $("#modal").classList.add("open"); $("#modal").setAttribute("aria-hidden", "false");
   go(start);
 }
+/**
+ * 流转规则：Hub 自己建的单推不推；Hub 开始做 / 做完可提测时，Linear 改成什么状态、指派给谁。
+ * 状态和成员都从 Linear 团队实时读，选「自动 / 不改」就保持原来的行为。
+ */
+const flowCache = { states: {}, loading: {} };
+function flowRules(p) {
+  const F = { agentPush: { linear: !!p.linear?.pushNew, github: false, ...(p.flow?.agentPush ?? {}) }, start: { stateId: null, assignee: null, ...(p.flow?.start ?? {}) }, deliver: { stateId: null, assignee: null, ...(p.flow?.deliver ?? {}) } };
+  const save = (patch) => issuesApi.saveProject({ name: p.name, key: p.key, flow: patch }, p.id).then(() => { renderProjectPage(); toast("流转规则已保存", "ok"); }).catch(fail);
+  if (!flowCache.states[p.id] && !flowCache.loading[p.id]) {
+    flowCache.loading[p.id] = true;
+    rpc("work.linearTeamStates", p.id).then((x) => { flowCache.states[p.id] = x ?? []; }).catch(() => { flowCache.states[p.id] = []; }).finally(() => { flowCache.loading[p.id] = false; renderProjectPage(); });
+  }
+  if (!lg.members[p.id] && !lg.loading[p.id]) {
+    lg.loading[p.id] = true;
+    issuesApi.linearMembers(p.id).then((m) => { lg.members[p.id] = m ?? []; }).catch(() => { lg.members[p.id] = []; }).finally(() => { lg.loading[p.id] = false; renderProjectPage(); });
+  }
+  const states = flowCache.states[p.id] ?? [];
+  const members = lg.members[p.id] ?? [];
+  const stateSel = (stage, auto) => select([["", `自动（${auto}）`], ...states.map((x) => [x.id, x.name])], F[stage].stateId ?? "",
+    (v) => save({ [stage]: { stateId: v || null } }), { style: "max-width:220px" });
+  const whoSel = (stage) => {
+    const cur = F[stage].assignee;
+    const opts = [["", "不改指派人"], ...members.map((m) => [m.id, m.name])];
+    if (cur && !members.some((m) => m.id === cur.id)) opts.push([cur.id, cur.name]);
+    return select(opts, cur?.id ?? "", (v) => save({ [stage]: { assignee: v ? (members.find((m) => m.id === v) ?? cur) : null } }), { style: "max-width:260px" });
+  };
+  return field("流转规则", h("div", { class: "fields", style: "gap:12px" },
+    h("div", { class: "checks" },
+      checkboxP(F.agentPush.linear, (on) => save({ agentPush: { linear: on } }), "智能体自己建的单推到 Linear", "比如拆出来的子单，会挂在父单下面、指派人跟父单一致"),
+      p.repo ? checkboxP(F.agentPush.github, (on) => save({ agentPush: { github: on } }), "智能体自己建的单也推到 GitHub issue") : null),
+    h("table", { class: "map-table" },
+      h("tr", {}, h("th", {}, "时机"), h("th", {}, "Linear 状态"), h("th", {}, "指派给")),
+      h("tr", {}, h("td", {}, "Hub 开始做"), h("td", {}, stateSel("start", "In Progress 类")), h("td", {}, whoSel("start"))),
+      h("tr", {}, h("td", {}, "Hub 做完，可以提测"), h("td", {}, stateSel("deliver", "名称含 Review 的状态")), h("td", {}, whoSel("deliver")))),
+    h("div", { class: "help" }, (p.delivery?.mode ?? "pr") === "local"
+      ? "「做完」= 已合并到本地开发分支且页面验收通过。指派给测试同学时，对方会在 Linear 收到通知。提测通过在 Linear 改 Done 即完成；打回请改回进行中并写评论，Hub 会带着评论退回给智能体。"
+      : "「做完」= 交付并通过审核。指派给测试同学时，对方会在 Linear 收到通知。"),
+    !states.length && !flowCache.loading[p.id] ? h("div", { class: "muted", style: "font-size:12.5px" }, "没有读到 Linear 团队的状态，先检查 Linear 连接") : null),
+    "同一阶段同一轮只改一次，不会反复改指派人。");
+}
 /** 「只导入指派给指定成员的」的成员勾选：成员列表来自 Linear 团队 */
 function importAssigneePicker(p, cfg, save) {
   const list = lg.members[p.id];
@@ -2502,6 +2555,7 @@ function linearSection(p) {
     ["two_way", "push"].includes(cfg.mode) ? h("div", { class: "checks" },
       checkboxP(cfg.pushNew, (on) => save({ pushNew: on }), "新建工作项时默认同时创建 Linear issue", "新建时可单独取消勾选"),
       checkboxP(cfg.postDeliverable, (on) => save({ postDeliverable: on }), "智能体的交付结果回写为 Linear 评论")) : null,
+    ["two_way", "push"].includes(cfg.mode) ? flowRules(p) : null,
     field("状态映射", h("table", { class: "map-table" },
       h("tr", {}, h("th", {}, "工作项状态"), h("th", {}, "Linear 状态类型")),
       h("tr", {}, h("td", {}, "待规划"), h("td", {}, "Backlog")),

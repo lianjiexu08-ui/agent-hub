@@ -794,3 +794,9 @@ select, textarea, input { border-radius: 8px; padding: 7px 10px; }
 @keyframes hubspin { to { transform: rotate(360deg); } }
 .now-line { display: inline-flex; align-items: center; gap: 4px; min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+/* 可点击的提示：跳到对应工作项 */
+.toast.link { cursor: pointer; display: flex; align-items: center; gap: 10px; }
+.toast.link:hover { filter: brightness(1.04); box-shadow: var(--shadow-lg); }
+.toast .toast-go { margin-left: auto; font-size: 12px; opacity: .8; white-space: nowrap; text-decoration: underline; text-underline-offset: 2px; }
+.toasts .toast { pointer-events: auto; }
