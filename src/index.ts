@@ -239,7 +239,7 @@ const restartNow = () => {
   setTimeout(() => {
     try { spawnReplacement(spec); } catch (e) { console.error("[系统] 拉起新进程失败", e); return; }
     assistant.closeLive();
-    cliRunner.killAll();
+    runtime.shuttingDown = true; cliRunner.killAll();
     // 收尾最多等 5 秒：某个预览 / MCP 连接卡住时也要退出，否则新进程一直拿不到端口
     setTimeout(() => process.exit(0), 5000).unref();
     void Promise.all([previews.stopAll(), runtime.mcp.closeAll()]).finally(() => process.exit(0));
@@ -283,4 +283,4 @@ function listen(attempt = 1) {
 listen();
 
 for (const sig of ["SIGINT", "SIGTERM"] as const)
-  process.on(sig, () => { assistant.closeLive(); cliRunner.killAll(); setTimeout(() => process.exit(0), 5000).unref(); void Promise.all([previews.stopAll(), runtime.mcp.closeAll()]).finally(() => process.exit(0)); });
+  process.on(sig, () => { assistant.closeLive(); runtime.shuttingDown = true; cliRunner.killAll(); setTimeout(() => process.exit(0), 5000).unref(); void Promise.all([previews.stopAll(), runtime.mcp.closeAll()]).finally(() => process.exit(0)); });

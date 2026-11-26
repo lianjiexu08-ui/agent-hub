@@ -91,3 +91,17 @@ test("兜底时挑有空位的：下一个候选满载就用再下一个；自�
   const b = await own.runtime.waitFor(own.runtime.submit("backend-dev", "B").id);
   assert.equal(b.result, "pi:kimi-coding/k3.1-pro", "自己的模型能用就用，满了排队而不是换");
 });
+
+test("Hub 退出过程中被杀掉的 CLI：不记失败，保持运行中，由新进程统一标为被重启中断", async () => {
+  let kill: (e: Error) => void = () => {};
+  const s = setup(() => null);
+  s.cli.run = () => new Promise((_, rej) => { kill = rej; });
+  const t = s.runtime.submit("backend-dev", "A");
+  await new Promise((r) => setTimeout(r, 30));
+  s.runtime.shuttingDown = true;
+  kill(new Error("pi 退出码 143：（无输出）"));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(s.store.getTask(t.id)!.status, "running");
+  assert.equal(s.store.failInterrupted(), 1);
+  assert.match(s.store.getTask(t.id)!.error ?? "", /interrupted by service restart/);
+});

@@ -187,6 +187,11 @@ export class Runtime {
    */
   /** CLI 任务持有的进程槽位（可在阻塞等待时让出） */
   /** 暂时用不了的底座 + 模型（runtime|model）→ 到什么时候之前不再派活 */
+  /**
+   * Hub 正在退出（重启 / 收到终止信号）：之后被杀掉的 CLI 进程会以退出码 143 结束，不能当成任务失败记下来
+   * （会计入连续失败、显示成「上次失败」）。这时不写结果，保持运行中，由新进程统一标为「被重启中断」后续跑。
+   */
+  shuttingDown = false;
   private down = new Map<string, number>();
   private isDown(runtime: string, model: string) { const t = this.down.get(`${runtime}|${model}`); return !!t && t > Date.now(); }
   /** 记下暂时用不了的模型并持久化（重启后仍然避开，不必每个任务再先失败一次） */
@@ -395,7 +400,7 @@ export class Runtime {
         this.store.updateTask(id, { inputTokens: out.inputTokens ?? 0, outputTokens: out.outputTokens ?? 0, cost: out.cost ?? 0, turns: 1 });
         return this.finish(id, { status: "completed", result: out.result });
       } catch (err) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || this.shuttingDown) return;
         return this.finish(id, { status: "failed", error: describeError(err) });
       } finally {
         releaseCli?.();
