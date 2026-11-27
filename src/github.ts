@@ -35,6 +35,14 @@ export class GitHub {
     return (text ? JSON.parse(text) : null) as T;
   }
   user() { return this.req<{ login: string }>("GET", "/user"); }
+  /** 一个 Actions job 的原始日志（纯文本，GitHub 会重定向到临时下载地址） */
+  async jobLog(full: string, jobId: string): Promise<string> {
+    const t = this.token();
+    if (!t) throw new Error("未配置 GitHub Token");
+    const res = await fetch(`${this.base}/repos/${full}/actions/jobs/${jobId}/logs`, { headers: { authorization: `Bearer ${t}`, "user-agent": "agent-hub" }, signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`读取 job 日志 → ${res.status}`);
+    return res.text();
+  }
 
   /**
    * 当前令牌的身份与权限范围。
@@ -101,6 +109,18 @@ export class GitHub {
   removeLabel(full: string, n: number, label: string) { return this.req("DELETE", `/repos/${full}/issues/${n}/labels/${encodeURIComponent(label)}`); }
   createPR(full: string, o: { title: string; head: string; base: string; body: string }) { return this.req<{ number: number }>("POST", `/repos/${full}/pulls`, o); }
   mergePR(full: string, n: number) { return this.req("PUT", `/repos/${full}/pulls/${n}/merge`, { merge_method: "squash" }); }
+  /** 仓库是否配置了 GitHub Actions 工作流 */
+  async hasWorkflows(full: string): Promise<boolean> {
+    const d = await this.req<{ total_count: number }>("GET", `/repos/${full}/actions/workflows?per_page=1`);
+    return (d.total_count ?? 0) > 0;
+  }
+  /** base 比 head 多出几个提交（head 落后主干多少） */
+  async behindBy(full: string, base: string, head: string): Promise<number> {
+    const d = await this.req<{ behind_by: number }>("GET", `/repos/${full}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`);
+    return d.behind_by ?? 0;
+  }
+  /** 把最新主干合进 PR 分支（GitHub 的「Update branch」）；有冲突时 GitHub 返回 422 */
+  updateBranch(full: string, n: number, expectedHead: string) { return this.req("PUT", `/repos/${full}/pulls/${n}/update-branch`, { expected_head_sha: expectedHead }); }
   pr(full: string, n: number) { return this.req<{ merge_commit_sha: string | null; base: { ref: string }; head: { sha: string } }>("GET", `/repos/${full}/pulls/${n}`); }
   /**
    * PR 最新提交的 CI 结果（GitHub Actions 等 check runs）。
@@ -130,4 +150,18 @@ export class GitHub {
     const files = await this.req<{ filename: string }[]>("GET", `/repos/${full}/pulls/${n}/files?per_page=100`);
     return files.map((f) => f.filename);
   }
+}
+
+/**
+ * 从 CI 日志里挑出最能说明失败原因的几十行：报错、失败的用例、断言、退出码，附带少量上下文。
+ * 去掉时间戳前缀；GitHub Actions 的分组标记也去掉。
+ */
+export function failureExcerpt(log: string, max = 60): string {
+  const lines = log.split("\n").map((l) => l.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, "").replace(/\r$/, "")).filter((l) => !/^##\[(group|endgroup)\]/.test(l));
+  const hit = /(error|failed|failure|✘|✖|FAIL|assert|exception|traceback|timeout|exit code [1-9]|expected|received|^\s*>\s+\d+\s*\|)/i;
+  const keep = new Set<number>();
+  lines.forEach((l, i) => { if (hit.test(l)) for (let k = Math.max(0, i - 1); k <= Math.min(lines.length - 1, i + 2); k++) keep.add(k); });
+  const picked = [...keep].sort((a, b) => a - b).map((i) => lines[i]);
+  const out = picked.length ? picked : lines.slice(-max);
+  return out.slice(-max).join("\n").slice(-6000);
 }

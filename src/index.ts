@@ -35,11 +35,31 @@ import { Previews } from "./preview.ts";
 import { BuiltinBrowser, DevEyeBrowser } from "./browser.ts";
 
 const env = (k: string, d: string) => process.env[k] ?? d;
+/** 端口能不能绑定（旧进程放掉了没有）；timeoutMs 内每 250ms 试一次 */
+async function portFree(port: number, host: string, timeoutMs: number): Promise<boolean> {
+  const { createServer } = await import("node:net");
+  const t0 = Date.now();
+  for (;;) {
+    const ok = await new Promise<boolean>((res) => { const s = createServer(); s.once("error", () => res(false)); s.listen(port, host, () => s.close(() => res(true))); });
+    if (ok) return true;
+    if (Date.now() - t0 > timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
 const simulate = process.env.HUB_SIMULATE === "1";
 const dataDir = env("HUB_DATA", "./data");
+// 输出管道断了（启动 Hub 的终端已关闭）时不要因 EPIPE 整个退出
+for (const s of [process.stdout, process.stderr]) s.on("error", (e: NodeJS.ErrnoException) => { if (e.code !== "EPIPE") throw e; });
 mkdirSync(dataDir, { recursive: true });
 const port = Number(env("PORT", "18790"));
 const hostname = env("HOST", "127.0.0.1");
+
+// 作为重启拉起的新进程：先等旧进程放掉端口再做任何恢复动作（标记中断任务、清理遗留 CLI 进程）。
+// 否则旧进程还在跑时，新进程就会把它手上的任务标成失败、杀掉它的 CLI，而自己又因端口被占而退出
+if (process.env.HUB_RESTART === "1" && !(await portFree(port, hostname, 60_000))) {
+  console.error(`[系统] 旧进程 60 秒内没有释放 ${hostname}:${port}，放弃这次重启（旧进程继续服务）`);
+  process.exit(1);
+}
 
 const store = new Store(env("HUB_DB", join(dataDir, "agent-hub.db")));
 const interrupted = store.failInterrupted();
@@ -214,12 +234,14 @@ const cancelRestart = () => {
 };
 const restartState = () => (idleRestart ? { since: idleRestart.since, waiting: work.activeIssueRuns() } : null);
 const restartNow = () => {
-  const spec = restartSpec();
+  const spec = restartSpec(undefined, { logFile: join(dataDir, "logs", "hub.log") });
   console.log(`[系统] 正在重启：${spec.command} ${spec.args.join(" ")}`);
   setTimeout(() => {
     try { spawnReplacement(spec); } catch (e) { console.error("[系统] 拉起新进程失败", e); return; }
     assistant.closeLive();
-    cliRunner.killAll();
+    runtime.shuttingDown = true; cliRunner.killAll();
+    // 收尾最多等 5 秒：某个预览 / MCP 连接卡住时也要退出，否则新进程一直拿不到端口
+    setTimeout(() => process.exit(0), 5000).unref();
     void Promise.all([previews.stopAll(), runtime.mcp.closeAll()]).finally(() => process.exit(0));
   }, 150);
   return "正在重启";
@@ -261,4 +283,4 @@ function listen(attempt = 1) {
 listen();
 
 for (const sig of ["SIGINT", "SIGTERM"] as const)
-  process.on(sig, () => { assistant.closeLive(); cliRunner.killAll(); void Promise.all([previews.stopAll(), runtime.mcp.closeAll()]).finally(() => process.exit(0)); });
+  process.on(sig, () => { assistant.closeLive(); runtime.shuttingDown = true; cliRunner.killAll(); setTimeout(() => process.exit(0), 5000).unref(); void Promise.all([previews.stopAll(), runtime.mcp.closeAll()]).finally(() => process.exit(0)); });

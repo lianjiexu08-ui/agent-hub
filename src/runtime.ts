@@ -17,13 +17,20 @@ import { costOf } from "./pricing.ts";
 import { priorityRank } from "./priority.ts";
 import { PrioritySlots } from "./slots.ts";
 import { builtinReceipt, recordReceipt } from "./receipt.ts";
-import { backoffMs, isTransientError, sleep } from "./transient.ts";
+import { backoffMs, downUntil, isTransientError, providerDown, sleep } from "./transient.ts";
 
 /** 非内置运行底座（Claude Code 等 CLI）的执行器 */
 export interface CliExecutor {
   /** 取得该运行底座的一个进程槽位（超过并发上限时按优先级排队） */
-  acquire?(runtime: string, priority: number, signal: AbortSignal): Promise<() => void>;
-  run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; /** 运行中的对话记录（增量，给界面实时看） */ progress?: (transcript: BetaMessageParam[]) => void }): Promise<{ result: string; cost?: number; inputTokens?: number; outputTokens?: number; transcript?: BetaMessageParam[] }>;
+  acquire?(runtime: string, priority: number, signal: AbortSignal, model?: string): Promise<() => void>;
+  /** 这个底座 + 模型现在是否已经满载（再来的任务要排队） */
+  busy?(runtime: string, model: string): boolean;
+  /** 这个底座 + 模型前面还有几个在排队；超过 overflow 时溢出到有空位的兜底模型 */
+  queued?(runtime: string, model: string): number;
+  overflow?(): number;
+  /** 兜底：智能体配置的模型用不了时，依次可换的底座和模型 */
+  fallbacks?(agent: Agent): { runtime: string; model: string }[];
+  run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; /** 运行中的对话记录（增量，给界面实时看） */ progress?: (transcript: BetaMessageParam[]) => void; /** 不续原来的会话（兜底换了底座） */ fresh?: boolean }): Promise<{ result: string; cost?: number; inputTokens?: number; outputTokens?: number; transcript?: BetaMessageParam[] }>;
 }
 
 export interface RuntimeHooks {
@@ -31,6 +38,10 @@ export interface RuntimeHooks {
   continuation?(task: Task, finalText: string): string | null;
   /** 追加到系统提示词的内容（技能目录等） */
   systemExtra?(task: Task, agent: Agent): string;
+  /** 某个底座 + 模型被判为暂时用不了（until 之前避开）；鉴权类问题要人处理 */
+  modelDown?(key: string, reason: string, until: number): void;
+  /** CLI 底座兜底换了模型（from → to），reason 是原来那个的报错 */
+  fallback?(task: Task, from: string, to: string, reason: string): void;
 }
 
 /** 可替换的模型调用接口，方便测试时注入假模型 */
@@ -81,6 +92,7 @@ export class Runtime {
     this.mcp = mcp;
     this.modelLimit = opts.maxConcurrency;
     this.sem = new PrioritySlots(() => this.modelLimit);
+    for (const [k, t] of store.docGet<{ list: [string, number][] }>("meta", "modelsDown")?.list ?? []) if (t > Date.now()) this.down.set(k, t);
     this.events.setMaxListeners(0);
   }
 
@@ -177,6 +189,36 @@ export class Runtime {
    * 调用方拿到的是最终回复文本。
    */
   /** CLI 任务持有的进程槽位（可在阻塞等待时让出） */
+  /** 暂时用不了的底座 + 模型（runtime|model）→ 到什么时候之前不再派活 */
+  /**
+   * Hub 正在退出（重启 / 收到终止信号）：之后被杀掉的 CLI 进程会以退出码 143 结束，不能当成任务失败记下来
+   * （会计入连续失败、显示成「上次失败」）。这时不写结果，保持运行中，由新进程统一标为「被重启中断」后续跑。
+   */
+  shuttingDown = false;
+  private down = new Map<string, number>();
+  private isDown(runtime: string, model: string) { const t = this.down.get(`${runtime}|${model}`); return !!t && t > Date.now(); }
+  /** 记下暂时用不了的模型并持久化（重启后仍然避开，不必每个任务再先失败一次） */
+  private markDown(key: string, reason: string) {
+    const until = downUntil(reason);
+    const known = this.down.get(key) ?? 0;
+    this.down.set(key, until);
+    this.store.docPut("meta", "modelsDown", { id: "modelsDown", list: [...this.down].filter(([, t]) => t > Date.now()) });
+    if (known <= Date.now()) this.hooks.modelDown?.(key, reason, until); // 只在新判定时通知一次
+  }
+  /** 这个智能体这次该用哪个底座和模型：自己的不可用时，取兜底链里第一个可用的 */
+  private routeCli(agent: Agent, tried: Set<string> = new Set()): Agent | null {
+    const cands = [{ runtime: agent.runtime, model: agent.cliModel }, ...(this.cli?.fallbacks?.(agent) ?? [])];
+    const usable = cands.filter((c) => !tried.has(`${c.runtime}|${c.model}`) && !this.isDown(c.runtime, c.model));
+    // 自己的模型能用就用（满了就排队）；已经在兜底时，优先挑现在有空位的，都满了才排第一个的队
+    let own = usable[0] && usable[0].runtime === agent.runtime && usable[0].model === agent.cliModel ? usable[0] : null;
+    // 自己的模型排队太长（例如并发很小的订阅），而兜底链里有空位：溢出过去，别让一串任务干等
+    const limit = this.cli?.overflow?.() ?? 0;
+    if (own && limit > 0 && (this.cli?.queued?.(own.runtime, own.model) ?? 0) >= limit && usable.slice(1).some((c) => !this.cli?.busy?.(c.runtime, c.model))) own = null;
+    const ok = own ?? usable.find((c) => !this.cli?.busy?.(c.runtime, c.model)) ?? usable[0];
+    return ok ? { ...agent, runtime: ok.runtime, cliModel: ok.model } : null;
+  }
+  /** 查看暂时避开的模型（界面 / 调试用） */
+  downList() { return [...this.down].filter(([, t]) => t > Date.now()).map(([k, t]) => ({ key: k, until: new Date(t).toISOString() })); }
   private slotHandles = new Map<string, { release: () => void; reacquire: () => Promise<void> }>();
   /**
    * 阻塞等待别的工作（等测试、等委派的子任务、等人确认需求）期间让出 CLI 槽位，结束后再拿回。
@@ -292,10 +334,14 @@ export class Runtime {
     const controller = new AbortController();
     this.controllers.set(id, controller);
     const viaCli = !!agent.runtime && agent.runtime !== "builtin" && !this.forceBuiltin;
+    // 兜底：自己的模型最近用不了（额度、并发、鉴权）时，直接换成兜底链里能用的，不再先失败一次
+    const tried = new Set<string>();
+    let eff: Agent = agent;
+    if (viaCli) eff = this.routeCli(agent) ?? agent;
     // CLI 底座：先排队拿进程槽位，排队期间保持 pending（哨兵不会把它当成卡住）
     let releaseCli: (() => void) | null = null;
     if (viaCli && this.cli?.acquire) {
-      try { releaseCli = await this.cli.acquire(agent.runtime, task.priority, controller.signal); }
+      try { releaseCli = await this.cli.acquire(eff.runtime, task.priority, controller.signal, eff.cliModel); }
       catch { this.controllers.delete(id); return; } // 排队时被取消，cancel() 已写入状态
       if (controller.signal.aborted || this.store.getTask(id)?.status !== "pending") { releaseCli(); this.controllers.delete(id); return; }
       // 阻塞等待其它任务时可以让出槽位（见 waiting()）
@@ -303,7 +349,7 @@ export class Runtime {
       this.slotHandles.set(id, {
         release: () => { const r = releaseCli; releaseCli = null; r?.(); },
         // 拿回槽位用最高优先级：手上的活做了一半，应先于新任务收尾
-        reacquire: async () => { if (!releaseCli) releaseCli = await cli.acquire!(agent.runtime, 1, controller.signal); },
+        reacquire: async () => { if (!releaseCli) releaseCli = await cli.acquire!(eff.runtime, 1, controller.signal, eff.cliModel); },
       });
     }
     this.emitTask(this.store.updateTask(id, { status: "running" }));
@@ -334,13 +380,33 @@ export class Runtime {
           if (timer) return;
           timer = setTimeout(flush, Math.max(0, 2000 - (Date.now() - lastSave)));
         };
-        const out = await this.cli.run(task, agent, { system, signal: controller.signal, heartbeat: () => this.touch(id), progress }).finally(() => { if (timer) clearTimeout(timer); });
+        let out: Awaited<ReturnType<CliExecutor["run"]>>;
+        for (;;) {
+          tried.add(`${eff.runtime}|${eff.cliModel}`);
+          try {
+            out = await this.cli.run(task, eff, { system, signal: controller.signal, heartbeat: () => this.touch(id), progress, fresh: eff.runtime !== agent.runtime }).finally(() => { if (timer) clearTimeout(timer); });
+            break;
+          } catch (err) {
+            const msg = describeError(err);
+            if (controller.signal.aborted || !providerDown(msg)) throw err;
+            this.markDown(`${eff.runtime}|${eff.cliModel}`, msg);
+            const next = this.routeCli(agent, tried);
+            if (!next) throw err;
+            // 换模型：放掉原来的槽位，按新底座 / 厂商重新排队
+            releaseCli?.(); releaseCli = null;
+            const from = `${eff.runtime}${eff.cliModel ? ` ${eff.cliModel}` : ""}`;
+            eff = next;
+            this.hooks.fallback?.(this.store.getTask(id)!, from, `${eff.runtime}${eff.cliModel ? ` ${eff.cliModel}` : ""}`, msg);
+            releaseCli = await this.cli.acquire?.(eff.runtime, 1, controller.signal, eff.cliModel) ?? null;
+            if (controller.signal.aborted) return;
+          }
+        }
         if (controller.signal.aborted) return;
         if (out.transcript) this.store.saveMessages(id, out.transcript);
         this.store.updateTask(id, { inputTokens: out.inputTokens ?? 0, outputTokens: out.outputTokens ?? 0, cost: out.cost ?? 0, turns: 1 });
         return this.finish(id, { status: "completed", result: out.result });
       } catch (err) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || this.shuttingDown) return;
         return this.finish(id, { status: "failed", error: describeError(err) });
       } finally {
         releaseCli?.();

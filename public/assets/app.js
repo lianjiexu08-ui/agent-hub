@@ -1895,7 +1895,7 @@ const settings = {
   patch(p = {}) {
     Object.assign(S.settings, p);
     const x = S.settings;
-    return act("settings.patch", { defaultModel: x.defaultModel, defaultEffort: x.defaultEffort, models: x.models, runtimes: x.runtimes, budget: x.budget, guard: x.guard, notify: x.notify, qa: x.qa, concurrency: x.concurrency }).catch(fail);
+    return act("settings.patch", { defaultModel: x.defaultModel, defaultEffort: x.defaultEffort, models: x.models, runtimes: x.runtimes, budget: x.budget, guard: x.guard, notify: x.notify, qa: x.qa, concurrency: x.concurrency, fallback: x.fallback }).catch(fail);
   },
   verifyProvider: (id, f) => act("settings.verifyProvider", id ?? null, f),
   removeProvider: (id) => act("settings.removeProvider", id),
@@ -3823,11 +3823,49 @@ function runtimesSection(customService) {
       h("b", { style: "font-size:13px" }, "运行底座"),
       h("span", { class: "muted", style: "font-size:12.5px" }, "已安装的直接可用；智能体选用哪个底座，就用哪个底座的模型")),
     h("div", {}, RUNTIME_DEFS.map(card)),
+    fallbackBlock(),
     h("div", { style: "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:16px 0 6px" },
       h("b", { style: "font-size:13px" }, "自定义模型服务"),
       h("span", { class: "muted", style: "font-size:12.5px" }, "没有可用底座、或想用别的服务商时在这里配置；内置运行底座的智能体使用这里的模型")),
     customService);
 }
+
+/** 兜底换模型 + 按厂商限并发（CLI 底座） */
+function fallbackBlock() {
+  const S = settings.get();
+  S.fallback ??= { on: true, chain: [] };
+  const F = S.fallback;
+  const toLines = () => F.chain.map((c) => `${c.runtime} ${c.model}`.trim()).join("\n");
+  const chain = h("textarea", { rows: 4, style: "max-width:420px;font-family:var(--mono, monospace);font-size:12.5px", placeholder: "每行：底座 模型（模型留空 = 该 CLI 默认）\npi zai/glm-5.4\npi kimi-coding/k3.1-pro\nclaude-code" });
+  chain.value = toLines();
+  chain.onchange = () => {
+    F.chain = chain.value.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => { const [runtime, ...m] = l.split(/\s+/); return { runtime, model: m.join(" ") }; });
+    settings.patch(); toast("兜底顺序已保存", "ok");
+  };
+  const caps = Object.entries(S.runtimes ?? {}).flatMap(([rt, c]) => Object.entries(c.providers ?? {}).map(([p, n]) => `${rt} ${p} ${n}`));
+  const capEl = h("textarea", { rows: 2, style: "max-width:420px;font-family:var(--mono, monospace);font-size:12.5px", placeholder: "每行：底座 厂商 并发数，如\npi kimi-coding 2" });
+  capEl.value = caps.join("\n");
+  capEl.onchange = () => {
+    for (const c of Object.values(S.runtimes ?? {})) delete c.providers;
+    for (const l of capEl.value.split("\n").map((x) => x.trim()).filter(Boolean)) {
+      const [rt, p, n] = l.split(/\s+/);
+      if (!rt || !p || !(Number(n) > 0)) return toast(`格式不对：${l}`, "err");
+      const c = rtCfg(rt); (c.providers ??= {})[p] = Number(n);
+    }
+    settings.patch(); toast("厂商并发上限已保存", "ok");
+  };
+  const down = (S_STATE_DOWN() ?? []).map((d) => `${d.key.replace("|", " ")}（到 ${new Date(d.until).toLocaleTimeString()}）`);
+  return h("div", { style: "margin:16px 0 6px" },
+    h("div", { style: "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:6px" },
+      h("b", { style: "font-size:13px" }, "兜底换模型"),
+      h("span", { class: "muted", style: "font-size:12.5px" }, "智能体的模型用不了（额度用完、并发超限、鉴权失败、厂商故障）时，按下面的顺序换成下一个能用的继续这一步，并在工作项里留言")),
+    h("div", { class: "checks" }, checkboxP(F.on, (on) => { F.on = on; settings.patch(); }, "开启兜底", "关闭后模型用不了就直接失败，等额度恢复后再续跑")),
+    field("兜底顺序", chain, "从上到下依次尝试，跳过智能体自己正在用的那个；用不了的模型会暂时避开（额度按恢复时间，并发超限 2 分钟，鉴权失败 30 分钟）"),
+    field("排队溢出", h("div", { class: "row" }, (() => { const el = h("input", { type: "number", min: 0, max: 50, style: "width:70px", onchange: (e) => { F.overflow = Math.max(0, Number(e.target.value) || 0); settings.patch(); } }); el.value = F.overflow ?? 2; return el; })(), h("span", { class: "muted", style: "font-size:12.5px" }, "个任务在排队时，新任务改用有空位的兜底模型（0 = 不溢出，一直排队等自己的模型）")), "并发很小的订阅（如 Kimi）排起长队时，别让任务干等"),
+    field("按厂商限并发", capEl, "同一底座下不同厂商的并发上限可以单独设（模型名「/」前的部分）。例如 Kimi 订阅只允许少量并发请求"),
+    down.length ? h("div", { class: "warn", style: "font-size:12.5px" }, `暂时避开：${down.join("、")}`) : null);
+}
+const S_STATE_DOWN = () => S.modelsDown;
 
 /** 智能体编辑：运行底座选择 + 对应的模型设置 */
 function runtimePicker(d) {
@@ -4078,6 +4116,14 @@ function guardSection() {
     field("受保护分支", listEditor(G.protectedBranches, guard.save, "每行一个，支持通配符"), "智能体不能直接推送到这些分支，只能通过 PR 合并"),
     field("受保护路径", listEditor(G.protectedPaths, guard.save, "每行一个，支持通配符"), "PR 改动涉及这些路径时不会自动合并，必须由你确认"),
     field("自动合并上限", h("div", { class: "row" }, numIn(G.maxDiff, (v) => { G.maxDiff = v; guard.save(); }), h("span", { class: "muted", style: "font-size:12.5px" }, "行（增加 + 删除），超过则需要你确认")), null),
+    field("资深评审代替人放行", (() => {
+      const R = G.reviewer ?? null;
+      const set = (patch) => { G.reviewer = patch ? { agent: "code-reviewer", size: true, paths: [], ...(G.reviewer ?? {}), ...patch } : null; guard.save(); renderSettings(); };
+      return h("div", { class: "fields", style: "gap:6px" },
+        h("div", { class: "row" }, select([["", "不使用（被拦下的都等你确认）"], ...(state.agents ?? S.agents ?? []).map((a) => [a.name, a.name])], R?.agent ?? "", (v) => set(v ? { agent: v } : null), { style: "max-width:320px" })),
+        R ? h("div", { class: "checks" }, checkboxP(R.size, (on) => set({ size: on }), "改动超过行数上限时", "由它看整个 PR，通过即合并")) : null,
+        R ? field("它还可以放行的受保护路径", listEditor(R.paths, () => set({}), "从上面的受保护路径里挑，每行一个"), "例如 **/migrations/**；没列出的受保护路径仍然要你确认") : null);
+    })(), "被安全护栏拦下、且测试与 CI 都通过时，先交给这个智能体（建议用最强的模型）对整个 PR 做一次资深评审：结论通过就自动合并，需要修改就带着意见交回开发。每个工作项最多 2 次，之后交给你"),
     h("div", { class: "checks" }, checkboxP(G.requireTests, (on) => { G.requireTests = on; guard.save(); }, "测试未通过时禁止合并", "包括 Hotfix")),
     field("回滚", h("span", { style: "font-size:13px" }, "已合并的 PR 可以在工作项详情里一键回滚：自动创建并合并 revert PR，工作项回到「待规划」。")),
     field("面板访问", select([["token", "访问令牌（HUB_TOKEN）"], ["password", "账号密码登录"], ["sso", "单点登录（规划中）"]], G.access, (v) => { G.access = v; guard.save(); }, { style: "max-width:320px" }), "部署到服务器后务必开启，并通过 HTTPS 访问"));

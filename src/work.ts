@@ -17,12 +17,13 @@ import { byPriority, priorityRank } from "./priority.ts";
 import { pickDevRole } from "./roles.ts";
 import type { Notifier } from "./notify.ts";
 import type { Settings } from "./settings.ts";
-import type { CiStatus, GitHub } from "./github.ts";
+import { failureExcerpt, type CiStatus, type GitHub } from "./github.ts";
 import { pickState, statusForStateType, type Linear, type LinearState } from "./linear.ts";
 import type { Workspace } from "./workspace.ts";
-import { backoffMs, isTransientError } from "./transient.ts";
+import { backoffMs, isTransientError, quotaReset } from "./transient.ts";
+export { quotaReset };
 import { existsSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { BetaMessageParam } from "@anthropic-ai/sdk/resources/beta/messages/messages";
 
 export const PHASES = ["understand", "plan", "do", "test", "review"] as const;
@@ -64,6 +65,10 @@ export interface Issue {
   resumeFrom?: Phase | null;
   /** 生命周期走完却没有 PR、被自动退回执行阶段的次数（上限 1） */
   missingPrFixes?: number;
+  /** 交回修 CI 时失败的那个提交：汇报执行完成时代码还停在这里，说明没修，不接受 */
+  ciFixSha?: string | null;
+  /** 资深评审做过几次（超过上限的大改动 / 受保护路径） */
+  seniorReviews?: number;
   /** 因 CI 未通过被自动交回开发智能体的次数（上限 2） */
   ciFixes?: number;
   /** 因与主干冲突被自动交回开发智能体的次数（上限 2） */
@@ -76,7 +81,7 @@ export interface Issue {
   waitingRestart?: boolean;
 }
 export interface Comment { id: number; issueId: number; author: string; kind: "user" | "agent" | "lead" | "system"; body: string; runId: string | null; createdAt: string }
-export interface Lead { agent: string; mode: "off" | "on_demand" | "autopilot"; duties: { flow: boolean; review: boolean; bugs: boolean; testing: boolean }; mergePolicy: "auto" | "manual"; dailyRuns: number; runsToday: number; runsDay?: string; activity: { at: string; text: string }[] }
+export interface Lead { agent: string; mode: "off" | "on_demand" | "autopilot"; duties: { flow: boolean; review: boolean; bugs: boolean; testing: boolean }; mergePolicy: "auto" | "manual"; dailyRuns: number; runsToday: number; runsDay?: string; activity: { at: string; text: string }[]; /** 上次例行巡检：时间与当时工作项状态的指纹（没有变化就不再花一次模型调用） */ patrol?: { at: string; sig: string; taskId?: string } }
 export interface LinearBinding {
   teamId: string; teamKey: string; teamName: string;
   mode: "two_way" | "import" | "push" | "off";
@@ -123,6 +128,8 @@ export function flowOf(p: Pick<Project, "flow" | "linear">): Flow {
 }
 export interface Delivery { baseBranch: string; mode: "pr" | "branch" | "local"; localPath: string; afterMerge: string }
 export interface Project {
+  /** 这个仓库出现过 CI 检查（之后新提交上暂时没有检查时，当成还没开始而不是没有 CI） */
+  ciSeen?: boolean;
   id: string; name: string; key: string; description: string; createdAt: string; nextNumber: number;
   repo: { fullName: string; defaultBranch?: string } | null;
   sync: {
@@ -199,23 +206,6 @@ export interface QAPort {
   failureReport?(id: string, shotDir?: string): string;
 }
 
-/**
- * 运行失败是不是模型订阅 / 接口的额度用完了（5 小时额度、限流等）。是的话返回预计恢复的时间，否则 null。
- * 认得的写法：「reset at 2026-11-26 16:16:42」（无时区按本机时间）、ISO 时间、「limit reached|<unix 秒>」（Claude Code）、
- * 「try again in 30 minutes / 45s」「resets in 2h」；认出是额度问题但没给时间时，按 15 分钟后再试。
- */
-export function quotaReset(error: string | null | undefined, failedAt: Date = new Date()): Date | null {
-  const e = error ?? "";
-  if (!/usage limit|rate.?limit|quota|limit (?:reached|exceeded)|too many requests|\b429\b|额度|限额|限流/i.test(e)) return null;
-  const at = e.match(/reset(?:s)? (?:at|on)\s*:?\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/i);
-  if (at) { const d = new Date(at[1].replace(" ", "T")); if (!isNaN(+d)) return d; }
-  const epoch = e.match(/limit reached\|(\d{10})/i);
-  if (epoch) return new Date(Number(epoch[1]) * 1000);
-  const rel = e.match(/(?:try again|retry|reset(?:s)?) in (?:about )?(\d+(?:\.\d+)?)\s*(h|hours?|m|min(?:ute)?s?|s|sec(?:ond)?s?)\b/i);
-  if (rel) { const n = Number(rel[1]); const unit = rel[2][0].toLowerCase(); return new Date(+failedAt + n * (unit === "h" ? 3_600_000 : unit === "m" ? 60_000 : 1000)); }
-  return new Date(+failedAt + 15 * 60_000);
-}
-
 export class Work {
   private store: Store;
   private runtime: Runtime;
@@ -254,6 +244,17 @@ export class Work {
     runtime.setHooks({
       continuation: (task) => this.continuation(task),
       systemExtra: (task, agent) => this.systemExtra(task, agent),
+      modelDown: (key, reason, until) => {
+        // 鉴权失败、余额不足这类不会自己恢复，要人去处理：主动通知
+        if (!/\b(401|403)\b|unauthori[sz]ed|authentication|身份验证|invalid.{0,20}api.?key|api.?key.{0,20}invalid|not logged in|login|credit balance|余额/i.test(reason) || /concurren(?:t|cy)/i.test(reason)) return;
+        const [rt, model] = key.split("|");
+        this.notify.push("budget", `模型 ${model || rt} 无法使用，需要你处理`, `${rt}${model ? ` ${model}` : ""} 报错：${reason.slice(0, 200)}。看起来是密钥失效、未登录或余额不足，请重新配置。在 ${new Date(until).toLocaleTimeString()} 之前，用到它的智能体会自动改用兜底链里的其他模型。`, null);
+      },
+      fallback: (task, from, to, reason) => {
+        const root = task.parentId ? this.store.getTask(task.rootId) ?? task : task;
+        const i = root.issueId != null ? this.getIssue(root.issueId) : null;
+        if (i) this.addComment(i.id, "system", "system", `↪ ${task.agent} 的模型 ${from} 暂时用不了（${reason.slice(0, 160)}），这一步自动改用 ${to} 继续`, root.id);
+      },
     });
     this.registerTools();
     this.reconcile();
@@ -1089,6 +1090,8 @@ export class Work {
   private leadOf(i: Issue): Lead | null { const l = this.proj(i.projectId)?.lead; return l && l.mode !== "off" ? l : null; }
 
   /** 负责人巡检：分诊 bug；持续迭代模式下提出改进项 */
+  /** 两次例行巡检的最短间隔（测试里调小） */
+  patrolGapMs = 30 * 60_000;
   async leadTick() {
     const day = new Date().toDateString();
     for (const p of this.projectsRaw()) {
@@ -1125,7 +1128,15 @@ export class Work {
         // 真实模式：让负责人智能体巡检项目，必要时用 create_issue 提出改进项
         if (!this.store.getAgent(L.agent)) continue;
         const open = its.filter((i) => !["done", "canceled"].includes(i.status)).map((i) => `- ${this.key(i)} [${STATUS_LABEL[i.status]}] ${i.title}`).join("\n");
-        this.runtime.submit(L.agent, `你是项目「${p.name}」的负责人，正在做例行巡检。\n\n未完成的工作项：\n${open || "（无）"}\n\n如果发现明确、有价值且不与现有工作项重复的改进点，用 create_issue 提出至多 1 个（写清验收标准，指派给合适的智能体并设为 todo）；没有就直接回复「无需新增」。`, { source: "issue" });
+        // 巡检要花一次完整的模型调用（负责人通常用最贵的模型）：上次巡检还没结束、距上次不到 30 分钟、
+        // 或者工作项状态和上次巡检时完全一样（例如夜里都在等额度），就跳过
+        const sig = createHash("sha1").update(open).digest("hex").slice(0, 16);
+        const prev = L.patrol;
+        const prevTask = prev?.taskId ? this.store.getTask(prev.taskId) : null;
+        if (prevTask && !TERMINAL.has(prevTask.status)) continue;
+        if (prev && (Date.now() - Date.parse(prev.at) < this.patrolGapMs || prev.sig === sig)) continue;
+        const patrolTask = this.runtime.submit(L.agent, `你是项目「${p.name}」的负责人，正在做例行巡检。\n\n未完成的工作项：\n${open || "（无）"}\n\n如果发现明确、有价值且不与现有工作项重复的改进点，用 create_issue 提出至多 1 个（写清验收标准，指派给合适的智能体并设为 todo）；没有就直接回复「无需新增」。`, { source: "issue" });
+        p.lead.patrol = { at: now(), sig, taskId: patrolTask.id };
         this.leadLog(p, "持续迭代：开始例行巡检");
       }
       p.lead.runsToday++;
@@ -1441,7 +1452,11 @@ export class Work {
     const last = runs.at(-1);
     const quota = i.status === "todo" && last?.status === "failed" ? quotaReset(last.error, new Date(last.updatedAt)) : null;
     if (quota && +quota > Date.now()) return { text: `等额度 ${quota.toTimeString().slice(0, 5)}`, tone: "wait", title: `模型额度用完，预计 ${quota.toLocaleString()} 恢复后自动继续` };
+    // 被重启或网络抖动打断：不是这张单的问题，哨兵会自动续跑，别显示成「失败」
+    if (i.status === "todo" && last?.status === "failed" && (/interrupted by service restart|服务重启/.test(last.error ?? "") || isTransientError(last.error)))
+      return { text: "等待续跑", tone: "wait", title: `${(last.error ?? "").slice(0, 200)}。不是需求或代码的问题，哨兵会自动从中断的阶段继续` };
     if (i.status === "todo" && last?.status === "failed") return { text: "上次失败", tone: "fail", title: last.error ?? "" };
+    if (i.status === "in_review" && this.waitingCi.has(i.id)) return { text: "等 CI", tone: "wait", title: `等 GitHub 上的 CI 跑完${i.pr?.ci?.pending?.length ? `（${i.pr.ci.pending.join("、")}）` : ""}，之后自动审核、合并` };
     if (i.status === "in_review" && i.pr?.guard && i.pr.state === "open") return { text: "等你确认合并", tone: "need", title: i.pr.guard };
     if (i.status === "in_review" && i.pr?.local === "local" && i.pr.state === "merged") return { text: "待提测", tone: "wait", title: "已合并本地开发分支，等人工提测" };
     if (i.status === "todo" && i.assignee && !last) return { text: "待开始", tone: "wait" };
@@ -1636,6 +1651,20 @@ export class Work {
       ...(i.phase === "do" ? (() => { const f = this.testFailures(i).filter((x) => x.cycle === i.cycle).at(-1); return f ? ["", "这次返工要解决的测试失败（完整记录）：", f.report] : []; })() : []),
     ].join("\n");
   }
+  /** 每个运行已经转交到哪条留言（时间） */
+  private notesSeen = new Map<string, string>();
+  /**
+   * 运行期间新来的人工 / 负责人留言：智能体每次调用 Hub 工具时附在结果后面。
+   * 否则留言只在下次运行开始时才看得到——正在跑的智能体会按过时的指示一路做完。
+   */
+  private newNotes(task: Task): string {
+    if (task.issueId == null || task.parentId !== null) return "";
+    const since = this.notesSeen.get(task.id) ?? task.createdAt;
+    const fresh = this.comments(task.issueId).filter((c) => (c.kind === "user" || c.kind === "lead") && c.author !== task.agent && c.createdAt > since);
+    if (!fresh.length) return "";
+    this.notesSeen.set(task.id, fresh.at(-1)!.createdAt);
+    return `\n\n---\n📨 你运行期间工作项里有新留言，请据此调整接下来的做法（与之前的指示冲突时以这里为准）：\n${fresh.map((c) => `[${c.author}] ${c.body.slice(0, 2000)}`).join("\n\n")}`;
+  }
   /** CLI 底座询问这次运行用哪个会话 */
   sessionFor(task: Task): { id: string; resume: boolean } | null {
     if (task.issueId == null || task.parentId !== null || task.source !== "issue") return null;
@@ -1740,6 +1769,19 @@ export class Work {
     rec.endedAt = now();
     rec.note = input.note.slice(0, 500);
 
+    if (rec.phase === "do" && i.ciFixSha) {
+      // 交回修 CI 后汇报完成：代码必须比失败的那个提交新，否则就是没修
+      const p = this.proj(i.projectId);
+      const head = p ? await this.workspace.head(p, this.key(i)) : null;
+      if (head && head === i.ciFixSha) {
+        rec.result = "active";
+        rec.endedAt = null;
+        this.save(i);
+        this.addComment(i.id, "system", "system", `⚠ ${task.agent} 汇报执行完成，但代码还停在 CI 失败的提交 ${head.slice(0, 7)}，没有新的修复。已退回，要求先修复 CI`, task.id);
+        return `CI 失败的提交是 ${head.slice(0, 7)}，你的工作目录还停在这个提交上，没有任何修复。CI 的失败是真实的（日志见工作项里负责人的留言），不是重启或环境问题。请复现并修复，提交后再调用 report_phase(phase="do")。确实无法修复时，用 comment_issue 写明原因，等人处理。`;
+      }
+      i.ciFixSha = null;
+    }
     if (rec.phase === "do") {
       // 有代码改动：提交并创建 / 更新 PR
       const out = await this.afterDo(i, task).catch((e) => {
@@ -1844,7 +1886,7 @@ export class Work {
           : `↗ 已推送分支 ${res.branch}（未开 PR），+${res.additions} −${res.deletions}，${res.files} 个文件${gen}`);
         return dv.mode === "local" ? `改动已提交到本地分支 ${res.branch}。` : `已推送分支 ${res.branch}。`;
       }
-      const pr = i.pr?.state === "open" && !i.pr.local ? i.pr : await this.github.createPR(p.repo!.fullName, { title: `${this.key(i)}: ${i.title}`, head: res.branch, base: baseOf(p), body: `${i.description}\n\n${i.github ? `Closes #${i.github.number}` : ""}` }).then((r) => ({ number: r.number, branch: res.branch, state: "open" as const, checks: "pending" as const, tests: null, additions: res.additions, deletions: res.deletions, files: res.files }));
+      const pr = i.pr?.state === "open" && !i.pr.local ? i.pr : await this.github.createPR(p.repo!.fullName, { title: `${this.key(i)}: ${i.title}`, head: res.branch, base: baseOf(p), body: `${i.description}\n\n${i.github ? `Refs #${i.github.number}（由 Agent Hub 在最终验收后关闭，不随 PR 合并自动关闭）` : ""}` }).then((r) => ({ number: r.number, branch: res.branch, state: "open" as const, checks: "pending" as const, tests: null, additions: res.additions, deletions: res.deletions, files: res.files }));
       i.pr = { ...pr, additions: res.additions, deletions: res.deletions, files: res.files, generated: res.generated, testLines: res.tests };
       this.save(i);
       this.addComment(i.id, "system", "system", `↗ 已提交 PR #${i.pr.number}（${res.branch} → ${baseOf(p)}），+${res.additions} −${res.deletions}，${res.files} 个文件${gen}${res.tests.lines ? `，其中测试 ${res.tests.lines} 行` : ""}`);
@@ -1974,6 +2016,19 @@ export class Work {
     // 人已批准过合并、这次只是解决了冲突：改动大小 / 受保护路径人已看过，不再拦；测试或 CI 失败仍然拦
     const approved = i.mergeApproved && gv && !/测试未通过|CI /.test(gv) ? i.mergeApproved : null;
     if (approved) gv = null;
+    // 资深评审代替人：只因改动大 / 涉及允许的受保护路径被拦时，交给资深评审看整个 PR
+    const R = this.settings.guard().reviewer;
+    if (gv && R?.agent && i.pr && !/测试未通过|CI /.test(gv)) {
+      const waive = { size: R.size, paths: R.paths };
+      const rest = await this.guardCheck(i, waive);
+      // 还有资深评审不能代替的原因：提示里把要人确认的那条放前面
+      if (rest && rest !== gv) gv = `${rest}（另：${gv}）`;
+      if (!rest) {
+        const verdict = await this.seniorReview(i, gv);
+        if (verdict === "pass") { lines.push(`🔍 ${gv}：已由 ${R.agent} 对整个 PR 做资深评审，结论通过，代替人工放行。`); gv = null; }
+        else if (verdict === "returned") { this.save(i); this.emit("lead"); return; }
+      }
+    }
     // CI 没过多半是代码问题：交回开发智能体看日志修复（最多 2 次），而不是停在人这里
     if (i.pr?.ci?.state === "failing" && await this.fixCiFailure(i, L.agent)) {
       lines.push(`❌ CI 未通过（${i.pr.ci.failed.join("、")}），已交回 ${i.assignee} 查看日志并修复（第 ${i.ciFixes} 次），修好后重新走测试和评审。`);
@@ -2004,7 +2059,8 @@ export class Work {
           this.notify.push("review", `${key} 等你最终验收`, `${i.title}：测试与 AI 审核已通过，PR #${i.pr.number} 已合并。`, key);
         }
       } catch (e) {
-        if (isMergeConflict(e) && await this.fixMergeConflict(i, L.agent)) lines.push(`合并 PR #${i.pr.number} 时与主干冲突（评审期间主干有新提交），已安排 ${i.assignee} 合并主干、解决冲突后重新走测试和评审。`);
+        if (e instanceof CiAfterSync && await this.fixCiFailure(i, L.agent)) lines.push(`${e.message}：和期间合入主干的改动合在一起出了问题，已交回 ${i.assignee} 查看日志并修复（第 ${i.ciFixes} 次）。`);
+        else if (isMergeConflict(e) && await this.fixMergeConflict(i, L.agent)) lines.push(`合并 PR #${i.pr.number} 时与主干冲突（评审期间主干有新提交），已安排 ${i.assignee} 合并主干、解决冲突后重新走测试和评审。`);
         else {
           lines.push(`合并 PR #${i.pr.number} 失败：${(e as Error).message}。请手动处理。`);
           this.notify.push("review", `${key} 合并失败，需要你处理`, (e as Error).message, key);
@@ -2071,6 +2127,9 @@ export class Work {
     if (!i.pr || i.pr.local || !p?.repo || !this.github.available()) return null;
     const t0 = Date.now();
     let last: CiStatus | null = null;
+    // 刚推送 / 刚同步主干时，GitHub 要过几秒到几十秒才在新提交上建出检查。这段时间查到的「没有任何检查」不等于仓库没有 CI：
+    // 仓库以前出现过 CI、或者配了 GitHub Actions 工作流，就把「没有检查」当成还没开始，继续等（最多 noneWaitMs）
+    let expectCi: boolean | null = null;
     // 等待期间：不进「需要你处理」（Hub 会自己处理），每次查到的进度写进 PR 给界面看
     this.waitingCi.add(i.id);
     try {
@@ -2080,6 +2139,13 @@ export class Work {
         const cur = this.getIssue(i.id);
         if (cur?.pr) { cur.pr.ci = last; this.save(cur); this.emit("issue"); }
         if (i.pr) i.pr.ci = last;
+        if (["passing", "failing", "pending"].includes(last.state) && !p.ciSeen) { const fresh = this.proj(p.id); if (fresh) { fresh.ciSeen = true; this.saveProj(fresh); } p.ciSeen = true; }
+        if (last.state === "none") {
+          expectCi ??= !!p.ciSeen || (await this.github.hasWorkflows(p.repo.fullName).catch(() => false));
+          if (expectCi && Date.now() - t0 < this.noneWaitMs) { await new Promise((r) => setTimeout(r, Math.min(everyMs, 10_000))); continue; }
+          if (expectCi) last = { ...last, state: "unknown", error: `仓库配置了 CI，但 ${Math.round(this.noneWaitMs / 60_000)} 分钟内这次提交上没有出现任何检查` };
+          return last;
+        }
         if (last.state !== "pending" || Date.now() - t0 >= timeoutMs) return last;
         await new Promise((r) => setTimeout(r, everyMs));
       }
@@ -2095,28 +2161,40 @@ export class Work {
     i.lifecycleDone = false;
     i.resumeFrom = "do";
     this.save(i);
+    i.ciFixSha = ci.sha;
+    this.save(i);
     const links = (ci.failedUrls ?? []).map((u) => `- ${u}`).join("\n");
-    this.addComment(i.id, by, "lead", `PR #${i.pr.number} 的 CI 没有通过：${ci.failed.join("、")}（提交 ${ci.sha.slice(0, 7)}）。\n${links ? `${links}\n` : ""}请先查看失败日志（例如 \`gh run view --log-failed\` 或打开上面的链接），在工作目录里复现并修复，确认相关测试通过后照常提交；其余工作已完成，不必重做。`);
+    // 把失败日志的关键行直接给智能体：只给链接时它可能不去看，凭印象判断「是环境问题」就交差
+    const p = this.proj(i.projectId);
+    const logs: string[] = [];
+    for (const u of (ci.failedUrls ?? []).slice(0, 2)) {
+      const job = /\/job\/(\d+)/.exec(u)?.[1];
+      if (!job || !p?.repo) continue;
+      const text = await this.github.jobLog(p.repo.fullName, job).then((l) => failureExcerpt(l), () => "");
+      if (text) logs.push(`\`\`\`\n${text}\n\`\`\``);
+    }
+    this.addComment(i.id, by, "lead", `PR #${i.pr.number} 的 CI 没有通过：${ci.failed.join("、")}（提交 ${ci.sha.slice(0, 7)}）。\n${links ? `${links}\n` : ""}${logs.length ? `\n失败日志的关键部分：\n${logs.join("\n")}\n\n` : ""}这是 GitHub 上 CI 的真实结果，不是重启或环境造成的。完整日志可用 \`gh run view --log-failed\` 或打开上面的链接查看。请在工作目录里复现并修复（本地通过但 CI 失败时，重点看 CI 与本地环境的差异，例如时序、无头浏览器、依赖版本），确认相关测试通过后提交新的修复；没有新提交就汇报完成会被退回。其余工作已完成，不必重做。`);
     await this.syncStatusRemote(i).catch(() => []);
     this.emit("issue");
     void this.startRun(this.getIssue(i.id)!, by);
     return true;
   }
 
-  private async guardCheck(i: Issue): Promise<string | null> {
+  private async guardCheck(i: Issue, waive: { size?: boolean; paths?: string[] } = {}): Promise<string | null> {
     const G = this.settings.guard();
     if (!i.pr) return null;
     if (G.requireTests && i.pr.checks === "failing") return "测试未通过";
     if (G.requireTests && i.pr.ci?.state === "failing") return `CI 未通过（${i.pr.ci.failed.join("、")}）`;
+    if (G.requireTests && i.pr.ci?.state === "unknown" && /没有出现任何检查/.test(i.pr.ci.error ?? "")) return `CI 没有运行（${i.pr.ci.error}）`;
     if (G.requireTests && i.pr.ci?.state === "pending") return `CI 还没跑完（${i.pr.ci.pending.join("、")}），等它结束后再合并`;
     // 行数上限只算要人评审的业务代码：锁文件 / 生成文件本来就不在 additions 里，测试代码在这里扣掉
     const tests = i.pr.testLines?.lines ?? 0;
     const n = i.pr.additions + i.pr.deletions - tests;
-    if (G.maxDiff && n > G.maxDiff) return `改动 ${n} 行${tests ? `（另有测试代码 ${tests} 行，不计入）` : ""}，超过自动合并上限 ${G.maxDiff} 行`;
+    if (G.maxDiff && n > G.maxDiff && !waive.size) return `改动 ${n} 行${tests ? `（另有测试代码 ${tests} 行，不计入）` : ""}，超过自动合并上限 ${G.maxDiff} 行`;
     const p = this.proj(i.projectId)!;
     let files: string[] = [];
     if (!i.pr.simulated && !i.pr.local && this.github.available() && p.repo) files = await this.github.prFiles(p.repo.fullName, i.pr.number).catch(() => []);
-    const hit = files.length ? G.protectedPaths.find((g) => files.some((f) => globMatch(g, f))) : null;
+    const hit = files.length ? G.protectedPaths.filter((g) => !waive.paths?.includes(g)).find((g) => files.some((f) => globMatch(g, f))) : null;
     if (hit) return `改动涉及受保护路径 ${hit}`;
     if (!files.length) {
       // 拿不到文件列表（演示模式）时按标题和描述的关键词判断
@@ -2126,6 +2204,83 @@ export class Work {
     }
     return null;
   }
+  /**
+   * 合并前确认 PR 包含最新主干：多个 PR 并行开发时，各自的 CI 都是对着旧主干跑的，
+   * 先合进去一个，另一个的 CI 结果就过时了（例如两边各加了一个同号的数据库迁移，单独都能过、合在一起就坏）。
+   * 落后时先让 GitHub 把主干合进分支（Update branch），等 CI 对新提交重新跑完；失败则抛 CiAfterSync，由调用方交回开发修。
+   * 有冲突时抛「merge conflict」，走原来的冲突处理。读不到比较结果时不拦（不比原来差）。
+   */
+  /**
+   * 资深评审：对整个 PR 做一次全面评审（被护栏拦下的大改动 / 受保护路径）。
+   * pass：放行；returned：带着意见交回开发（已安排续跑）；skip：评审没给出结论或次数用完，交给人。
+   */
+  private async seniorReview(i: Issue, why: string): Promise<"pass" | "returned" | "skip"> {
+    const R = this.settings.guard().reviewer;
+    const p = this.proj(i.projectId);
+    if (!R?.agent || !i.pr || !p || (i.seniorReviews ?? 0) >= 2 || !this.store.getAgent(R.agent)) return "skip";
+    i.seniorReviews = (i.seniorReviews ?? 0) + 1;
+    this.save(i);
+    const key = this.key(i);
+    const dir = this.workspace.enabledFor(p, this.store.getAgent(i.assignee ?? "") ?? undefined) ? this.workspace.dir(p, key) : null;
+    this.addComment(i.id, "system", "system", `🔍 ${why}。按设置交给 ${R.agent} 对整个 PR 做资深评审（第 ${i.seniorReviews} 次），通过后自动合并`);
+    this.emit("issue");
+    const input = [
+      `请对 ${key}「${i.title}」的 PR #${i.pr.number}（分支 ${i.pr.branch} → ${baseOf(p)}）做一次全面的资深评审。它被安全护栏拦下：${why}。你的结论将代替人工决定是否合并。`,
+      dir ? `代码在本机目录 ${dir}，用 \`git -C ${dir} diff origin/${baseOf(p)}...HEAD\` 查看全部改动。` : `用 \`gh pr diff ${i.pr.number} -R ${p.repo?.fullName}\` 查看全部改动。`,
+      `需求与验收标准：\n${i.description.slice(0, 4000)}`,
+      "重点：是否满足需求、正确性与边界、数据库迁移是否可升级 / 回滚且与主干上已有迁移不冲突、鉴权与数据安全、并发与幂等、是否有与需求无关的改动、测试是否覆盖关键路径。只读代码，不要修改、提交或推送。",
+      "最后一行必须是「结论：通过」或「结论：需要修改」。需要修改时，在前面逐条列出必须修改的问题（位置、原因、改法）；建议性的问题不要阻塞。",
+    ].join("\n\n");
+    const r = await this.runtime.callAgent(R.agent, input, { timeoutMs: 40 * 60_000, priority: 1 }).catch((e) => ({ status: "failed", result: null, error: (e as Error).message }));
+    const text = (r.result ?? "").trim();
+    const last = text.split("\n").filter((l) => l.trim()).at(-1) ?? "";
+    if (r.status === "completed" && /结论[:：]\s*通过/.test(last)) {
+      this.addComment(i.id, R.agent, "lead", `🔍 资深评审通过\n\n${text.slice(-3000)}`);
+      return "pass";
+    }
+    if (r.status === "completed" && /结论[:：]\s*需要修改/.test(last) && i.assignee) {
+      this.addComment(i.id, R.agent, "lead", `🔍 资深评审：需要修改，已交回 ${i.assignee}\n\n${text.slice(-6000)}`);
+      i.status = "todo";
+      i.lifecycleDone = false;
+      i.resumeFrom = "do";
+      this.save(i);
+      await this.syncStatusRemote(i).catch(() => []);
+      void this.startRun(this.getIssue(i.id)!, "资深评审");
+      return "returned";
+    }
+    this.addComment(i.id, "system", "system", `🔍 资深评审没有给出明确结论（${r.error ?? "最后一行不是「结论：…」"}），交给你决定`);
+    return "skip";
+  }
+
+  private async syncBeforeMerge(i: Issue, p: Project) {
+    if (!i.pr || !p.repo) return;
+    const full = p.repo.fullName;
+    const head = await this.github.pr(full, i.pr.number).then((r) => r.head.sha).catch(() => null);
+    if (!head) return;
+    const behind = await this.github.behindBy(full, baseOf(p), head).catch(() => 0);
+    if (!behind) return;
+    try { await this.github.updateBranch(full, i.pr.number, head); }
+    catch (e) {
+      if (/→ 422/.test((e as Error).message)) throw new Error(`merge conflict：PR 落后主干 ${behind} 个提交，自动同步时有冲突`);
+      throw e;
+    }
+    this.addComment(i.id, "system", "system", `↻ PR #${i.pr.number} 落后主干 ${behind} 个提交（期间合入了别的工作项），已把最新主干合进分支，等 CI 对合并结果重新跑完再合并`);
+    // GitHub 异步生成合并提交：等 PR 的 head 变了再看 CI
+    for (let t = 0; t < 30; t++) {
+      const cur: string = await this.github.pr(full, i.pr.number).then((r) => r.head.sha, () => head);
+      if (cur !== head) break;
+      await new Promise((r) => setTimeout(r, this.syncPollMs));
+    }
+    const ci = await this.waitCi(i, 20 * 60_000, this.syncPollMs * 15);
+    if (i.pr) { i.pr.ci = ci; this.save(i); }
+    if (ci?.state === "failing") throw new CiAfterSync(ci.failed);
+    if (ci?.state === "unknown" && /没有出现任何检查/.test(ci.error ?? "")) throw new Error(`同步主干后 ${ci.error}，没有合并，请到 GitHub 确认`);
+    if (ci?.state === "pending") throw new Error(`同步主干后 CI 超过 20 分钟还没跑完（${ci.pending.join("、")}），稍后再合并`);
+  }
+  /** 测试里调小 */
+  syncPollMs = 2000;
+  /** 仓库有 CI 时，新提交上迟迟没有检查最多等多久 */
+  noneWaitMs = 5 * 60_000;
   private async merge(i: Issue, by: string) {
     if (!i.pr || i.pr.state !== "open") return;
     const p = this.proj(i.projectId)!;
@@ -2142,6 +2297,7 @@ export class Work {
       }
     } else if (!i.pr.simulated) {
       if (!this.github.available() || !p.repo) throw new Error("未配置 GitHub Token，无法合并");
+      await this.syncBeforeMerge(i, p);
       await this.github.mergePR(p.repo.fullName, i.pr.number);
     }
     i.pr.state = "merged";
@@ -2200,6 +2356,11 @@ export class Work {
     }
     try { await this.merge(i, ME); }
     catch (e) {
+      if (e instanceof CiAfterSync) {
+        i.mergeApproved = { by: ME, at: now() };
+        if (await this.fixCiFailure(i, ME)) throw new WorkError(`${e.message}，已交回 ${i.assignee} 修复（第 ${i.ciFixes} 次）。你已批准合并，修好后测试与 CI 通过会直接合并`, 409);
+        throw new WorkError(`${e.message}，请手动处理`, 409);
+      }
       if (isMergeConflict(e)) {
         if (await this.fixMergeConflict(i, ME)) throw new WorkError(`PR #${i.pr.number} 与主干冲突，已安排 ${i.assignee} 合并主干、解决冲突后重新提交（第 ${i.mergeFixes} 次）。你已批准合并，解决后测试与 CI 通过会直接合并`, 409);
         throw new WorkError(`PR #${i.pr.number} 与主干冲突，而且没有可以交回的开发智能体（先指派一个），请手动处理`, 409);
@@ -2316,6 +2477,15 @@ export class Work {
   private reconcile() {
     for (const i of this.issues().filter((x) => x.status === "in_review" && x.lifecycleDone && !x.pr && !this.activeRun(x.id)))
       setImmediate(() => void this.missingPr(this.getIssue(i.id)!).catch(() => {}));
+    // 交付收尾（等 CI、审核、合并）做到一半被重启打断：PR 还开着、没被拦、也没审核完，重新做一遍收尾
+    for (const i of this.issues().filter((x) => x.status === "in_review" && x.lifecycleDone && x.pr?.state === "open" && !x.pr.guard && !x.pr.reviewed && (this.leadOf(x) || x.mergeApproved || x.labels.includes("hotfix")) && !this.activeRun(x.id))) {
+      this.addComment(i.id, "system", "system", "服务重启时交付收尾（等 CI、审核、合并）还没做完，重新进行");
+      setImmediate(() => void this.afterDeliver(this.getIssue(i.id)!).catch(() => {}));
+    }
+    // 开启「资深评审代替人放行」之前就被护栏拦下的：按新规则再判断一次（测试 / CI 不过的不管）
+    if (this.settings.guard().reviewer?.agent)
+      for (const i of this.issues().filter((x) => x.status === "in_review" && x.pr?.state === "open" && x.pr.guard && !/测试未通过|CI /.test(x.pr.guard) && !x.seniorReviews && !this.activeRun(x.id)))
+        setImmediate(() => void this.afterDeliver(this.getIssue(i.id)!).catch(() => {}));
     let resumed = 0;
     for (const i of this.issues().filter((x) => x.status === "in_progress")) {
       if (this.activeRun(i.id)) continue;
@@ -2363,8 +2533,8 @@ export class Work {
       async (raw: unknown, ctx: { task: Task; agent: { name: string }; signal: AbortSignal }) => {
         const parsed = schema.safeParse(raw);
         if (!parsed.success) return { content: `参数不合法：${parsed.error.message}`, isError: true };
-        try { return { content: await fn(parsed.data, ctx.task, ctx.agent.name, ctx.signal) }; }
-        catch (err) { return { content: err instanceof Error ? err.message : String(err), isError: true }; }
+        try { return { content: (await fn(parsed.data, ctx.task, ctx.agent.name, ctx.signal)) + this.newNotes(ctx.task) }; }
+        catch (err) { return { content: (err instanceof Error ? err.message : String(err)) + this.newNotes(ctx.task), isError: true }; }
       };
     const isIssueRoot = (task: Task) => task.issueId != null && task.parentId === null && !!this.getIssue(task.issueId);
 
@@ -2446,6 +2616,11 @@ function ciReadError(e: unknown): string {
   return m.slice(0, 160);
 }
 /** GitHub 合并接口的冲突：405 Pull Request is not mergeable */
+/** 同步主干后 CI 没过：多半是和别的工作项的改动合在一起出了问题，交回开发修 */
+class CiAfterSync extends Error {
+  failed: string[];
+  constructor(failed: string[]) { super(`把最新主干合进 PR 后 CI 未通过（${failed.join("、")}）`); this.failed = failed; }
+}
 function isMergeConflict(e: unknown): boolean { return /→ 405|not mergeable|merge conflict/i.test((e as Error)?.message ?? ""); }
 function globMatch(glob: string, path: string): boolean {
   const re = new RegExp("^" + glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*\/?/g, "§").replace(/\*/g, "[^/]*").replace(/§/g, ".*") + "$");

@@ -75,3 +75,16 @@ test("智能体自己已经提交、工作目录只剩 Hub 的 pi 配置：照�
   assert.ok(git(remote, "rev-parse", "--verify", "agent/s2t-13"));
   assert.throws(() => git(remote, "cat-file", "-e", "agent/s2t-13:.pi/mcp.json"), "含令牌的 pi 配置没有提交");
 });
+
+test("智能体自己推过分支、之后又改了历史：Hub 推送不因 stale info 被拒", async () => {
+  const { ws, p, remote, pushMain } = setup();
+  const dir = await ws.prepare(p, "S2T-32");
+  writeFileSync(join(dir, "app.txt"), "line1 v1\nline2\nline3\n");
+  git(dir, "commit", "-am", "v1");
+  git(dir, "push", "-q", remote, "HEAD:refs/heads/agent/s2t-32"); // 智能体自己推送
+  git(dir, "commit", "--amend", "-qm", "v1 改写"); // 又改写了提交
+  pushMain("shared.txt", "a\nmain moved\n");
+  const res = await ws.commitAndPush(p, "S2T-32", "S2T-32: 推送");
+  assert.ok(res && !("conflict" in res && res.conflict), "推送成功");
+  assert.equal(git(remote, "rev-parse", "agent/s2t-32"), git(dir, "rev-parse", "HEAD"), "远端分支是 Hub 合并主干后的最新提交");
+});

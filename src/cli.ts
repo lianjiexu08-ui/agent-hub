@@ -96,13 +96,29 @@ export class CliRunner implements CliExecutor {
     this.cwdFor = opts.cwdFor;
   }
 
-  private slotsFor(rt: string) {
-    let s = this.slots.get(rt);
-    if (!s) { s = new PrioritySlots(() => this.settings.get().runtimes[rt]?.max || 1); this.slots.set(rt, s); }
+  private slotsFor(rt: string, provider?: string) {
+    const key = provider ? `${rt}:${provider}` : rt;
+    let s = this.slots.get(key);
+    if (!s) {
+      s = new PrioritySlots(() => (provider ? this.settings.get().runtimes[rt]?.providers?.[provider] : this.settings.get().runtimes[rt]?.max) || 1);
+      this.slots.set(key, s);
+    }
     return s;
   }
-  /** 超过并发上限时按优先级排队，而不是让任务失败 */
-  acquire(rt: string, priority: number, signal: AbortSignal) { return this.slotsFor(rt).acquire(priority, signal); }
+  /**
+   * 超过并发上限时按优先级排队，而不是让任务失败。
+   * 同一个底座下不同厂商的并发上限可以单独设（如 pi 下 Kimi 订阅只允许少量并发请求）：
+   * 先排厂商的队，拿到后再占底座的槽位，避免等 Kimi 的任务占着 pi 的槽位、把 GLM 的任务也堵住。
+   */
+  async acquire(rt: string, priority: number, signal: AbortSignal, model?: string) {
+    const provider = model?.includes("/") ? model.split("/")[0] : "";
+    const capped = provider && this.settings.get().runtimes[rt]?.providers?.[provider];
+    const releaseProvider = capped ? await this.slotsFor(rt, provider).acquire(priority, signal) : null;
+    try {
+      const release = await this.slotsFor(rt).acquire(priority, signal);
+      return () => { release(); releaseProvider?.(); };
+    } catch (e) { releaseProvider?.(); throw e; }
+  }
   /** 并发上限在设置里调大后，唤醒排队的任务 */
   pump() { for (const s of this.slots.values()) s.pump(); }
   stats() { return Object.fromEntries([...this.slots].map(([rt, s]) => [rt, { running: s.running, waiting: s.waiting }])); }
@@ -151,14 +167,31 @@ export class CliRunner implements CliExecutor {
     return n;
   }
 
-  async run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; progress?: (transcript: BetaMessageParam[]) => void }) {
+  queued(rt: string, model: string) {
+    const provider = model.includes("/") ? model.split("/")[0] : "";
+    return Math.max(this.slots.get(rt)?.waiting ?? 0, provider ? this.slots.get(`${rt}:${provider}`)?.waiting ?? 0 : 0);
+  }
+  overflow() { const s = this.settings.get().fallback; return s?.on ? s.overflow ?? 2 : 0; }
+  busy(rt: string, model: string) {
+    const s = this.settings.get().runtimes[rt];
+    const provider = model.includes("/") ? model.split("/")[0] : "";
+    const full = (key: string, limit: number) => { const x = this.slots.get(key); return !!x && (x.running >= Math.max(1, limit) || x.waiting > 0); };
+    return full(rt, s?.max || 1) || (!!provider && !!s?.providers?.[provider] && full(`${rt}:${provider}`, s.providers[provider]));
+  }
+  /** 兜底顺序：智能体自己的模型之后，依次可换的底座和模型（底座要已配置启动命令） */
+  fallbacks(agent: Agent): { runtime: string; model: string }[] {
+    const s = this.settings.get();
+    if (!s.fallback?.on) return [];
+    return s.fallback.chain.filter((c) => s.runtimes[c.runtime]?.template && !(c.runtime === agent.runtime && c.model === agent.cliModel));
+  }
+  async run(task: Task, agent: Agent, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; progress?: (transcript: BetaMessageParam[]) => void; fresh?: boolean }) {
     const cfg = this.settings.get().runtimes[agent.runtime];
     if (!cfg?.template) throw new Error(`运行底座 ${agent.runtime} 没有配置启动命令`);
     try { return await this.exec(task, agent, cfg.template, ctx); }
     finally { rmSync(join(this.tmp, task.id), { recursive: true, force: true }); } // 临时目录（MCP 配置等）用完即删
   }
 
-  private async exec(task: Task, agent: Agent, template: string, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; progress?: (transcript: BetaMessageParam[]) => void }) {
+  private async exec(task: Task, agent: Agent, template: string, ctx: { system: string; signal: AbortSignal; heartbeat: () => void; progress?: (transcript: BetaMessageParam[]) => void; fresh?: boolean }) {
     const work = join(this.tmp, task.id);
     mkdirSync(work, { recursive: true });
     const cwd = this.cwdFor(task) ?? work;
@@ -206,7 +239,8 @@ export class CliRunner implements CliExecutor {
     if (!agent.cliModel) args = args.filter((a, i) => !(a === "{model}" || (["--model", "-m"].includes(a) && args[i + 1] === "{model}")));
     args = args.map((a) => a.replace(/\{(prompt|system|model|mcp_config)\}/g, (_, k) => vars[k] ?? ""));
     // 会话：pi 用 --session-id（有就续、没有就建）；Claude Code 首次 --session-id、续跑 --resume
-    const sess = this.sessionFor?.(task) ?? null;
+    // fresh：兜底换了底座，原会话属于另一个 CLI，不能续，开新会话
+    const sess = ctx.fresh ? null : this.sessionFor?.(task) ?? null;
     let sessMarked = false;
     if (sess && !args.some((a) => ["--session-id", "--resume", "-r", "--session", "--continue", "-c", "--no-session-persistence", "--no-session"].includes(a))) {
       if (agent.runtime === "pi") args.push("--session-id", sess.id);
