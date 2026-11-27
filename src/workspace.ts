@@ -160,6 +160,9 @@ export class Workspace {
     await git(["push", `--force-with-lease=refs/heads/${branch}:${remote}`, this.url(p), `HEAD:refs/heads/${branch}`], dir);
   }
 
+  /** 工作项工作目录当前的提交（没有工作目录时 null） */
+  head(p: Proj, key: string): Promise<string | null> { return git(["rev-parse", "HEAD"], this.dir(p, key)).catch(() => null); }
+
   private baseSrc(p: Proj) { return isLocal(p) ? p.delivery!.localPath! : this.url(p); }
 
   /**

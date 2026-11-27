@@ -195,3 +195,19 @@ test("CI 未通过：交回开发智能体修复（附失败 job 链接），最
     for (const t of store.listTasks({ status: "running" })) runtime.cancel(t.id);
   } finally { srv.close(); }
 });
+
+test("CI 失败日志摘要：挑出报错、失败用例和断言，去掉时间戳", async () => {
+  const { failureExcerpt } = await import("../src/github.ts");
+  const log = [
+    "2026-11-26T22:52:16.98Z   ✓  1 [chromium] › e2e/chapter2.spec.ts:23:1 › 主流程 (4.9s)",
+    ...Array.from({ length: 50 }, (_, n) => `2026-11-26T22:52:17.00Z noise ${n}`),
+    "2026-11-26T22:52:39.59Z   ✘  5 [chromium] › e2e/voice.spec.ts:85:1 › 语音建单 (14.0s)",
+    "2026-11-26T22:52:55.84Z     Error: expect(locator).toContainText(expected) failed",
+    "2026-11-26T22:52:55.84Z     > 94 |     await expect(user).toContainText('用户 · 语音')",
+  ].join("\n");
+  const out = failureExcerpt(log);
+  assert.match(out, /✘  5 \[chromium\] › e2e\/voice\.spec\.ts/);
+  assert.match(out, /Error: expect\(locator\)/);
+  assert.doesNotMatch(out, /noise 10/);
+  assert.doesNotMatch(out, /2026-11-26T/);
+});

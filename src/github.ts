@@ -35,6 +35,14 @@ export class GitHub {
     return (text ? JSON.parse(text) : null) as T;
   }
   user() { return this.req<{ login: string }>("GET", "/user"); }
+  /** 一个 Actions job 的原始日志（纯文本，GitHub 会重定向到临时下载地址） */
+  async jobLog(full: string, jobId: string): Promise<string> {
+    const t = this.token();
+    if (!t) throw new Error("未配置 GitHub Token");
+    const res = await fetch(`${this.base}/repos/${full}/actions/jobs/${jobId}/logs`, { headers: { authorization: `Bearer ${t}`, "user-agent": "agent-hub" }, signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`读取 job 日志 → ${res.status}`);
+    return res.text();
+  }
 
   /**
    * 当前令牌的身份与权限范围。
@@ -142,4 +150,18 @@ export class GitHub {
     const files = await this.req<{ filename: string }[]>("GET", `/repos/${full}/pulls/${n}/files?per_page=100`);
     return files.map((f) => f.filename);
   }
+}
+
+/**
+ * 从 CI 日志里挑出最能说明失败原因的几十行：报错、失败的用例、断言、退出码，附带少量上下文。
+ * 去掉时间戳前缀；GitHub Actions 的分组标记也去掉。
+ */
+export function failureExcerpt(log: string, max = 60): string {
+  const lines = log.split("\n").map((l) => l.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, "").replace(/\r$/, "")).filter((l) => !/^##\[(group|endgroup)\]/.test(l));
+  const hit = /(error|failed|failure|✘|✖|FAIL|assert|exception|traceback|timeout|exit code [1-9]|expected|received|^\s*>\s+\d+\s*\|)/i;
+  const keep = new Set<number>();
+  lines.forEach((l, i) => { if (hit.test(l)) for (let k = Math.max(0, i - 1); k <= Math.min(lines.length - 1, i + 2); k++) keep.add(k); });
+  const picked = [...keep].sort((a, b) => a - b).map((i) => lines[i]);
+  const out = picked.length ? picked : lines.slice(-max);
+  return out.slice(-max).join("\n").slice(-6000);
 }

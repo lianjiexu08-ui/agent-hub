@@ -17,7 +17,7 @@ import { byPriority, priorityRank } from "./priority.ts";
 import { pickDevRole } from "./roles.ts";
 import type { Notifier } from "./notify.ts";
 import type { Settings } from "./settings.ts";
-import type { CiStatus, GitHub } from "./github.ts";
+import { failureExcerpt, type CiStatus, type GitHub } from "./github.ts";
 import { pickState, statusForStateType, type Linear, type LinearState } from "./linear.ts";
 import type { Workspace } from "./workspace.ts";
 import { backoffMs, isTransientError, quotaReset } from "./transient.ts";
@@ -65,6 +65,8 @@ export interface Issue {
   resumeFrom?: Phase | null;
   /** 生命周期走完却没有 PR、被自动退回执行阶段的次数（上限 1） */
   missingPrFixes?: number;
+  /** 交回修 CI 时失败的那个提交：汇报执行完成时代码还停在这里，说明没修，不接受 */
+  ciFixSha?: string | null;
   /** 资深评审做过几次（超过上限的大改动 / 受保护路径） */
   seniorReviews?: number;
   /** 因 CI 未通过被自动交回开发智能体的次数（上限 2） */
@@ -1767,6 +1769,19 @@ export class Work {
     rec.endedAt = now();
     rec.note = input.note.slice(0, 500);
 
+    if (rec.phase === "do" && i.ciFixSha) {
+      // 交回修 CI 后汇报完成：代码必须比失败的那个提交新，否则就是没修
+      const p = this.proj(i.projectId);
+      const head = p ? await this.workspace.head(p, this.key(i)) : null;
+      if (head && head === i.ciFixSha) {
+        rec.result = "active";
+        rec.endedAt = null;
+        this.save(i);
+        this.addComment(i.id, "system", "system", `⚠ ${task.agent} 汇报执行完成，但代码还停在 CI 失败的提交 ${head.slice(0, 7)}，没有新的修复。已退回，要求先修复 CI`, task.id);
+        return `CI 失败的提交是 ${head.slice(0, 7)}，你的工作目录还停在这个提交上，没有任何修复。CI 的失败是真实的（日志见工作项里负责人的留言），不是重启或环境问题。请复现并修复，提交后再调用 report_phase(phase="do")。确实无法修复时，用 comment_issue 写明原因，等人处理。`;
+      }
+      i.ciFixSha = null;
+    }
     if (rec.phase === "do") {
       // 有代码改动：提交并创建 / 更新 PR
       const out = await this.afterDo(i, task).catch((e) => {
@@ -2146,8 +2161,19 @@ export class Work {
     i.lifecycleDone = false;
     i.resumeFrom = "do";
     this.save(i);
+    i.ciFixSha = ci.sha;
+    this.save(i);
     const links = (ci.failedUrls ?? []).map((u) => `- ${u}`).join("\n");
-    this.addComment(i.id, by, "lead", `PR #${i.pr.number} 的 CI 没有通过：${ci.failed.join("、")}（提交 ${ci.sha.slice(0, 7)}）。\n${links ? `${links}\n` : ""}请先查看失败日志（例如 \`gh run view --log-failed\` 或打开上面的链接），在工作目录里复现并修复，确认相关测试通过后照常提交；其余工作已完成，不必重做。`);
+    // 把失败日志的关键行直接给智能体：只给链接时它可能不去看，凭印象判断「是环境问题」就交差
+    const p = this.proj(i.projectId);
+    const logs: string[] = [];
+    for (const u of (ci.failedUrls ?? []).slice(0, 2)) {
+      const job = /\/job\/(\d+)/.exec(u)?.[1];
+      if (!job || !p?.repo) continue;
+      const text = await this.github.jobLog(p.repo.fullName, job).then((l) => failureExcerpt(l), () => "");
+      if (text) logs.push(`\`\`\`\n${text}\n\`\`\``);
+    }
+    this.addComment(i.id, by, "lead", `PR #${i.pr.number} 的 CI 没有通过：${ci.failed.join("、")}（提交 ${ci.sha.slice(0, 7)}）。\n${links ? `${links}\n` : ""}${logs.length ? `\n失败日志的关键部分：\n${logs.join("\n")}\n\n` : ""}这是 GitHub 上 CI 的真实结果，不是重启或环境造成的。完整日志可用 \`gh run view --log-failed\` 或打开上面的链接查看。请在工作目录里复现并修复（本地通过但 CI 失败时，重点看 CI 与本地环境的差异，例如时序、无头浏览器、依赖版本），确认相关测试通过后提交新的修复；没有新提交就汇报完成会被退回。其余工作已完成，不必重做。`);
     await this.syncStatusRemote(i).catch(() => []);
     this.emit("issue");
     void this.startRun(this.getIssue(i.id)!, by);
