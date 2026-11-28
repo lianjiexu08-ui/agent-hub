@@ -915,6 +915,8 @@ async function renderDrawer(force = false) {
       d.pr?.state === "open"
         ? h("button", { class: "primary", disabled: d.pr.checks === "passing" ? null : "", onclick: () => issuesApi.mergePR(d.key).then(() => toast(`已合并 ${prName(d.pr)}，${d.key} 完成`, "ok")).catch(fail) }, d.pr.local === "local" ? "✓ 验收并合并到本地" : `✓ 验收并合并 ${prName(d.pr)}`)
         : h("button", { class: "primary", onclick: () => set({ status: "done" }) }, "✓ 最终验收通过"),
+      d.pr?.state === "open" && d.pr.guard && !/测试未通过|CI /.test(d.pr.guard) && S.settings?.guard?.reviewer?.agent
+        ? h("button", { title: "让资深评审再看一次整个 PR：通过就自动合并，需要修改就交回开发", onclick: () => act("work.reReview", d.key).then(() => toast(`已请 ${S.settings.guard.reviewer.agent} 重新评审`, "ok")).catch(fail) }, "🔍 重新资深评审") : null,
       h("button", { onclick: () => { ui.feedbackOpen = !ui.feedbackOpen; renderDrawer(); } }, "↩ 退回修改"),
       ui.feedbackOpen ? [fb, h("div", { class: "row", style: "width:100%;justify-content:flex-end" },
         h("button", { class: "primary", onclick: sendBack }, d.assignee ? "退回并重新执行" : "退回"))] : null);

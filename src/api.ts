@@ -83,6 +83,7 @@ export function buildApi(s: Services) {
     "work.remove": (ref) => work.remove(ref),
     "work.confirmRequirement": (ref, answer) => work.confirmRequirement(ref, answer),
     "work.mergePR": (ref, force) => work.mergePR(ref, !!force),
+    "work.reReview": (ref) => work.reReview(ref),
     "work.redeliver": (ref) => work.redeliver(ref),
     "work.rollback": (ref) => work.rollback(ref),
     "work.pushToGithub": (ref) => work.pushToGithub(ref),

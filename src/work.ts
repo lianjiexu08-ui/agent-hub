@@ -2423,6 +2423,26 @@ export class Work {
       if (cur.assignee) void this.startRun(this.getIssue(cur.id)!, "页面验收");
     }).catch(() => {});
   }
+  /**
+   * 人让资深评审再看一次被护栏拦下的 PR（例如评审次数用完、或上次没给结论）：通过就自动合并，需要修改就交回开发。
+   * 只能代替「改动大 / 允许的受保护路径」这两类拦截；测试或 CI 不过、其他受保护路径仍然要人。
+   */
+  async reReview(ref: string | number) {
+    const i = this.find(ref);
+    const R = this.settings.guard().reviewer;
+    if (!R?.agent) throw new WorkError("没有设置资深评审（设置 → 安全护栏 → 资深评审代替人放行）");
+    if (i.status !== "in_review" || i.pr?.state !== "open" || !i.pr.guard) throw new WorkError("只有被安全护栏拦下、PR 还开着的工作项可以重新评审");
+    if (/测试未通过|CI /.test(i.pr.guard)) throw new WorkError(`这次拦截的原因是「${i.pr.guard}」，资深评审不能代替`);
+    if (this.seniorRunning.has(i.id) || this.activeRun(i.id)) throw new WorkError("正在评审或执行中", 409);
+    i.seniorReviews = Math.min(i.seniorReviews ?? 0, 1);
+    i.seniorSkipped = false;
+    i.pr.guard = null;
+    this.save(i);
+    this.addComment(i.id, ME, "user", `请 ${R.agent} 重新做一次资深评审`);
+    void this.afterDeliver(this.getIssue(i.id)!).catch(() => {});
+    return { ok: true };
+  }
+
   async mergePR(ref: string | number, force = false) {
     const i = this.find(ref);
     if (!i.pr || i.pr.state !== "open") throw new WorkError("没有可合并的 PR");

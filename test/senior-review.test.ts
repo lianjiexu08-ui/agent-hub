@@ -16,7 +16,7 @@ import { Work } from "../src/work.ts";
 import { simulatedLLM } from "../src/simulate.ts";
 import { AgentSchema } from "../src/types.ts";
 
-async function scenario(verdict: string | null | string[], files = ["backend/app/x.py"], opt: { preset?: Record<string, unknown>; conflict?: boolean; dirty?: boolean; accept?: "human" | "lead" } = {}) {
+async function scenario(verdict: string | null | string[], files = ["backend/app/x.py"], opt: { preset?: Record<string, unknown>; conflict?: boolean; dirty?: boolean; accept?: "human" | "lead"; reReview?: boolean } = {}) {
   const merged: number[] = [];
   const srv = createServer((req, res) => {
     const send = (d: unknown, code = 200) => { res.statusCode = code; res.setHeader("content-type", "application/json"); res.end(JSON.stringify(d)); };
@@ -50,6 +50,7 @@ async function scenario(verdict: string | null | string[], files = ["backend/app
   store.docPut("issues", i.id, i);
   await work["afterDeliver"](work.find(v.key));
   await new Promise((r) => setTimeout(r, 50));
+  if (opt.reReview) { await work.reReview(v.key); await new Promise((r) => setTimeout(r, 80)); }
   const out = { work, merged, asked, i: work.find(v.key), log: work.detail(v.key).activity.map((a: { body: string }) => a.body).join("\n") };
   for (const t of store.listTasks({})) runtime.cancel(t.id);
   srv.close();
@@ -147,4 +148,11 @@ test("默认由人验收：合并后停在等人验收", async () => {
   const s = await scenario("结论：通过");
   assert.deepEqual(s.merged, [50]);
   assert.equal(s.i.status, "in_review");
+});
+
+test("评审次数用完交给人后，人可以让资深评审再看一次：通过就自动合并", async () => {
+  const s = await scenario("结论：通过", undefined, { preset: { seniorReviews: 2 }, reReview: true });
+  assert.equal(s.asked.length, 1);
+  assert.deepEqual(s.merged, [50]);
+  assert.match(s.log, /重新做一次资深评审/);
 });
