@@ -2447,6 +2447,9 @@ function renderProjectPage() {
         field("合并方式", select([["manual", "手动：验收通过后由我确认合并"], ["auto", "自动：测试与评审通过后直接合并"]], p.lead?.mergePolicy ?? "auto",
           (v) => issuesApi.setLead(p.id, { mergePolicy: v }).then(() => toast(v === "manual" ? "改为手动合并" : "改为自动合并", "ok")).catch(fail), { style: "max-width:360px" }),
           "立即生效，不需要点保存"),
+        field("最终验收", select([["human", "由我验收：合并后等我确认完成"], ["lead", "负责人验收：测试、CI、评审都通过并已合并后直接完成，我事后抽查"]], p.lead?.acceptance ?? "human",
+          (v) => issuesApi.setLead(p.id, { acceptance: v }).then(() => toast(v === "lead" ? "改为负责人验收" : "改为由你验收", "ok")).catch(fail), { style: "max-width:360px" }),
+          "Hub 接管仓库时选「负责人验收」；需求确认、被护栏拦下的合并仍然要你处理"),
         mainWarn);
     })()),
     section("工作项来源", "工作项只能有一个权威来源，二选一：从 Linear 导入，或从 GitHub 的 issue 导入。两者互斥——同一件活在两边各有一份，改哪边算数就说不清了。绑定 GitHub 仓库只影响代码与 PR，不改变这里的选择。", (() => {

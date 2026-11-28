@@ -83,7 +83,7 @@ export interface Issue {
   waitingRestart?: boolean;
 }
 export interface Comment { id: number; issueId: number; author: string; kind: "user" | "agent" | "lead" | "system"; body: string; runId: string | null; createdAt: string }
-export interface Lead { agent: string; mode: "off" | "on_demand" | "autopilot"; duties: { flow: boolean; review: boolean; bugs: boolean; testing: boolean }; mergePolicy: "auto" | "manual"; dailyRuns: number; runsToday: number; runsDay?: string; activity: { at: string; text: string }[]; /** 上次例行巡检：时间与当时工作项状态的指纹（没有变化就不再花一次模型调用） */ patrol?: { at: string; sig: string; taskId?: string } }
+export interface Lead { agent: string; mode: "off" | "on_demand" | "autopilot"; duties: { flow: boolean; review: boolean; bugs: boolean; testing: boolean }; mergePolicy: "auto" | "manual"; /** 最终验收：human = 合并后等人验收；lead = 测试、CI、评审都通过并已合并后由负责人验收完成（人可事后抽查，在 GitHub 上重开即可） */ acceptance?: "human" | "lead"; dailyRuns: number; runsToday: number; runsDay?: string; activity: { at: string; text: string }[]; /** 上次例行巡检：时间与当时工作项状态的指纹（没有变化就不再花一次模型调用） */ patrol?: { at: string; sig: string; taskId?: string } }
 export interface LinearBinding {
   teamId: string; teamKey: string; teamName: string;
   mode: "two_way" | "import" | "push" | "off";
@@ -1075,12 +1075,16 @@ export class Work {
     const p = this.proj(id)!;
     const before = p.lead.mode;
     const beforeMerge = p.lead.mergePolicy;
+    const beforeAccept = p.lead.acceptance ?? "human";
     p.lead = { ...p.lead, ...patch, duties: { ...p.lead.duties, ...(patch.duties ?? {}) } };
     if (patch.mode && patch.mode !== before) this.leadLog(p, `工作模式：${{ off: "关闭", on_demand: "按需", autopilot: "持续迭代" }[patch.mode]}`);
     // 合并方式决定改动会不会不经人确认就进开发分支，改动必须留痕
     if (patch.mergePolicy && patch.mergePolicy !== beforeMerge) this.leadLog(p, `合并方式：${patch.mergePolicy === "manual" ? "手动" : "自动"}`);
+    if (patch.acceptance && patch.acceptance !== beforeAccept) this.leadLog(p, `最终验收：${patch.acceptance === "lead" ? "负责人验收（人事后抽查）" : "由人验收"}`);
     this.saveProj(p);
     this.emit("project");
+    // 改为负责人验收：已经合并、在等人验收的工作项按新规则处理
+    if (patch.acceptance === "lead" && beforeAccept !== "lead") for (const i of this.issues().filter((x) => x.projectId === id && this.leadAccepts(x))) void this.leadAccept(i, "设置改为负责人验收").catch(() => {});
   }
   /** 记录负责人动态并保存项目（p 须是调用方刚读取并修改过的最新对象） */
   private leadLog(p: Project, text: string) {
@@ -1089,6 +1093,27 @@ export class Work {
     this.saveProj(p);
   }
   leadActivity(id: string) { return (this.proj(id)?.lead.activity ?? []).slice().reverse(); }
+  /** 负责人可以代人做最终验收：设置开启、PR 已由 AI 合并（不是人手工合并的分支 / 本地交付）、测试与 CI 没有失败、不在阻塞中 */
+  private leadAccepts(i: Issue): boolean {
+    const L = this.leadOf(i);
+    return !!L && L.acceptance === "lead" && i.status === "in_review" && i.pr?.state === "merged" && !i.pr.local && !i.blocked
+      && i.pr.checks !== "failing" && i.pr.ci?.state !== "failing";
+  }
+  private async leadAccept(i: Issue, why: string) {
+    const cur = this.getIssue(i.id);
+    if (!cur || !this.leadAccepts(cur)) return;
+    const L = this.leadOf(cur)!;
+    const key = this.key(cur);
+    cur.status = "done";
+    this.save(cur);
+    await this.syncStatusRemote(cur).catch(() => []);
+    this.addComment(cur.id, L.agent, "lead", `✅ 最终验收：测试、CI 与评审均已通过，PR #${cur.pr!.number} 已合并，按设置由负责人验收完成（${why}）。如有问题，在 Hub 里把它改回进行中，或在 GitHub 上重开 issue。`);
+    this.recycle(cur, "负责人验收完成");
+    const p = this.proj(cur.projectId);
+    if (p) this.leadLog(p, `✅ ${key} 已由负责人验收完成（PR #${cur.pr!.number}）`);
+    this.notify.push("review", `${key} 已由负责人验收完成`, `${cur.title}：PR #${cur.pr!.number} 已合并。可事后抽查。`, key);
+    this.emit("issue");
+  }
   private leadOf(i: Issue): Lead | null { const l = this.proj(i.projectId)?.lead; return l && l.mode !== "off" ? l : null; }
 
   /** 负责人巡检：分诊 bug；持续迭代模式下提出改进项 */
@@ -2068,9 +2093,14 @@ export class Work {
           this.leadLog(p, `⚡ Hotfix ${key}：AI 验收通过，已合并 PR #${i.pr.number} 并完成`);
           this.notify.push("hotfix", `⚡ ${key} 已上线`, `${i.title}：测试通过，AI 验收后已合并 PR #${i.pr.number}。`, key);
         } else {
-          lines.push(`审核通过，已合并 PR #${i.pr.number}。等待你最终验收。`);
-          this.leadLog(p, `审核 ${key} 通过，已合并 PR #${i.pr.number}，等待你最终验收`);
-          this.notify.push("review", `${key} 等你最终验收`, `${i.title}：测试与 AI 审核已通过，PR #${i.pr.number} 已合并。`, key);
+          if (L.acceptance === "lead") {
+            lines.push(`审核通过，已合并 PR #${i.pr.number}。`);
+            setImmediate(() => void this.leadAccept(i, "合并后自动验收").catch(() => {}));
+          } else {
+            lines.push(`审核通过，已合并 PR #${i.pr.number}。等待你最终验收。`);
+            this.leadLog(p, `审核 ${key} 通过，已合并 PR #${i.pr.number}，等待你最终验收`);
+            this.notify.push("review", `${key} 等你最终验收`, `${i.title}：测试与 AI 审核已通过，PR #${i.pr.number} 已合并。`, key);
+          }
         }
       } catch (e) {
         if (e instanceof CiAfterSync && await this.fixCiFailure(i, L.agent)) lines.push(`${e.message}：和期间合入主干的改动合在一起出了问题，已交回 ${i.assignee} 查看日志并修复（第 ${i.ciFixes} 次）。`);
@@ -2532,6 +2562,8 @@ export class Work {
       this.addComment(i.id, "system", "system", "服务重启时交付收尾（等 CI、审核、合并）还没做完，重新进行");
       setImmediate(() => void this.afterDeliver(this.getIssue(i.id)!).catch(() => {}));
     }
+    // 负责人验收：已合并、在等验收的（开启设置前合并的，或验收前被重启打断的）
+    for (const i of this.issues().filter((x) => this.leadAccepts(x))) setImmediate(() => void this.leadAccept(i, "重启后补做").catch(() => {}));
     // 开启「资深评审代替人放行」之前就被护栏拦下的：按新规则再判断一次（测试 / CI 不过的不管）
     if (this.settings.guard().reviewer?.agent)
       for (const i of this.issues().filter((x) => x.status === "in_review" && x.pr?.state === "open" && x.pr.guard && !/测试未通过|CI /.test(x.pr.guard) && !x.seniorSkipped && (x.seniorReviews ?? 0) < 2 && !this.activeRun(x.id)))

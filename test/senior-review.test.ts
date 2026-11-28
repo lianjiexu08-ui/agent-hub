@@ -16,7 +16,7 @@ import { Work } from "../src/work.ts";
 import { simulatedLLM } from "../src/simulate.ts";
 import { AgentSchema } from "../src/types.ts";
 
-async function scenario(verdict: string | null | string[], files = ["backend/app/x.py"], opt: { preset?: Record<string, unknown>; conflict?: boolean; dirty?: boolean } = {}) {
+async function scenario(verdict: string | null | string[], files = ["backend/app/x.py"], opt: { preset?: Record<string, unknown>; conflict?: boolean; dirty?: boolean; accept?: "human" | "lead" } = {}) {
   const merged: number[] = [];
   const srv = createServer((req, res) => {
     const send = (d: unknown, code = 200) => { res.statusCode = code; res.setHeader("content-type", "application/json"); res.end(JSON.stringify(d)); };
@@ -43,12 +43,13 @@ async function scenario(verdict: string | null | string[], files = ["backend/app
   const work = new Work(store, runtime, { notify: new Notifier(store, () => settings.get().notify), settings, github, linear: new Linear(() => null), workspace: new Workspace("/tmp/agent-hub-test-ws", () => null), simulate: false });
   const p = work.saveProject({ name: "演示", key: "SR" });
   await work.connectRepo(p.id, "x/y");
-  work.setLead(p.id, { mode: "on_demand", mergePolicy: "auto" });
+  work.setLead(p.id, { mode: "on_demand", mergePolicy: "auto", ...(opt.accept ? { acceptance: opt.accept } : {}) });
   const v = await work.create({ projectId: p.id, title: "推送", status: "backlog" });
   const i = work.find(v.key);
   Object.assign(i, { status: "in_review", assignee: "developer", lifecycleDone: true, pr: { number: 50, branch: "agent/sr-1", state: "open", checks: "passing", tests: "1/1", additions: 2000, deletions: 0, files: 3 } }, opt.preset ?? {});
   store.docPut("issues", i.id, i);
   await work["afterDeliver"](work.find(v.key));
+  await new Promise((r) => setTimeout(r, 50));
   const out = { work, merged, asked, i: work.find(v.key), log: work.detail(v.key).activity.map((a: { body: string }) => a.body).join("\n") };
   for (const t of store.listTasks({})) runtime.cancel(t.id);
   srv.close();
@@ -133,4 +134,17 @@ test("CI 通过但 PR 已经与主干冲突：先交回解决冲突，不浪费�
   assert.deepEqual(s.merged, []);
   assert.equal(s.i.mergeFixes, 1);
   assert.match(s.log, /与主干冲突，已安排 developer 合并主干/);
+});
+
+test("最终验收交给负责人：合并后直接完成，并留言可事后抽查", async () => {
+  const s = await scenario("结论：通过", undefined, { accept: "lead" });
+  assert.deepEqual(s.merged, [50]);
+  assert.equal(s.i.status, "done");
+  assert.match(s.log, /由负责人验收完成/);
+});
+
+test("默认由人验收：合并后停在等人验收", async () => {
+  const s = await scenario("结论：通过");
+  assert.deepEqual(s.merged, [50]);
+  assert.equal(s.i.status, "in_review");
 });
