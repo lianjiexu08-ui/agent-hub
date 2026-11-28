@@ -16,15 +16,16 @@ import { Work } from "../src/work.ts";
 import { simulatedLLM } from "../src/simulate.ts";
 import { AgentSchema } from "../src/types.ts";
 
-async function scenario(verdict: string | null, files = ["backend/app/x.py"]) {
+async function scenario(verdict: string | null | string[], files = ["backend/app/x.py"], opt: { preset?: Record<string, unknown>; conflict?: boolean } = {}) {
   const merged: number[] = [];
   const srv = createServer((req, res) => {
     const send = (d: unknown, code = 200) => { res.statusCode = code; res.setHeader("content-type", "application/json"); res.end(JSON.stringify(d)); };
     const url = req.url ?? "";
     if (url === "/repos/x/y") return send({ full_name: "x/y", default_branch: "main" });
-    if (url === "/repos/x/y/pulls/50") return send({ merge_commit_sha: null, base: { ref: "main" }, head: { sha: "h1" } });
+    if (url === "/repos/x/y/pulls/50") return send({ merge_commit_sha: null, base: { ref: "main" }, head: { sha: "h1" }, mergeable: !opt.conflict });
+    if (url.startsWith("/repos/x/y/actions/workflows")) return send({ total_count: 1 });
     if (url.startsWith("/repos/x/y/compare/")) return send({ behind_by: 0 });
-    if (url.includes("/check-runs")) return send({ check_runs: [{ name: "backend", status: "completed", conclusion: "success" }] });
+    if (url.includes("/check-runs")) return send({ check_runs: opt.conflict ? [] : [{ name: "backend", status: "completed", conclusion: "success" }] });
     if (url.startsWith("/repos/x/y/pulls/50/files")) return send(files.map((filename) => ({ filename })));
     if (url === "/repos/x/y/pulls/50/merge") { merged.push(50); return send({ merged: true }); }
     send({}, 404);
@@ -36,7 +37,8 @@ async function scenario(verdict: string | null, files = ["backend/app/x.py"]) {
   if (verdict !== null) settings.patch({ guard: { ...settings.guard(), reviewer: { agent: "code-reviewer", size: true, paths: ["**/migrations/**"] } } });
   const runtime = new Runtime(store, simulatedLLM({ delayMs: [5000, 6000] }), { maxConcurrency: 2, maxDepth: 1, maxHops: 1 });
   const asked: string[] = [];
-  runtime.callAgent = async (_a: string, input: string) => { asked.push(input); return { taskId: "t", status: "completed", result: verdict ?? "", error: null, timedOut: false }; };
+  const answers = Array.isArray(verdict) ? [...verdict] : null;
+  runtime.callAgent = async (_a: string, input: string) => { asked.push(input); return { taskId: "t", status: "completed", result: (answers ? answers.shift() : verdict as string | null) ?? "", error: null, timedOut: false }; };
   const github = new GitHub(() => "tok", `http://127.0.0.1:${(srv.address() as { port: number }).port}`);
   const work = new Work(store, runtime, { notify: new Notifier(store, () => settings.get().notify), settings, github, linear: new Linear(() => null), workspace: new Workspace("/tmp/agent-hub-test-ws", () => null), simulate: false });
   const p = work.saveProject({ name: "演示", key: "SR" });
@@ -44,7 +46,7 @@ async function scenario(verdict: string | null, files = ["backend/app/x.py"]) {
   work.setLead(p.id, { mode: "on_demand", mergePolicy: "auto" });
   const v = await work.create({ projectId: p.id, title: "推送", status: "backlog" });
   const i = work.find(v.key);
-  Object.assign(i, { status: "in_review", assignee: "developer", lifecycleDone: true, pr: { number: 50, branch: "agent/sr-1", state: "open", checks: "passing", tests: "1/1", additions: 2000, deletions: 0, files: 3 } });
+  Object.assign(i, { status: "in_review", assignee: "developer", lifecycleDone: true, pr: { number: 50, branch: "agent/sr-1", state: "open", checks: "passing", tests: "1/1", additions: 2000, deletions: 0, files: 3 } }, opt.preset ?? {});
   store.docPut("issues", i.id, i);
   await work["afterDeliver"](work.find(v.key));
   const out = { work, merged, asked, i: work.find(v.key), log: work.detail(v.key).activity.map((a: { body: string }) => a.body).join("\n") };
@@ -83,4 +85,44 @@ test("没开资深评审：照旧等人确认", async () => {
   assert.deepEqual(s.merged, []);
   assert.equal(s.asked.length, 0);
   assert.match(s.i.pr!.guard ?? "", /超过自动合并上限/);
+});
+
+test("评审最后一行漏了结论：带着原文再问一次，按第二次的结论处理", async () => {
+  const s = await scenario(["看过了，没有阻塞问题。", "补充核实完毕。\n结论：通过"]);
+  assert.equal(s.asked.length, 2);
+  assert.match(s.asked[1], /最后一行没有写结论/);
+  assert.match(s.asked[1], /看过了，没有阻塞问题/);
+  assert.deepEqual(s.merged, [50]);
+});
+
+test("评审两次都没有结论：交给人，不合并", async () => {
+  const s = await scenario(["看了一半", "还是没写"]);
+  assert.equal(s.asked.length, 2);
+  assert.deepEqual(s.merged, []);
+  assert.match(s.log, /没有给出明确结论/);
+});
+
+test("通过后因冲突 / CI 被交回、修好再交付：不受次数限制，照常评审", async () => {
+  // 之前一次「需要修改」+ 一次「通过」（老数据计为 2）；只有「需要修改」才计次
+  const s = await scenario("结论：通过", undefined, { preset: { seniorReviews: 1 } });
+  assert.equal(s.asked.length, 1);
+  assert.deepEqual(s.merged, [50]);
+  assert.equal(s.i.seniorReviews, 1, "通过不计次");
+});
+
+test("已经两次要求修改：不再自动评审，并留言说明原因", async () => {
+  const s = await scenario("结论：通过", undefined, { preset: { seniorReviews: 2 } });
+  assert.equal(s.asked.length, 0);
+  assert.deepEqual(s.merged, []);
+  assert.match(s.log, /已经 2 次要求修改，这次不再自动评审/);
+});
+
+test("PR 与主干冲突导致 CI 没跑：不干等也不当成「CI 没有运行」交给人，直接交回开发解决冲突", async () => {
+  const s = await scenario("结论：通过", undefined, { conflict: true });
+  assert.equal(s.asked.length, 0);
+  assert.deepEqual(s.merged, []);
+  assert.equal(s.i.mergeFixes, 1);
+  assert.equal(s.i.resumeFrom, "do");
+  assert.match(s.log, /GitHub 不会在冲突的 PR 上运行 CI/);
+  assert.doesNotMatch(s.i.pr?.guard ?? "", /CI 没有运行/);
 });

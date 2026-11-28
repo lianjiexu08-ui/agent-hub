@@ -1,7 +1,7 @@
 /** GitHub REST 客户端（Personal Access Token）。Token 只保存在服务端。 */
 export interface GhIssue { number: number; title: string; body: string | null; state: string; state_reason?: string | null; labels: (string | { name: string })[]; pull_request?: unknown }
 
-export interface CiStatus { state: "passing" | "failing" | "pending" | "none" | "unknown"; sha: string; failed: string[]; pending: string[]; checkedAt: string; /** 失败 job 的页面链接（交回开发修复时附上） */ failedUrls?: string[]; /** state = unknown 时读不到的原因 */ error?: string; /** 结果来自哪个接口 */ source?: "checks" | "actions" }
+export interface CiStatus { state: "passing" | "failing" | "pending" | "none" | "unknown"; sha: string; failed: string[]; pending: string[]; checkedAt: string; /** 失败 job 的页面链接（交回开发修复时附上） */ failedUrls?: string[]; /** state = unknown 时读不到的原因 */ error?: string; /** PR 与主干冲突，GitHub 没有跑 CI */ conflict?: boolean; /** 结果来自哪个接口 */ source?: "checks" | "actions" }
 /** 汇总 check runs：cancelled / timed_out / action_required 也算失败（需要人看） */
 export function summarizeChecks(sha: string, runs: { name: string; status: string; conclusion: string | null; html_url?: string }[]): CiStatus {
   const ok = new Set(["success", "neutral", "skipped"]);
@@ -121,7 +121,7 @@ export class GitHub {
   }
   /** 把最新主干合进 PR 分支（GitHub 的「Update branch」）；有冲突时 GitHub 返回 422 */
   updateBranch(full: string, n: number, expectedHead: string) { return this.req("PUT", `/repos/${full}/pulls/${n}/update-branch`, { expected_head_sha: expectedHead }); }
-  pr(full: string, n: number) { return this.req<{ merge_commit_sha: string | null; base: { ref: string }; head: { sha: string } }>("GET", `/repos/${full}/pulls/${n}`); }
+  pr(full: string, n: number) { return this.req<{ merge_commit_sha: string | null; base: { ref: string }; head: { sha: string }; mergeable?: boolean | null; mergeable_state?: string }>("GET", `/repos/${full}/pulls/${n}`); }
   /**
    * PR 最新提交的 CI 结果（GitHub Actions 等 check runs）。
    * 任何一个失败 → failing；还有没跑完的 → pending；全部成功 / 跳过 → passing；没有配置 CI → none。

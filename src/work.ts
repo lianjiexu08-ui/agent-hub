@@ -69,6 +69,8 @@ export interface Issue {
   ciFixSha?: string | null;
   /** 资深评审做过几次（超过上限的大改动 / 受保护路径） */
   seniorReviews?: number;
+  /** 资深评审这次没给结论 / 次数用完，已交给人：重启时不再自动重评 */
+  seniorSkipped?: boolean;
   /** 因 CI 未通过被自动交回开发智能体的次数（上限 2） */
   ciFixes?: number;
   /** 因与主干冲突被自动交回开发智能体的次数（上限 2） */
@@ -2011,6 +2013,14 @@ export class Work {
     const ci = i.pr?.ci;
     if (ci?.state === "passing") lines.push("✅ CI：全部通过。");
     else if (ci?.state === "unknown") lines.push(`⚠ CI：无法读取（${ci.error}），请自行到 GitHub 确认。`);
+    // 冲突导致 CI 没跑：交回开发合并主干、解决冲突（与合并时撞上冲突的处理相同）
+    if (i.pr?.ci?.conflict && await this.fixMergeConflict(i, L.agent)) {
+      lines.push(`PR #${i.pr.number} 与主干冲突，GitHub 不会在冲突的 PR 上运行 CI，已安排 ${i.assignee} 合并主干、解决冲突后重新提交（第 ${i.mergeFixes} 次）。`);
+      this.addComment(i.id, L.agent, "lead", lines.join("\n"));
+      this.save(i);
+      this.emit("lead");
+      return;
+    }
     let gv = i.pr ? await this.guardCheck(i) : null;
     if (i.pr) i.pr.reviewed = true;
     // 人已批准过合并、这次只是解决了冲突：改动大小 / 受保护路径人已看过，不再拦；测试或 CI 失败仍然拦
@@ -2142,6 +2152,14 @@ export class Work {
         if (["passing", "failing", "pending"].includes(last.state) && !p.ciSeen) { const fresh = this.proj(p.id); if (fresh) { fresh.ciSeen = true; this.saveProj(fresh); } p.ciSeen = true; }
         if (last.state === "none") {
           expectCi ??= !!p.ciSeen || (await this.github.hasWorkflows(p.repo.fullName).catch(() => false));
+          // PR 与主干冲突时 GitHub 不会为 pull_request 事件跑 CI：不必干等，按冲突处理
+          if (expectCi && await this.github.pr(p.repo.fullName, i.pr.number).then((r) => r.mergeable === false, () => false)) {
+            last = { ...last, state: "unknown", error: "PR 与主干冲突，GitHub 不会在冲突的 PR 上运行 CI", conflict: true };
+            const c2 = this.getIssue(i.id);
+            if (c2?.pr) { c2.pr.ci = last; this.save(c2); }
+            if (i.pr) i.pr.ci = last;
+            return last;
+          }
           if (expectCi && Date.now() - t0 < this.noneWaitMs) { await new Promise((r) => setTimeout(r, Math.min(everyMs, 10_000))); continue; }
           if (expectCi) last = { ...last, state: "unknown", error: `仓库配置了 CI，但 ${Math.round(this.noneWaitMs / 60_000)} 分钟内这次提交上没有出现任何检查` };
           return last;
@@ -2185,7 +2203,7 @@ export class Work {
     if (!i.pr) return null;
     if (G.requireTests && i.pr.checks === "failing") return "测试未通过";
     if (G.requireTests && i.pr.ci?.state === "failing") return `CI 未通过（${i.pr.ci.failed.join("、")}）`;
-    if (G.requireTests && i.pr.ci?.state === "unknown" && /没有出现任何检查/.test(i.pr.ci.error ?? "")) return `CI 没有运行（${i.pr.ci.error}）`;
+    if (G.requireTests && i.pr.ci?.state === "unknown" && (i.pr.ci.conflict || /没有出现任何检查/.test(i.pr.ci.error ?? ""))) return `CI 没有运行（${i.pr.ci.error}）`;
     if (G.requireTests && i.pr.ci?.state === "pending") return `CI 还没跑完（${i.pr.ci.pending.join("、")}），等它结束后再合并`;
     // 行数上限只算要人评审的业务代码：锁文件 / 生成文件本来就不在 additions 里，测试代码在这里扣掉
     const tests = i.pr.testLines?.lines ?? 0;
@@ -2217,12 +2235,17 @@ export class Work {
   private async seniorReview(i: Issue, why: string): Promise<"pass" | "returned" | "skip"> {
     const R = this.settings.guard().reviewer;
     const p = this.proj(i.projectId);
-    if (!R?.agent || !i.pr || !p || (i.seniorReviews ?? 0) >= 2 || !this.store.getAgent(R.agent)) return "skip";
-    i.seniorReviews = (i.seniorReviews ?? 0) + 1;
-    this.save(i);
+    if (!R?.agent || !i.pr || !p || !this.store.getAgent(R.agent)) return "skip";
+    // 次数只算「需要修改」交回的轮次；通过后因冲突 / CI 被交回、修好再交付时照常评审
+    if ((i.seniorReviews ?? 0) >= 2) {
+      this.addComment(i.id, "system", "system", `🔍 资深评审已经 ${i.seniorReviews} 次要求修改，这次不再自动评审，交给你决定`);
+      i.seniorSkipped = true;
+      this.save(i);
+      return "skip";
+    }
     const key = this.key(i);
     const dir = this.workspace.enabledFor(p, this.store.getAgent(i.assignee ?? "") ?? undefined) ? this.workspace.dir(p, key) : null;
-    this.addComment(i.id, "system", "system", `🔍 ${why}。按设置交给 ${R.agent} 对整个 PR 做资深评审（第 ${i.seniorReviews} 次），通过后自动合并`);
+    this.addComment(i.id, "system", "system", `🔍 ${why}。按设置交给 ${R.agent} 对整个 PR 做资深评审（第 ${(i.seniorReviews ?? 0) + 1} 次），通过后自动合并`);
     this.emit("issue");
     const input = [
       `请对 ${key}「${i.title}」的 PR #${i.pr.number}（分支 ${i.pr.branch} → ${baseOf(p)}）做一次全面的资深评审。它被安全护栏拦下：${why}。你的结论将代替人工决定是否合并。`,
@@ -2231,14 +2254,27 @@ export class Work {
       "重点：是否满足需求、正确性与边界、数据库迁移是否可升级 / 回滚且与主干上已有迁移不冲突、鉴权与数据安全、并发与幂等、是否有与需求无关的改动、测试是否覆盖关键路径。只读代码，不要修改、提交或推送。",
       "最后一行必须是「结论：通过」或「结论：需要修改」。需要修改时，在前面逐条列出必须修改的问题（位置、原因、改法）；建议性的问题不要阻塞。",
     ].join("\n\n");
-    const r = await this.runtime.callAgent(R.agent, input, { timeoutMs: 40 * 60_000, priority: 1 }).catch((e) => ({ status: "failed", result: null, error: (e as Error).message }));
+    const call = (q: string) => this.runtime.callAgent(R.agent, q, { timeoutMs: 40 * 60_000, priority: 1 }).catch((e) => ({ status: "failed", result: null as string | null, error: (e as Error).message as string | undefined }));
+    let r = await call(input);
+    const lastLine = (t: string) => t.split("\n").filter((l) => l.trim()).at(-1) ?? "";
+    const verdictOf = (t: string) => /结论[:：]\s*(通过|需要修改)/.exec(lastLine(t))?.[1];
+    // 评审写完了却漏了最后一行结论（或者中途失败）：带着原文再问一次，只要结论
+    if (!verdictOf((r.result ?? "").trim())) {
+      const prev = (r.result ?? "").trim();
+      const again = await call(prev
+        ? `${input}\n\n你上一次的评审如下，但最后一行没有写结论。请根据它（必要时补充核实）重新给出完整评审，最后一行必须是「结论：通过」或「结论：需要修改」：\n\n${prev.slice(-8000)}`
+        : input);
+      if (again.status === "completed" || !prev) r = again;
+    }
     const text = (r.result ?? "").trim();
-    const last = text.split("\n").filter((l) => l.trim()).at(-1) ?? "";
+    const last = lastLine(text);
+    i.seniorSkipped = false;
     if (r.status === "completed" && /结论[:：]\s*通过/.test(last)) {
       this.addComment(i.id, R.agent, "lead", `🔍 资深评审通过\n\n${text.slice(-3000)}`);
       return "pass";
     }
     if (r.status === "completed" && /结论[:：]\s*需要修改/.test(last) && i.assignee) {
+      i.seniorReviews = (i.seniorReviews ?? 0) + 1;
       this.addComment(i.id, R.agent, "lead", `🔍 资深评审：需要修改，已交回 ${i.assignee}\n\n${text.slice(-6000)}`);
       i.status = "todo";
       i.lifecycleDone = false;
@@ -2249,6 +2285,8 @@ export class Work {
       return "returned";
     }
     this.addComment(i.id, "system", "system", `🔍 资深评审没有给出明确结论（${r.error ?? "最后一行不是「结论：…」"}），交给你决定`);
+    i.seniorSkipped = true;
+    this.save(i);
     return "skip";
   }
 
@@ -2484,7 +2522,10 @@ export class Work {
     }
     // 开启「资深评审代替人放行」之前就被护栏拦下的：按新规则再判断一次（测试 / CI 不过的不管）
     if (this.settings.guard().reviewer?.agent)
-      for (const i of this.issues().filter((x) => x.status === "in_review" && x.pr?.state === "open" && x.pr.guard && !/测试未通过|CI /.test(x.pr.guard) && !x.seniorReviews && !this.activeRun(x.id)))
+      for (const i of this.issues().filter((x) => x.status === "in_review" && x.pr?.state === "open" && x.pr.guard && !/测试未通过|CI /.test(x.pr.guard) && !x.seniorSkipped && (x.seniorReviews ?? 0) < 2 && !this.activeRun(x.id)))
+        setImmediate(() => void this.afterDeliver(this.getIssue(i.id)!).catch(() => {}));
+    // 因「CI 没有运行」被拦的：常见原因是 PR 与主干冲突（GitHub 不跑 CI），重新收尾一次，冲突就交回开发解决
+    for (const i of this.issues().filter((x) => x.status === "in_review" && x.pr?.state === "open" && /CI 没有运行/.test(x.pr.guard ?? "") && !x.pr.ci?.conflict && !this.activeRun(x.id)))
         setImmediate(() => void this.afterDeliver(this.getIssue(i.id)!).catch(() => {}));
     let resumed = 0;
     for (const i of this.issues().filter((x) => x.status === "in_progress")) {
