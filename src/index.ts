@@ -208,6 +208,7 @@ const reload = async () => {
  * 被挂起的工作项在新进程启动后自动开始。mode = "now"：立即重启，运行中的会被中断，由哨兵重试。
  */
 let idleRestart: { since: string; timer: NodeJS.Timeout } | null = null;
+const IDLE_RESTART_MAX = Number(process.env.HUB_IDLE_RESTART_MAX_MS ?? 15 * 60_000);
 const restart = (mode: "now" | "idle" = "now") => {
   if (mode === "idle") {
     if (idleRestart) return `已在等待：还有 ${work.activeIssueRuns()} 个运行中的任务`;
@@ -215,12 +216,17 @@ const restart = (mode: "now" | "idle" = "now") => {
     const tick = () => {
       if (!idleRestart) return;
       if (work.activeIssueRuns() === 0) { idleRestart = null; restartNow(); return; }
+      // 排空期间不开始新任务，整条流水线都在等：最多等 IDLE_RESTART_MAX，超时直接重启，被打断的由新进程按「被重启中断」续跑
+      if (Date.now() - Date.parse(idleRestart.since) > IDLE_RESTART_MAX) {
+        console.log(`[系统] 等待空闲已超过 ${Math.round(IDLE_RESTART_MAX / 60_000)} 分钟，还有 ${work.activeIssueRuns()} 个在跑，直接重启（由新进程续跑）`);
+        idleRestart = null; restartNow(); return;
+      }
       idleRestart.timer = setTimeout(tick, 3000);
     };
     idleRestart = { since: new Date().toISOString(), timer: setTimeout(tick, 0) };
     console.log(`[系统] 将在空闲时重启：等待 ${work.activeIssueRuns()} 个运行中的任务结束`);
     runtime.events.emit("event", { type: "work", kind: "restart" } as never);
-    return `等 ${work.activeIssueRuns()} 个运行中的任务结束后重启`;
+    return `等 ${work.activeIssueRuns()} 个运行中的任务结束后重启（最多等 ${Math.round(IDLE_RESTART_MAX / 60_000)} 分钟）`;
   }
   return restartNow();
 };
