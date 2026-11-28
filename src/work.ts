@@ -71,6 +71,8 @@ export interface Issue {
   seniorReviews?: number;
   /** 资深评审这次没给结论 / 次数用完，已交给人：重启时不再自动重评 */
   seniorSkipped?: boolean;
+  /** 验收被重启打断，退回执行阶段等智能体重新 report_phase(do) */
+  retest?: boolean;
   /** 因 CI 未通过被自动交回开发智能体的次数（上限 2） */
   ciFixes?: number;
   /** 因与主干冲突被自动交回开发智能体的次数（上限 2） */
@@ -1484,6 +1486,9 @@ export class Work {
     if (i.status === "todo" && last?.status === "failed" && (/interrupted by service restart|服务重启/.test(last.error ?? "") || isTransientError(last.error)))
       return { text: "等待续跑", tone: "wait", title: `${(last.error ?? "").slice(0, 200)}。不是需求或代码的问题，哨兵会自动从中断的阶段继续` };
     if (i.status === "todo" && last?.status === "failed") return { text: "上次失败", tone: "fail", title: last.error ?? "" };
+    // 正常结束却没走完生命周期（智能体提前收工）：哨兵会自动从中断的阶段重试
+    if (i.status === "todo" && last?.status === "completed" && !i.lifecycleDone && i.assignee)
+      return { text: "等待续跑", tone: "wait", title: `上次运行没有走完生命周期就结束了，哨兵会从「${PHASE_LABEL[(i.resumeFrom ?? "do") as keyof typeof PHASE_LABEL] ?? "中断处"}」自动重试` };
     if (i.status === "in_review" && this.waitingCi.has(i.id)) return { text: "等 CI", tone: "wait", title: `等 GitHub 上的 CI 跑完${i.pr?.ci?.pending?.length ? `（${i.pr.ci.pending.join("、")}）` : ""}，之后自动审核、合并` };
     if (i.status === "in_review" && this.seniorRunning.has(i.id)) return { text: "资深评审中", tone: "wait", title: `${this.settings.guard().reviewer?.agent ?? "资深评审"} 正在评审整个 PR，通过后自动合并` };
     if (i.status === "in_review" && i.pr?.guard && i.pr.state === "open") return { text: "等你确认合并", tone: "need", title: i.pr.guard };
@@ -1672,6 +1677,10 @@ export class Work {
 
   /** 带着原对话续跑时发的那一句：不重复整份需求，提醒它接着做、别重来 */
   private continueInput(i: Issue): string {
+    if (i.retest && (i.phase ?? i.resumeFrom) === "do") return [
+      `（服务重启打断了 Hub 对 ${this.key(i)} 的验收，不是你的问题。上面是你之前的完整过程，工作目录里的改动都还在。）`,
+      "测试阶段由 Hub 执行（验收队列），不由你汇报。请确认改动都已提交、工作区干净后，直接再调用一次 report_phase(phase=\"do\")，Hub 会重新跑验收并告诉你结果；不要重做执行阶段，也不要自己汇报测试阶段。",
+    ].join("\n");
     return [
       `（运行被中断了——网络异常或服务重启，不是你的问题。上面是你之前的完整过程，工作目录里的改动都还在。）`,
       `请接着做 ${this.key(i)} 的「${PHASE_LABEL[i.phase ?? "understand"]}」阶段：先看一眼工作目录现状确认做到哪了，然后从中断的地方继续，不要重做已经完成的步骤。`,
@@ -1830,6 +1839,7 @@ export class Work {
       }
       const prMsg = out;
       this.enterPhase(i, "test");
+      i.retest = false;
       this.save(i);
       this.emit("issue");
       if (!this.qa) { const t = i.phases.at(-1)!; t.result = "pass"; t.endedAt = now(); t.note = "未配置测试队列，跳过"; this.enterPhase(i, "review"); this.save(i); return `${prMsg ?? ""}测试队列未启用，直接进入「评审」。${PHASE_HINT.review}`; }
@@ -1988,6 +1998,7 @@ export class Work {
       if (act) { act.result = task.status === "cancelled" ? "cancelled" : "fail"; act.endedAt = now(); act.note ||= task.status === "cancelled" ? "已停止" : task.error ?? ""; }
       // 不是人主动停止的（运行失败、提前收工）：记下中断的阶段，重试时接着做，不消耗轮次
       if (task.status !== "cancelled" && act) i.resumeFrom = resumePoint(act.phase);
+      if (task.status !== "cancelled" && act?.phase === "test") i.retest = true;
       i.phase = null;
       i.blocked = null;
       const quota = task.status === "failed" ? quotaReset(task.error) : null;
@@ -2612,8 +2623,14 @@ export class Work {
         this.addComment(i.id, "system", "system", "服务重启，进行中的运行已中断。可重新运行（哨兵会自动重试）。");
         continue;
       }
+      // 测试阶段是 Hub 在 report_phase(do) 里跑验收队列，智能体没法汇报「测试」：退回执行阶段末尾，让它重新 report_phase(do) 触发验收
+      if (act?.phase === "test") {
+        act.result = "cancelled"; act.endedAt = now(); act.note = "服务重启，验收中断，重新提交后重跑";
+        this.enterPhase(i, "do");
+        i.retest = true;
+      }
       // 其余：保持进行中、阶段不变，启动完成后带着原来的对话接着跑（错开几秒，避免同时拉起一堆进程）
-      if (act) act.note = "服务重启，自动接着跑";
+      else if (act) act.note = "服务重启，自动接着跑";
       i.blocked = null;
       this.save(i);
       this.addComment(i.id, "system", "system", `Hub 重启，「${act ? PHASE_LABEL[act.phase] : "当前阶段"}」会在启动后接着跑（保留之前的对话，不重做）`);
