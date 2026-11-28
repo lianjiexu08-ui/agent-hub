@@ -69,7 +69,7 @@ export function downUntil(error: string | null | undefined, now = new Date()): n
   if (q) return +q;
   if (/concurren(?:t|cy) (?:request )?limit/i.test(error ?? "")) return +now + 2 * 60_000;
   if (isTransientError(error)) return +now + 3 * 60_000;
-  return +now + 30 * 60_000; // 鉴权类：要人处理，半小时内别再用
+  return +now + 2 * 3600_000; // 鉴权类：要人处理（已通知），两小时内别再用
 }
 
 const DOW = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];

@@ -16,13 +16,13 @@ import { Work } from "../src/work.ts";
 import { simulatedLLM } from "../src/simulate.ts";
 import { AgentSchema } from "../src/types.ts";
 
-async function scenario(verdict: string | null | string[], files = ["backend/app/x.py"], opt: { preset?: Record<string, unknown>; conflict?: boolean } = {}) {
+async function scenario(verdict: string | null | string[], files = ["backend/app/x.py"], opt: { preset?: Record<string, unknown>; conflict?: boolean; dirty?: boolean } = {}) {
   const merged: number[] = [];
   const srv = createServer((req, res) => {
     const send = (d: unknown, code = 200) => { res.statusCode = code; res.setHeader("content-type", "application/json"); res.end(JSON.stringify(d)); };
     const url = req.url ?? "";
     if (url === "/repos/x/y") return send({ full_name: "x/y", default_branch: "main" });
-    if (url === "/repos/x/y/pulls/50") return send({ merge_commit_sha: null, base: { ref: "main" }, head: { sha: "h1" }, mergeable: !opt.conflict });
+    if (url === "/repos/x/y/pulls/50") return send({ merge_commit_sha: null, base: { ref: "main" }, head: { sha: "h1" }, mergeable: !(opt.conflict || opt.dirty) });
     if (url.startsWith("/repos/x/y/actions/workflows")) return send({ total_count: 1 });
     if (url.startsWith("/repos/x/y/compare/")) return send({ behind_by: 0 });
     if (url.includes("/check-runs")) return send({ check_runs: opt.conflict ? [] : [{ name: "backend", status: "completed", conclusion: "success" }] });
@@ -125,4 +125,12 @@ test("PR 与主干冲突导致 CI 没跑：不干等也不当成「CI 没有运�
   assert.equal(s.i.resumeFrom, "do");
   assert.match(s.log, /GitHub 不会在冲突的 PR 上运行 CI/);
   assert.doesNotMatch(s.i.pr?.guard ?? "", /CI 没有运行/);
+});
+
+test("CI 通过但 PR 已经与主干冲突：先交回解决冲突，不浪费一次资深评审", async () => {
+  const s = await scenario("结论：通过", undefined, { dirty: true });
+  assert.equal(s.asked.length, 0);
+  assert.deepEqual(s.merged, []);
+  assert.equal(s.i.mergeFixes, 1);
+  assert.match(s.log, /与主干冲突，已安排 developer 合并主干/);
 });

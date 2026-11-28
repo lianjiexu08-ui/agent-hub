@@ -1286,6 +1286,7 @@ export class Work {
       if (i.blocked) out.push({ kind: "confirm", issue: v, text: `需求待确认：${i.blocked.length} 个问题` });
       else if (this.waitingCi.has(i.id)) continue; // Hub 在等 CI，结果出来后自动审核、合并或拦下，不需要人操作
       else if (i.status === "in_review" && this.waitsForTesting(i)) continue;
+      else if (i.status === "in_review" && this.seniorRunning.has(i.id)) continue;
       else if (i.status === "in_review") out.push({ kind: "review", issue: v, text: i.pr?.local === "local" ? (i.pr.state === "merged" ? "已合并到本地，等你提测" : "验收后合并到本地") : i.pr?.local === "branch" ? `分支 ${i.pr.branch} 已推送，最终验收` : i.pr?.guard && i.pr.state === "open" ? `安全护栏拦截：${i.pr.guard}` : i.pr?.state === "merged" ? `最终验收（PR #${i.pr.number} 已由 AI 合并）` : i.pr?.state === "open" ? `验收并合并 PR #${i.pr.number}` : "最终验收" });
       else if (leadOff && i.status === "todo" && v.lastRun?.status === "failed") out.push({ kind: "failed", issue: v, text: "运行失败（项目负责人已关闭，需要你处理）" });
     }
@@ -1459,6 +1460,7 @@ export class Work {
       return { text: "等待续跑", tone: "wait", title: `${(last.error ?? "").slice(0, 200)}。不是需求或代码的问题，哨兵会自动从中断的阶段继续` };
     if (i.status === "todo" && last?.status === "failed") return { text: "上次失败", tone: "fail", title: last.error ?? "" };
     if (i.status === "in_review" && this.waitingCi.has(i.id)) return { text: "等 CI", tone: "wait", title: `等 GitHub 上的 CI 跑完${i.pr?.ci?.pending?.length ? `（${i.pr.ci.pending.join("、")}）` : ""}，之后自动审核、合并` };
+    if (i.status === "in_review" && this.seniorRunning.has(i.id)) return { text: "资深评审中", tone: "wait", title: `${this.settings.guard().reviewer?.agent ?? "资深评审"} 正在评审整个 PR，通过后自动合并` };
     if (i.status === "in_review" && i.pr?.guard && i.pr.state === "open") return { text: "等你确认合并", tone: "need", title: i.pr.guard };
     if (i.status === "in_review" && i.pr?.local === "local" && i.pr.state === "merged") return { text: "待提测", tone: "wait", title: "已合并本地开发分支，等人工提测" };
     if (i.status === "todo" && i.assignee && !last) return { text: "待开始", tone: "wait" };
@@ -1629,8 +1631,8 @@ export class Work {
     const input = continuing ? this.continueInput(cur0) : this.buildInput(cur0, resume);
     const task = this.runtime.submit(i.assignee!, input, { source: "issue", issueId: i.id, hops: opts.hops ?? 0, priority: i.priority });
     if (!resume) void this.linearHandoff(i.id, "start");
-    this.addComment(i.id, "system", "system", continuing ? `▶ ${i.assignee} 接着上次的进度继续「${PHASE_LABEL[cur0.phase!]}」（由 ${by} 触发，保留之前的对话，第 ${i.cycle} 轮）`
-      : resume ? `▶ ${i.assignee} 从「${PHASE_LABEL[cur0.phase!]}」继续（由 ${by} 触发，仍是第 ${i.cycle} 轮）` : `▶ ${i.assignee} 开始执行（由 ${by} 触发），第 ${i.cycle} 轮`, task.id);
+    this.addComment(i.id, "system", "system", continuing ? `▶ ${i.assignee} 接着上次的进度继续「${PHASE_LABEL[(cur0.phase ?? cur0.resumeFrom ?? "do") as keyof typeof PHASE_LABEL]}」（由 ${by} 触发，保留之前的对话，第 ${i.cycle} 轮）`
+      : resume ? `▶ ${i.assignee} 从「${PHASE_LABEL[(cur0.phase ?? cur0.resumeFrom ?? "do") as keyof typeof PHASE_LABEL]}」继续（由 ${by} 触发，仍是第 ${i.cycle} 轮）` : `▶ ${i.assignee} 开始执行（由 ${by} 触发），第 ${i.cycle} 轮`, task.id);
     this.emit("issue");
     return task;
   }
@@ -2013,9 +2015,11 @@ export class Work {
     const ci = i.pr?.ci;
     if (ci?.state === "passing") lines.push("✅ CI：全部通过。");
     else if (ci?.state === "unknown") lines.push(`⚠ CI：无法读取（${ci.error}），请自行到 GitHub 确认。`);
-    // 冲突导致 CI 没跑：交回开发合并主干、解决冲突（与合并时撞上冲突的处理相同）
-    if (i.pr?.ci?.conflict && await this.fixMergeConflict(i, L.agent)) {
-      lines.push(`PR #${i.pr.number} 与主干冲突，GitHub 不会在冲突的 PR 上运行 CI，已安排 ${i.assignee} 合并主干、解决冲突后重新提交（第 ${i.mergeFixes} 次）。`);
+    // PR 已经与主干冲突：先解决冲突，再评审 / 合并（否则评审完合并也会失败，评审白做）
+    const conflicted = !!i.pr?.ci?.conflict || (!!i.pr && i.pr.state === "open" && !i.pr.simulated && !i.pr.local && !!p.repo && this.github.available()
+      && await this.github.pr(p.repo.fullName, i.pr.number).then((r) => r.mergeable === false, () => false));
+    if (i.pr && conflicted && await this.fixMergeConflict(i, L.agent)) {
+      lines.push(`PR #${i.pr.number} 与主干冲突${i.pr.ci?.conflict ? "，GitHub 不会在冲突的 PR 上运行 CI" : ""}，已安排 ${i.assignee} 合并主干、解决冲突后重新提交（第 ${i.mergeFixes} 次）。`);
       this.addComment(i.id, L.agent, "lead", lines.join("\n"));
       this.save(i);
       this.emit("lead");
@@ -2130,6 +2134,8 @@ export class Work {
 
   /** 正在等 CI 结果的工作项（交付后由 Hub 自动处理，不需要人操作） */
   private waitingCi = new Set<number>();
+  /** 正在做资深评审的工作项（不需要人处理） */
+  private seniorRunning = new Set<number>();
   /** 等 PR 最新提交的 CI 跑完（最多 timeoutMs），返回最终 / 最新的结果；查不到时返回 null（不阻塞流程） */
   private async waitCi(i: Issue, timeoutMs = 15 * 60_000, everyMs = 30_000): Promise<CiStatus | null> {
     const p = this.proj(i.projectId);
@@ -2255,17 +2261,10 @@ export class Work {
       "最后一行必须是「结论：通过」或「结论：需要修改」。需要修改时，在前面逐条列出必须修改的问题（位置、原因、改法）；建议性的问题不要阻塞。",
     ].join("\n\n");
     const call = (q: string) => this.runtime.callAgent(R.agent, q, { timeoutMs: 40 * 60_000, priority: 1 }).catch((e) => ({ status: "failed", result: null as string | null, error: (e as Error).message as string | undefined }));
-    let r = await call(input);
+    this.seniorRunning.add(i.id);
+    let r: Awaited<ReturnType<typeof call>>;
+    try { r = await this.seniorCall(call, input); } finally { this.seniorRunning.delete(i.id); }
     const lastLine = (t: string) => t.split("\n").filter((l) => l.trim()).at(-1) ?? "";
-    const verdictOf = (t: string) => /结论[:：]\s*(通过|需要修改)/.exec(lastLine(t))?.[1];
-    // 评审写完了却漏了最后一行结论（或者中途失败）：带着原文再问一次，只要结论
-    if (!verdictOf((r.result ?? "").trim())) {
-      const prev = (r.result ?? "").trim();
-      const again = await call(prev
-        ? `${input}\n\n你上一次的评审如下，但最后一行没有写结论。请根据它（必要时补充核实）重新给出完整评审，最后一行必须是「结论：通过」或「结论：需要修改」：\n\n${prev.slice(-8000)}`
-        : input);
-      if (again.status === "completed" || !prev) r = again;
-    }
     const text = (r.result ?? "").trim();
     const last = lastLine(text);
     i.seniorSkipped = false;
@@ -2288,6 +2287,19 @@ export class Work {
     i.seniorSkipped = true;
     this.save(i);
     return "skip";
+  }
+
+  /** 调用资深评审；最后一行漏了结论（或中途失败）时带着原文再问一次，只要结论 */
+  private async seniorCall<R extends { status: string; result: string | null }>(call: (q: string) => Promise<R>, input: string): Promise<R> {
+    const lastLine = (t: string) => t.split("\n").filter((l) => l.trim()).at(-1) ?? "";
+    let r = await call(input);
+    const prev = (r.result ?? "").trim();
+    if (/结论[:：]\s*(通过|需要修改)/.test(lastLine(prev))) return r;
+    const again = await call(prev
+      ? `${input}\n\n你上一次的评审如下，但最后一行没有写结论。请根据它（必要时补充核实）重新给出完整评审，最后一行必须是「结论：通过」或「结论：需要修改」：\n\n${prev.slice(-8000)}`
+      : input);
+    if (again.status === "completed" || !prev) r = again;
+    return r;
   }
 
   private async syncBeforeMerge(i: Issue, p: Project) {
